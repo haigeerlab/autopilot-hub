@@ -72,14 +72,37 @@ class CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(result["cap"], "L2")  # app cap L3, lowered by degrade issue to L2
 
-    def test_unparseable_trust_fails_closed(self):
-        trust = os.path.join(self.tmp, "trust.yml")
-        with open(trust, "w") as f:
-            f.write("levels:\n  T0: L4\n")  # real YAML, not JSON-compatible: slice 1 cannot read it
-        proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--trust", trust])
+    def test_levels_comments_file(self):
+        changed = os.path.join(self.tmp, "changed.txt")
+        with open(changed, "w") as f:
+            f.write("src/core/a.py\n")
+        comments = os.path.join(self.tmp, "comments.json")
+        with open(comments, "w") as f:
+            json.dump(['<!-- autopilot-levels:v1 {"spec_guard":{"module":"m","tier":"standard"},"module_crew":{"effective":"relaxed"}} -->'], f)
+        proc, result, md = self.run_cli(os.path.join(FIX, "conclusion.basic.json"),
+                                        ["--changed-files", changed, "--levels-comments", comments])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(result["cap"], "L0")
-        self.assertTrue(any("trust" in n for n in result["notes"]), result["notes"])
+        self.assertEqual(result["cap"], "L3")
+        self.assertIn("spec-guard", md)
+
+    def test_no_levels_comments_defaults_to_L2(self):
+        changed = os.path.join(self.tmp, "changed.txt")
+        with open(changed, "w") as f:
+            f.write("src/core/a.py\n")
+        proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--changed-files", changed])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["cap"], "L2")
+
+    def test_trust_flag_is_gone(self):
+        proc, _, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--trust", "x"])
+        self.assertEqual(proc.returncode, 2)
+
+    def test_bad_tier_map_exits_2(self):
+        bad = os.path.join(self.tmp, "map.json")
+        with open(bad, "w") as f:
+            f.write("{}")
+        proc, _, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--tier-map", bad])
+        self.assertEqual(proc.returncode, 2)
 
     def test_missing_schema_exits_2(self):
         out = os.path.join(self.tmp, "o.json")

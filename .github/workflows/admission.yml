@@ -5,7 +5,8 @@
 #
 # Safety:
 # - Triggered by the caller's `pull_request` event (never pull_request_target).
-# - Never checks out or runs PR code. The conclusion and trust files are read from the BASE branch via the API.
+# - Never checks out or runs PR code. The conclusion is read from the BASE branch via the API.
+# - Plugin tiers come from the latest `autopilot-levels:v1` PR comment written by the local orchestrator.
 # - All event values reach shell only through env vars, never inlined into `run:` scripts.
 # - The check run is always `neutral`: it reports a cap, it never blocks.
 name: autopilot-admission
@@ -62,7 +63,7 @@ jobs:
             fi
           }
           fetch .github/autopr/readiness-conclusion.json .admission/conclusion.json
-          fetch .github/autopr/trust.yml .admission/trust.json
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '[.[].body]' | python3 -c 'import json,sys;print(json.dumps([b for page in sys.stdin.read().split("\n") if page.strip() for b in json.loads(page)]))' > .admission/comments.json || echo '[]' > .admission/comments.json
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > .admission/changed.txt
           gh issue list -R "${REPO}" --label autopilot:degrade --state open --limit 200 --json body > .admission/degrade.json || echo '[]' > .admission/degrade.json
 
@@ -72,7 +73,8 @@ jobs:
             --conclusion .admission/conclusion.json \
             --schema .hub/schemas/vendor/repo-readiness/conclusion.v1.json \
             --allowed-tools .hub/allowed-tools.json \
-            --trust .admission/trust.json \
+            --tier-map .hub/tier-map.json \
+            --levels-comments .admission/comments.json \
             --degrade-issues .admission/degrade.json \
             --changed-files .admission/changed.txt \
             --repo "${REPO}" --default-branch "${DEFAULT_BRANCH}" \

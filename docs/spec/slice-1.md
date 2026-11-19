@@ -16,7 +16,7 @@
 | --- | --- |
 | 读取并校验 `.github/autopr/readiness-conclusion.json`（`repo-readiness.conclusion/v1`） | 解析 `autopr-evidence:v1` 证据评论 |
 | 核对结论的工具版本是否在允许列表里 | 跨厂商审查、行为验证的判定 |
-| 计算有效上限 = min(结论上限, `trust.yml` 配置, 未关闭的降级 issue) | 风险档计算（`risk-tiers.yml`），本切片里所有 PR 一律按"仓库级上限"处理 |
+| 计算有效上限 = min(结论上限, spec-guard 模块档位, module-crew 生效档位, 未关闭的降级 issue)（2026-11-20 起，见 I7） | 风险档计算（`risk-tiers.yml`），本切片里所有 PR 一律按"仓库级上限"处理 |
 | 输出检查结果、标签、一条摘要评论 | 自动合并、自动降级、度量 |
 | 失败时 fail closed，按 L0 报告 | 修改被测仓库的分支保护或必需检查 |
 
@@ -27,7 +27,7 @@
 | `.github/autopr/readiness-conclusion.json`，**从 base 分支读取**，不用 PR 分支上的那份 | repo-readiness 生成，经人工合并的 PR 提交（T4） | 上限 L0，原因写"没有接入结论" |
 | 结论 schema | repo-readiness 发布版里的 `schemas/conclusion.v1.json`，按 tag + 40 位 SHA 引用 | 本切片不运行，配置错误直接报错 |
 | 允许的工具版本列表 `allowed-tools.json` | 中心仓库，T4 | 上限 L0 |
-| `.github/autopr/trust.yml`（可选） | 被测仓库，T4 | 视作不额外限制 |
+| PR 上最新一条 `<!-- autopilot-levels:v1 {...} -->` 评论（2026-11-20 起取代 `trust.yml`） | 本机编排写入 | 缺失时两项各按 L2；读不懂或档位不认识按 L0 |
 | 未关闭的 `autopilot:degrade` issue | 被测仓库 | 本切片只读取、不创建；没有就视作不额外限制 |
 
 ## 4. 判定
@@ -39,7 +39,7 @@
 3. 当前时间早于 `valid_until`。
 4. `basis.tool` 的版本和提交（`version` + `commit`）在 `allowed-tools.json` 里。`attestation` 的校验机制尚未定（repo-readiness 接口清单 #14），本切片先只核对版本和 SHA，并在摘要里标明"发布证明未校验"。
 5. 取结论的 `trust_cap`。如果 PR 只改动某一个应用，且结论里有该应用的条目，就取该应用的上限；跨应用时取最低值；改到不属于任何应用的路径时，按仓库级处理。
-6. 有效上限 = min(第 5 步结果, `trust.yml`, 降级 issue)。
+6. 有效上限 = min(第 5 步结果, spec-guard 模块档位, module-crew 生效档位, 降级 issue)。两个插件档位按 `tier-map.json` 换成 L 级。
 
 本切片里，上限只用于报告，不改变任何人的操作。
 
@@ -79,7 +79,7 @@
    - schema 不合法（L0）；
    - `repo` 不匹配（L0）；
    - 按应用取上限：单应用、跨应用、根路径三种；
-   - `trust.yml` 更低时取更低值。
+   - 插件档位更低时取更低值；插件档位更高时不抬高上限。
 2. 在 agent-relay 上开一个测试 PR：
    - 结论还没提交时，检查结果显示 L0、原因"没有接入结论"；
    - 结论提交以后，再开一个测试 PR，显示 L2，详情能对上结论文件的 sha256。
@@ -108,9 +108,10 @@
 | # | 事项 | 结论 |
 | --- | --- | --- |
 | I1 | **中心仓库的可见性** | GitHub 规定：公开仓库只能调用公开仓库里的可复用 workflow；私有仓库的 workflow 只能被同一账号下的私有仓库调用（[Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)）。agent-relay 是公开仓库，所以 **autopilot-hub 必须改为公开**，否则切片 1 跑不起来。仓库里只有规则和脚本，没有密钥。**已于 2026-11-19 按用户决定改为公开**（改之前核对过：全部提交使用 noreply 邮箱，历史中未发现疑似密钥） |
-| I2 | `trust.yml` 的写法 | 只用标准库，没有 YAML 解析器，所以本切片只读得懂**与 JSON 兼容的 YAML**。文件存在但读不懂时，按 L0 处理，不会悄悄忽略这一条限制 |
+| I2 | ~~`trust.yml` 的写法~~ | **2026-11-20 已去掉**：设计 r6 不再自建等级配置，改由 I7 的两项插件档位取代 |
 | I3 | `allowed-tools.json` 初始为空 | repo-readiness 发布 v0.1.0 之前，所有 PR 都报 L0。这是预期行为 |
 | I4 | ~~临时 schema~~ | **2026-11-19 已替换**：改用 repo-readiness `v0.1.0`（提交 `8af61cab0725518159662806999cc87e8fd517a0`）的 `schemas/conclusion.v1.json`，原样拷入 `schemas/vendor/repo-readiness/`，来源与 sha256 记在同目录 `SOURCE.json`，测试会核对哈希。与临时 schema 的差异：`tier` 是 `{id, name}` 对象；`trust_cap`、`apps[].trust_cap` 可为 null 或任意字符串，准入把 null 和不在 L0–L5 里的值一律按 L0；`basis.tool` 用 `commit`；一个文件可同时属于多个应用，所有相关上限都参与取最低 |
 | I5 | `hub_ref` 输入 | 调用方要在 `uses:` 和 `hub_ref` 里写同一个 40 位 SHA，因为可复用 workflow 无法可靠地拿到自身的提交号 |
 | I3b | `allowed-tools.json` 已填 | 收录 repo-readiness `0.1.0` @ `8af61cab…`。只有用这个提交的干净检出签发的结论才会被接受 |
 | I6 | 改名 autopilot（设计 r6） | 检查名、标签、评论标记、降级块改为 `autopilot/admission`、`autopilot:cap-Lx`、`<!-- autopilot-admission -->`、`autopilot-degrade:v1`、`autopilot:degrade`。**仓库内的文件路径 `.github/autopr/` 暂不改**：autopr-standard 的接口层契约和 repo-readiness 都在用这个目录，要改需各方一起定 |
+| I7 | 插件档位（2026-11-20，用户定） | spec-guard 的模块档位（0.89.0 `/map --json` 的 `autonomy.tier`）和 module-crew 的生效档位（`module-crew tier --json` 的 `effective`）只在用户的 Mac 上读得到，由本机编排写成 PR 评论：`<!-- autopilot-levels:v1 {"spec_guard":{"module":"<id>","tier":"<档位>"},"module_crew":{"effective":"<档位>"}} -->`，有多条时取最新一条。档位换算见 `tier-map.json`（T4）：strict→L2、standard→L3、relaxed→L4，不认识的按 L0。评论作者暂不校验（agent 身份未建，设计 Q2），所以只报告模式下才可接受 |
