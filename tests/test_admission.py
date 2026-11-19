@@ -60,6 +60,9 @@ class CapTest(unittest.TestCase):
     def test_missing_conclusion_is_L0(self):
         self.assertCap(run(conclusion=None), "L0", "没有接入结论")
 
+    def test_failure_reason_states_the_cap(self):
+        self.assertTrue(run(conclusion=None)["reason"].startswith("信任上限 L0（只报告）："))
+
     def test_expired_conclusion_is_L0(self):
         later = dt.datetime(2026, 12, 3, 0, 0, 0, tzinfo=UTC)  # == valid_until: expired
         self.assertCap(run(now=later), "L0", "过期")
