@@ -1,0 +1,60 @@
+# Reusable workflow: slice-2 auto-degrade. Spec: docs/spec/slice-2.md
+#
+# Callers pin BOTH the `uses:` ref and `hub_ref` to the same 40-char commit SHA of autopilot-hub,
+# see examples/caller-autopilot-degrade.yml. Updating that SHA in a caller repo is a T4 change.
+#
+# Safety:
+# - Triggered by the caller's push / workflow_run / issues events. Never checks out or runs PR code.
+# - Event values reach the script only through the event JSON file, never inlined into `run:`.
+# - Only opens or comments on `autopilot:degrade` issues; degrading can only lower the admission cap.
+# - Any API failure fails the run (red) without writing anything.
+name: autopilot-degrade
+
+on:
+  workflow_call:
+    inputs:
+      hub_ref:
+        description: "40-char autopilot-hub commit SHA; must equal the SHA in the caller's `uses:` line"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: read
+
+jobs:
+  degrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: autopilot-degrade-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HUB_REF: ${{ inputs.hub_ref }}
+    steps:
+      - name: Check hub_ref is a full commit SHA
+        run: |
+          case "${HUB_REF}" in
+            *[!0-9a-f]*|"") echo "::error::hub_ref must be a 40-char lowercase commit SHA"; exit 2 ;;
+          esac
+          [ "${#HUB_REF}" -eq 40 ] || { echo "::error::hub_ref must be 40 chars"; exit 2; }
+
+      - name: Check out autopilot-hub at the pinned SHA (scripts only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haigeerlab/autopilot-hub
+          ref: ${{ inputs.hub_ref }}
+          path: .hub
+          persist-credentials: false
+
+      - name: Ensure the degrade label exists
+        run: gh label create "autopilot:degrade" --color B60205 --description "autopilot 降级：关闭即解除" > /dev/null 2>&1 || true
+
+      - name: Decide and open degrade issues
+        run: |
+          python3 -B .hub/degrade/run.py --event-name "${GITHUB_EVENT_NAME}" --event-path "${GITHUB_EVENT_PATH}" --out-md degrade-summary.md
+          cat degrade-summary.md >> "${GITHUB_STEP_SUMMARY}"
