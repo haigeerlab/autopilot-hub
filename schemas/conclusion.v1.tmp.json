@@ -1,0 +1,55 @@
+{
+  "$comment": "TEMPORARY schema for repo-readiness.conclusion/v1, written by autopilot-hub from repo-readiness SPEC §3.3 (2026-11-19). Replace with the released schemas/conclusion.v1.json from repo-readiness (pinned by tag + 40-char SHA) once it is published at its checkpoint A.",
+  "type": "object",
+  "required": ["schema", "repo", "head", "default_branch", "tier", "trust_cap", "basis", "issued_at", "valid_until"],
+  "properties": {
+    "schema": {"type": "string", "enum": ["repo-readiness.conclusion/v1"]},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "default_branch": {"type": "string", "minLength": 1},
+    "tier": {"type": "string", "enum": ["unmet", "basic", "standard", "high"]},
+    "trust_cap": {"type": "string", "enum": ["L0", "L2", "L3", "L4"]},
+    "apps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "paths", "tier", "trust_cap"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "tier": {"type": "string", "enum": ["unmet", "basic", "standard", "high"]},
+          "trust_cap": {"type": "string", "enum": ["L0", "L2", "L3", "L4"]}
+        }
+      }
+    },
+    "basis": {
+      "type": "object",
+      "required": ["report_sha256", "clauses", "tool"],
+      "properties": {
+        "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "clauses": {
+          "type": "object",
+          "required": ["id", "version", "sha256"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "tool": {
+          "type": "object",
+          "required": ["version", "sha"],
+          "properties": {
+            "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+            "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          }
+        }
+      }
+    },
+    "issued_at": {"type": "string", "format": "date-time"},
+    "valid_until": {"type": "string", "format": "date-time"},
+    "declarations_expire_at": {"type": "string", "format": "date-time"},
+    "waivers": {"type": "array"},
+    "attestation": {}
+  }
+}

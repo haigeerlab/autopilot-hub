@@ -1,0 +1,6 @@
+{
+  "schema": "autopilot-hub.allowed-tools/v1",
+  "tools": [
+    {"name": "repo-readiness", "version": "0.1.0", "sha": "2222222222222222222222222222222222222222"}
+  ]
+}
