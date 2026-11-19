@@ -10,6 +10,8 @@ import re
 LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5")
 STEP_IDS = ("exists", "schema", "repo", "valid_until", "tool", "app_cap", "limits")
 ATTESTATION_NOTE = "发布证明未校验：attestation 机制尚未定（repo-readiness 接口清单 #14）"
+LEVELS_BLOCK = re.compile(r"<!--\s*autopilot-levels:v1\s+(.*?)\s*-->", re.S)
+DEFAULT_PLUGIN_LEVEL = "L2"
 DEGRADE_BLOCK = re.compile(r"<!--\s*autopilot-degrade:v1\s+(.*?)\s*-->", re.S)
 
 
@@ -170,16 +172,50 @@ def app_cap(conclusion, changed_files):
     return lowest(caps), "涉及：" + "、".join(sorted(owners))
 
 
-def trust_limit(trust):
-    """Slice 1 computes no risk tier, so the strictest configured level applies."""
-    if not isinstance(trust, dict):
-        return None
-    levels = [v for v in (trust.get("levels") or {}).values() if v in LEVELS]
-    return lowest(levels) if levels else None
+PLUGIN_SOURCES = (
+    # (label, key in the levels block, field holding the tier)
+    ("spec-guard 模块档位", "spec_guard", "tier"),
+    ("module-crew 生效档位", "module_crew", "effective"),
+)
+
+
+def plugin_limits(comments, tier_map):
+    """Limits from the latest `autopilot-levels:v1` block in the PR comments, written by the local orchestrator.
+
+    Missing block or missing source -> L2 (design §3.2). Unparseable latest block or unknown tier -> L0.
+    Returns [{"source", "level", "detail"}]. The comment author is not verified yet (agent identity, design Q2).
+    """
+    tiers = tier_map["tiers"]
+    blocks = [b for c in comments for b in LEVELS_BLOCK.findall(c or "")]
+    if not blocks:
+        return [{"source": label, "level": DEFAULT_PLUGIN_LEVEL, "detail": f"缺少等级评论，{label}按 {DEFAULT_PLUGIN_LEVEL}"}
+                for label, _, _ in PLUGIN_SOURCES]
+    try:
+        payload = json.loads(blocks[-1])
+        if not isinstance(payload, dict):
+            raise ValueError
+    except ValueError:
+        return [{"source": label, "level": "L0", "detail": f"等级评论读不懂，{label}按 L0"} for label, _, _ in PLUGIN_SOURCES]
+    out = []
+    for label, key, field in PLUGIN_SOURCES:
+        entry = payload.get(key)
+        tier = entry.get(field) if isinstance(entry, dict) else None
+        if tier is None:
+            out.append({"source": label, "level": DEFAULT_PLUGIN_LEVEL, "detail": f"缺少{label}，按 {DEFAULT_PLUGIN_LEVEL}"})
+        elif tier in tiers and tiers[tier] in LEVELS:
+            out.append({"source": label, "level": tiers[tier], "detail": f"{label} {tier} → {tiers[tier]}"})
+        else:
+            out.append({"source": label, "level": "L0", "detail": f"{label} {tier!r} 不认识，按 L0"})
+    return out
+
+
+def valid_tier_map(tier_map):
+    return (isinstance(tier_map, dict) and isinstance(tier_map.get("tiers"), dict) and tier_map["tiers"]
+            and all(v in LEVELS for v in tier_map["tiers"].values()))
 
 
 def decide(*, conclusion, schema, repo, default_branch, now, allowed_tools,
-           changed_files, trust, degrade_levels, attestation_note=True):
+           changed_files, plugin_limits, degrade_levels, attestation_note=True):
     steps, notes = [], []
 
     def finish(cap, reason):
@@ -222,19 +258,19 @@ def decide(*, conclusion, schema, repo, default_branch, now, allowed_tools,
     cap, scope = app_cap(conclusion, changed_files)
     ok("app_cap", f"结论给出的上限 {cap}（{scope}）")
 
-    limits = [cap]
+    limits = [("接入结论", cap)]
     limit_notes = []
-    t = trust_limit(trust)
-    if t is not None:
-        limits.append(t)
-        limit_notes.append(f"trust.yml 最严档 {t}")
+    for item in plugin_limits:
+        limits.append((item["source"], item["level"]))
+        limit_notes.append(item["detail"])
     if degrade_levels:
-        limits.append(lowest(degrade_levels))
+        limits.append(("降级 issue", lowest(degrade_levels)))
         limit_notes.append(f"未关闭的降级 issue 最低 {lowest(degrade_levels)}")
-    final = lowest(limits)
+    final = lowest([level for _, level in limits])
     ok("limits", "；".join(limit_notes) if limit_notes else "没有额外限制")
 
     reason = f"信任上限 {final}（只报告）"
     if final != cap:
-        reason += "，被" + ("trust" if t is not None and t == final else "降级") + "限制"
+        by = [name for name, level in limits[1:] if level == final]
+        reason += "，被" + "、".join(by) + "限制"
     return finish(final, reason)

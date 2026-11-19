@@ -1,0 +1,5 @@
+{
+  "schema": "autopilot-hub.tier-map/v1",
+  "$comment": "Plugin autonomy tier (spec-guard moduleAutonomy, module-crew effective) -> autopilot level. Unknown tiers are L0. Decided by the user 2026-11-20. Editing this file is a T4 change. L4 only takes effect once the user sets the auto-merge boundary in spec-guard; admission is report-only until then.",
+  "tiers": {"strict": "L2", "standard": "L3", "relaxed": "L4"}
+}

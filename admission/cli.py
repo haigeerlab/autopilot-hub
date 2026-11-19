@@ -17,6 +17,8 @@ if __package__ in (None, ""):
 
 from admission import decide as d  # noqa: E402
 
+HUB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 MARKER = "<!-- autopilot-admission -->"
 
 
@@ -61,7 +63,9 @@ def main(argv=None):
     p.add_argument("--conclusion", required=True, help="path to readiness-conclusion.json from the BASE branch (may be absent)")
     p.add_argument("--schema", required=True)
     p.add_argument("--allowed-tools", required=True)
-    p.add_argument("--trust", help="optional .github/autopr/trust.yml (JSON-compatible YAML only)")
+    p.add_argument("--tier-map", default=os.path.join(HUB_ROOT, "tier-map.json"),
+                   help="plugin tier -> level map (default: the hub's tier-map.json)")
+    p.add_argument("--levels-comments", help="optional JSON array of PR comment bodies, oldest first")
     p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({body: ...})")
     p.add_argument("--changed-files", help="optional file with one changed path per line")
     p.add_argument("--repo", required=True)
@@ -85,13 +89,16 @@ def main(argv=None):
         conclusion = {"__unparseable__": True}  # fails schema validation -> L0 with a format reason
     allowed = read_json(a.allowed_tools, optional=True)
     allowed = allowed if isinstance(allowed, dict) else None
-    trust = read_json(a.trust, optional=True)
-    trust_unreadable = trust is not None and not isinstance(trust, dict)
-    if trust_unreadable:
-        # Present but unreadable (non-JSON YAML or broken): fail closed instead of silently ignoring the limit.
-        trust = {"levels": {"unreadable": "L0"}}
-    elif not isinstance(trust, dict):
-        trust = None
+    try:
+        tier_map = read_json(a.tier_map, optional=False)
+    except FileNotFoundError as e:
+        print(f"admission: tier map not found: {e}", file=sys.stderr)
+        return 2
+    if not d.valid_tier_map(tier_map):
+        print("admission: tier map is not a valid {tiers: {name: level}} object", file=sys.stderr)
+        return 2
+    comments = read_json(a.levels_comments, optional=True)
+    comments = [c for c in comments if isinstance(c, str)] if isinstance(comments, list) else []
     issues = read_json(a.degrade_issues, optional=True)
     issues = issues if isinstance(issues, list) else []
     changed = []
@@ -106,11 +113,10 @@ def main(argv=None):
 
     result = d.decide(
         conclusion=conclusion, schema=schema, repo=a.repo, default_branch=a.default_branch, now=now,
-        allowed_tools=allowed, changed_files=changed, trust=trust,
+        allowed_tools=allowed, changed_files=changed, plugin_limits=d.plugin_limits(comments, tier_map),
         degrade_levels=d.degrade_levels(issues, a.repo),
     )
-    if trust_unreadable:
-        result["notes"].append("trust.yml 读不懂（切片 1 只支持与 JSON 兼容的 YAML），按 L0 处理")
+    result["notes"].append("等级评论的作者暂不校验（agent 身份尚未建立，设计 Q2）；本检查只报告")
     result["conclusion_sha256"] = sha256_of(a.conclusion)
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)

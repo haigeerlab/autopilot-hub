@@ -25,6 +25,16 @@ def load(name):
         return json.load(f)
 
 
+TIER_MAP = json.load(open(os.path.join(ROOT, "tier-map.json"), encoding="utf-8"))
+
+
+def levels_comment(payload):
+    return "编排写入的等级\n<!-- autopilot-levels:v1 " + json.dumps(payload) + " -->\n"
+
+
+# Both plugin tiers at the loosest value, so conclusion-only tests see the conclusion cap unchanged.
+PERMISSIVE = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}, "module_crew": {"effective": "relaxed"}})
+
 SCHEMA = json.load(open(os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "conclusion.v1.json"), encoding="utf-8"))
 
 
@@ -39,7 +49,7 @@ def run(conclusion="default", **kw):
         now=NOW,
         allowed_tools=load("allowed-tools.json"),
         changed_files=["README.md"],
-        trust=None,
+        plugin_limits=d.plugin_limits([PERMISSIVE], TIER_MAP),
         degrade_levels=[],
     )
     args.update(kw)
@@ -160,13 +170,48 @@ class CapTest(unittest.TestCase):
     def test_no_changed_files_uses_repo_cap(self):
         self.assertCap(run(changed_files=[]), "L2")
 
-    def test_trust_lower_than_conclusion_wins(self):
-        trust = {"version": 1, "levels": {"T0": "L2", "T1": "L2", "T2": "L0"}}
-        self.assertCap(run(trust=trust), "L0", "trust")
+    def limits(self, *comments):
+        return d.plugin_limits(list(comments), TIER_MAP)
 
-    def test_trust_higher_than_conclusion_does_not_raise(self):
-        trust = {"version": 1, "levels": {"T0": "L4", "T1": "L4"}}
-        self.assertCap(run(trust=trust), "L2")
+    def test_no_levels_comment_defaults_both_plugins_to_L2(self):
+        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits())
+        self.assertCap(r, "L2")
+        self.assertIn("缺少", " ".join(s["detail"] for s in r["steps"]))
+
+    def test_spec_guard_strict_lowers_app_cap(self):
+        c = levels_comment({"spec_guard": {"module": "m", "tier": "strict"}, "module_crew": {"effective": "relaxed"}})
+        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "spec-guard")
+
+    def test_module_crew_effective_lowers_app_cap(self):
+        c = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}, "module_crew": {"effective": "strict"}})
+        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "module-crew")
+
+    def test_plugin_tier_cannot_raise_above_conclusion(self):
+        self.assertCap(run(changed_files=["README.md"]), "L2")  # relaxed=L4 but repo cap is L2
+
+    def test_standard_maps_to_L3(self):
+        c = levels_comment({"spec_guard": {"module": "m", "tier": "standard"}, "module_crew": {"effective": "standard"}})
+        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L3")
+
+    def test_unknown_tier_is_L0(self):
+        c = levels_comment({"spec_guard": {"module": "m", "tier": "yolo"}, "module_crew": {"effective": "relaxed"}})
+        self.assertCap(run(plugin_limits=self.limits(c)), "L0")
+
+    def test_missing_one_source_defaults_that_source_to_L2(self):
+        c = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}})
+        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "module-crew")
+
+    def test_unparseable_levels_block_is_L0(self):
+        self.assertCap(run(plugin_limits=self.limits("<!-- autopilot-levels:v1 {oops} -->")), "L0")
+
+    def test_latest_levels_comment_wins(self):
+        old = levels_comment({"spec_guard": {"module": "m", "tier": "strict"}, "module_crew": {"effective": "strict"}})
+        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits(old, PERMISSIVE))
+        self.assertCap(r, "L3")
+
+    def test_unrelated_comments_are_ignored(self):
+        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits("looks good", PERMISSIVE, "<!-- other -->"))
+        self.assertCap(r, "L3")
 
     def test_open_degrade_issue_lowers_cap(self):
         self.assertCap(run(degrade_levels=["L0"]), "L0", "降级")
