@@ -72,6 +72,15 @@ class CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(result["cap"], "L2")  # app cap L3, lowered by degrade issue to L2
 
+    def test_unparseable_trust_fails_closed(self):
+        trust = os.path.join(self.tmp, "trust.yml")
+        with open(trust, "w") as f:
+            f.write("levels:\n  T0: L4\n")  # real YAML, not JSON-compatible: slice 1 cannot read it
+        proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--trust", trust])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["cap"], "L0")
+        self.assertTrue(any("trust" in n for n in result["notes"]), result["notes"])
+
     def test_missing_schema_exits_2(self):
         out = os.path.join(self.tmp, "o.json")
         proc = subprocess.run([sys.executable, "-B", CLI, "--conclusion", "x", "--schema", os.path.join(self.tmp, "none.json"),

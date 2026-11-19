@@ -1,0 +1,5 @@
+{
+  "schema": "autopilot-hub.allowed-tools/v1",
+  "$comment": "Released tool versions whose conclusions admission accepts. Match is on version AND 40-char SHA. Empty until repo-readiness publishes v0.1.0 (its checkpoint A); until then every PR reports L0. Editing this file is a T4 change.",
+  "tools": []
+}

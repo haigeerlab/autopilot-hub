@@ -86,7 +86,12 @@ def main(argv=None):
     allowed = read_json(a.allowed_tools, optional=True)
     allowed = allowed if isinstance(allowed, dict) else None
     trust = read_json(a.trust, optional=True)
-    trust = trust if isinstance(trust, dict) else None
+    trust_unreadable = trust is not None and not isinstance(trust, dict)
+    if trust_unreadable:
+        # Present but unreadable (non-JSON YAML or broken): fail closed instead of silently ignoring the limit.
+        trust = {"levels": {"unreadable": "L0"}}
+    elif not isinstance(trust, dict):
+        trust = None
     issues = read_json(a.degrade_issues, optional=True)
     issues = issues if isinstance(issues, list) else []
     changed = []
@@ -104,6 +109,8 @@ def main(argv=None):
         allowed_tools=allowed, changed_files=changed, trust=trust,
         degrade_levels=d.degrade_levels(issues, a.repo),
     )
+    if trust_unreadable:
+        result["notes"].append("trust.yml 读不懂（切片 1 只支持与 JSON 兼容的 YAML），按 L0 处理")
     result["conclusion_sha256"] = sha256_of(a.conclusion)
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)

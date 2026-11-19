@@ -1,0 +1,25 @@
+# CI for autopilot-hub itself: unit tests of the admission script.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests (stdlib only)
+        run: |
+          python3 --version
+          python3 -B -m unittest discover -s tests -v
+      - name: allowed-tools.json is valid JSON
+        run: python3 -c 'import json;json.load(open("allowed-tools.json"))'
