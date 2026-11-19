@@ -149,7 +149,7 @@ def decide(*, conclusion, schema, repo, default_branch, now, allowed_tools,
 
     def fail(step_id, detail):
         steps.append({"id": step_id, "ok": False, "detail": detail})
-        return finish("L0", detail)
+        return finish("L0", f"信任上限 L0（只报告）：{detail}")
 
     def ok(step_id, detail):
         steps.append({"id": step_id, "ok": True, "detail": detail})
