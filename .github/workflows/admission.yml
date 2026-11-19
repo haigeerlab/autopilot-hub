@@ -1,14 +1,14 @@
 # Reusable workflow: slice-1 admission (report-only). Spec: docs/spec/slice-1.md
 #
 # Callers pin BOTH the `uses:` ref and `hub_ref` to the same 40-char commit SHA of autopilot-hub,
-# see examples/caller-autopr-admission.yml. Updating that SHA in a caller repo is a T4 change.
+# see examples/caller-autopilot-admission.yml. Updating that SHA in a caller repo is a T4 change.
 #
 # Safety:
 # - Triggered by the caller's `pull_request` event (never pull_request_target).
 # - Never checks out or runs PR code. The conclusion and trust files are read from the BASE branch via the API.
 # - All event values reach shell only through env vars, never inlined into `run:` scripts.
 # - The check run is always `neutral`: it reports a cap, it never blocks.
-name: autopr-admission
+name: autopilot-admission
 
 on:
   workflow_call:
@@ -64,13 +64,13 @@ jobs:
           fetch .github/autopr/readiness-conclusion.json .admission/conclusion.json
           fetch .github/autopr/trust.yml .admission/trust.json
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > .admission/changed.txt
-          gh issue list -R "${REPO}" --label autopr:degrade --state open --limit 200 --json body > .admission/degrade.json || echo '[]' > .admission/degrade.json
+          gh issue list -R "${REPO}" --label autopilot:degrade --state open --limit 200 --json body > .admission/degrade.json || echo '[]' > .admission/degrade.json
 
       - name: Decide
         run: |
           python3 -B .hub/admission/cli.py \
             --conclusion .admission/conclusion.json \
-            --schema .hub/schemas/conclusion.v1.tmp.json \
+            --schema .hub/schemas/vendor/repo-readiness/conclusion.v1.json \
             --allowed-tools .hub/allowed-tools.json \
             --trust .admission/trust.json \
             --degrade-issues .admission/degrade.json \
@@ -91,7 +91,7 @@ jobs:
           python3 - <<'PY' > .admission/check.json
           import json, os
           print(json.dumps({
-              "name": "autopr/admission",
+              "name": "autopilot/admission",
               "head_sha": os.environ["HEAD_SHA"],
               "status": "completed",
               "conclusion": "neutral",
@@ -101,15 +101,15 @@ jobs:
           PY
           gh api "repos/${REPO}/check-runs" --method POST --input .admission/check.json > /dev/null
 
-          for level in L0 L1 L2 L3 L4; do
+          for level in L0 L1 L2 L3 L4 L5; do
             [ "${level}" = "${CAP}" ] && continue
-            gh api "repos/${REPO}/issues/${PR_NUMBER}/labels/autopr:cap-${level}" --method DELETE > /dev/null 2>&1 || true
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/labels/autopilot:cap-${level}" --method DELETE > /dev/null 2>&1 || true
           done
-          gh label create "autopr:cap-${CAP}" -R "${REPO}" --color BFD4F2 --description "autopr 信任上限（只报告）" > /dev/null 2>&1 || true
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --method POST -f "labels[]=autopr:cap-${CAP}" > /dev/null
+          gh label create "autopilot:cap-${CAP}" -R "${REPO}" --color BFD4F2 --description "autopilot 信任上限（只报告）" > /dev/null 2>&1 || true
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --method POST -f "labels[]=autopilot:cap-${CAP}" > /dev/null
 
           COMMENT_ID="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '[.[] | select(.body | startswith("<!-- autopr-admission -->"))][0].id // empty')"
+            --jq '[.[] | select(.body | startswith("<!-- autopilot-admission -->") or startswith("<!-- autopr-admission -->"))][0].id // empty')"
           python3 -c 'import json;print(json.dumps({"body":open(".admission/summary.md",encoding="utf-8").read()},ensure_ascii=False))' > .admission/comment.json
           if [ -n "${COMMENT_ID}" ]; then
             gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --method PATCH --input .admission/comment.json > /dev/null

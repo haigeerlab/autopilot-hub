@@ -25,7 +25,7 @@ def load(name):
         return json.load(f)
 
 
-SCHEMA = json.load(open(os.path.join(ROOT, "schemas", "conclusion.v1.tmp.json"), encoding="utf-8"))
+SCHEMA = json.load(open(os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "conclusion.v1.json"), encoding="utf-8"))
 
 
 def run(conclusion="default", **kw):
@@ -69,12 +69,12 @@ class CapTest(unittest.TestCase):
 
     def test_tool_not_in_allowed_list_is_L0(self):
         c = load("conclusion.basic.json")
-        c["basis"]["tool"]["sha"] = "3" * 40
+        c["basis"]["tool"]["commit"] = "3" * 40
         self.assertCap(run(conclusion=c), "L0", "允许列表")
 
-    def test_tool_version_and_sha_must_match_together(self):
+    def test_tool_version_and_commit_must_match_together(self):
         c = load("conclusion.basic.json")
-        c["basis"]["tool"]["version"] = "0.2.0"  # same SHA, different version
+        c["basis"]["tool"]["version"] = "0.2.0"  # same commit, different version
         self.assertCap(run(conclusion=c), "L0", "允许列表")
 
     def test_missing_allowed_list_is_L0(self):
@@ -82,8 +82,60 @@ class CapTest(unittest.TestCase):
 
     def test_schema_invalid_is_L0(self):
         c = load("conclusion.basic.json")
-        c["trust_cap"] = "L9"
+        c["tier"] = "basic"  # v1 requires an object
         self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_unknown_field_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["extra"] = 1  # additionalProperties: false
+        self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_bad_head_sha_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["head"] = "abc"  # $ref sha pattern
+        self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_wrong_schema_const_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["schema"] = "repo-readiness.conclusion/v2"
+        self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_empty_rulesets_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["basis"]["rulesets"] = []  # minItems 1
+        self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_bad_date_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["declarations_expire_at"] = "soon"  # format: date
+        self.assertCap(run(conclusion=c), "L0", "格式")
+
+    def test_null_declarations_expiry_is_valid(self):
+        c = load("conclusion.basic.json")
+        c["declarations_expire_at"] = None
+        self.assertCap(run(conclusion=c), "L2")
+
+    def test_null_repo_cap_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["tier"], c["trust_cap"] = {"id": None, "name": "未达标"}, None
+        self.assertCap(run(conclusion=c), "L0")
+
+    def test_non_level_repo_cap_is_L0(self):
+        c = load("conclusion.basic.json")
+        c["trust_cap"] = "L9"  # any string passes the schema; admission fails closed
+        self.assertCap(run(conclusion=c), "L0")
+
+    def test_null_app_cap_is_L0_for_that_app(self):
+        c = load("conclusion.basic.json")
+        c["apps"][0]["trust_cap"] = None
+        self.assertCap(run(conclusion=c, changed_files=["src/core/a.py"]), "L0")
+        self.assertCap(run(conclusion=c, changed_files=["src/cli/x.py"]), "L2")
+
+    def test_file_in_two_apps_takes_lowest(self):
+        c = load("conclusion.basic.json")
+        c["apps"][0]["paths"].append("shared/**")
+        c["apps"][1]["paths"].append("shared/**")
+        self.assertCap(run(conclusion=c, changed_files=["src/core/a.py", "shared/x.py"]), "L2")
 
     def test_schema_missing_required_field_is_L0(self):
         c = load("conclusion.basic.json")
@@ -121,7 +173,7 @@ class CapTest(unittest.TestCase):
 
     def test_unmet_conclusion_is_L0(self):
         c = load("conclusion.basic.json")
-        c["tier"], c["trust_cap"] = "unmet", "L0"
+        c["tier"], c["trust_cap"] = {"id": None, "name": "未达标"}, "L0"
         c["apps"] = []
         self.assertCap(run(conclusion=c), "L0")
 
@@ -158,7 +210,7 @@ class GlobTest(unittest.TestCase):
 
 class DegradeParseTest(unittest.TestCase):
     def issue(self, payload):
-        return {"body": "降级说明\n<!-- autopr-degrade:v1 " + json.dumps(payload) + " -->\n"}
+        return {"body": "降级说明\n<!-- autopilot-degrade:v1 " + json.dumps(payload) + " -->\n"}
 
     def test_parses_level_for_this_repo(self):
         iss = [self.issue({"scope": {"repo": "haigeerlab/agent-relay", "tier": "*"}, "level": "L0", "reason": "revert"})]
@@ -169,7 +221,7 @@ class DegradeParseTest(unittest.TestCase):
         self.assertEqual(d.degrade_levels(iss, "haigeerlab/agent-relay"), [])
 
     def test_unparseable_block_fails_closed(self):
-        iss = [{"body": "<!-- autopr-degrade:v1 {not json} -->"}]
+        iss = [{"body": "<!-- autopilot-degrade:v1 {not json} -->"}]
         self.assertEqual(d.degrade_levels(iss, "haigeerlab/agent-relay"), ["L0"])
 
     def test_issue_without_block_is_ignored(self):
@@ -179,10 +231,26 @@ class DegradeParseTest(unittest.TestCase):
 class SchemaValidatorTest(unittest.TestCase):
     def test_reports_path_of_error(self):
         c = load("conclusion.basic.json")
-        c["apps"][0]["trust_cap"] = "LX"
+        c["apps"][0]["trust_cap"] = 3  # must be string or null
         errors = d.validate(c, SCHEMA)
         self.assertTrue(any("apps[0].trust_cap" in e for e in errors), errors)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VendoredSchemaTest(unittest.TestCase):
+    def test_vendored_schema_matches_recorded_sha256(self):
+        import hashlib
+        base = os.path.join(ROOT, "schemas", "vendor", "repo-readiness")
+        source = json.load(open(os.path.join(base, "SOURCE.json"), encoding="utf-8"))
+        data = open(os.path.join(base, "conclusion.v1.json"), "rb").read()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), source["sha256"])
+        self.assertRegex(source["commit"], r"^[0-9a-f]{40}$")
+
+    def test_allowed_list_pins_the_vendored_release(self):
+        source = json.load(open(os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "SOURCE.json"), encoding="utf-8"))
+        allowed = json.load(open(os.path.join(ROOT, "allowed-tools.json"), encoding="utf-8"))
+        self.assertIn({"name": "repo-readiness", "version": source["tag"].lstrip("v"), "commit": source["commit"]},
+                      allowed["tools"])

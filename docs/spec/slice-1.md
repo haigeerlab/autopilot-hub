@@ -28,7 +28,7 @@
 | 结论 schema | repo-readiness 发布版里的 `schemas/conclusion.v1.json`，按 tag + 40 位 SHA 引用 | 本切片不运行，配置错误直接报错 |
 | 允许的工具版本列表 `allowed-tools.json` | 中心仓库，T4 | 上限 L0 |
 | `.github/autopr/trust.yml`（可选） | 被测仓库，T4 | 视作不额外限制 |
-| 未关闭的 `autopr:degrade` issue | 被测仓库 | 本切片只读取、不创建；没有就视作不额外限制 |
+| 未关闭的 `autopilot:degrade` issue | 被测仓库 | 本切片只读取、不创建；没有就视作不额外限制 |
 
 ## 4. 判定
 
@@ -37,7 +37,7 @@
 1. 结论文件存在，且能通过 schema 校验。
 2. `repo` 等于当前仓库，`default_branch` 等于当前默认分支。
 3. 当前时间早于 `valid_until`。
-4. `basis` 里的工具版本和 SHA 在 `allowed-tools.json` 里。`attestation` 的校验机制尚未定（repo-readiness 接口清单 #14），本切片先只核对版本和 SHA，并在摘要里标明"发布证明未校验"。
+4. `basis.tool` 的版本和提交（`version` + `commit`）在 `allowed-tools.json` 里。`attestation` 的校验机制尚未定（repo-readiness 接口清单 #14），本切片先只核对版本和 SHA，并在摘要里标明"发布证明未校验"。
 5. 取结论的 `trust_cap`。如果 PR 只改动某一个应用，且结论里有该应用的条目，就取该应用的上限；跨应用时取最低值；改到不属于任何应用的路径时，按仓库级处理。
 6. 有效上限 = min(第 5 步结果, `trust.yml`, 降级 issue)。
 
@@ -45,9 +45,9 @@
 
 ## 5. 输出
 
-- **检查结果** `autopr/admission`：始终是 `neutral`（只报告）。标题写"信任上限 L2（只报告）"这样的一句话；详情写判定的每一步、结论文件的 sha256，以及结论的签发和过期时间。
-- **标签**：`autopr:cap-L0`、`autopr:cap-L2` 这类，每个 PR 只保留一个。
-- **摘要评论**：每个 PR 只保留一条，带标记 `<!-- autopr-admission -->`，每次运行时更新。
+- **检查结果** `autopilot/admission`：始终是 `neutral`（只报告）。标题写"信任上限 L2（只报告）"这样的一句话；详情写判定的每一步、结论文件的 sha256，以及结论的签发和过期时间。
+- **标签**：`autopilot:cap-L0`、`autopilot:cap-L2` 这类，每个 PR 只保留一个。
+- **摘要评论**：每个 PR 只保留一条，带标记 `<!-- autopilot-admission -->`，每次运行时更新（旧标记 `<!-- autopr-admission -->` 的评论也会被找到并原地更新）。
 
 ## 6. 安全
 
@@ -110,5 +110,7 @@
 | I1 | **中心仓库的可见性** | GitHub 规定：公开仓库只能调用公开仓库里的可复用 workflow；私有仓库的 workflow 只能被同一账号下的私有仓库调用（[Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)）。agent-relay 是公开仓库，所以 **autopilot-hub 必须改为公开**，否则切片 1 跑不起来。仓库里只有规则和脚本，没有密钥。**已于 2026-11-19 按用户决定改为公开**（改之前核对过：全部提交使用 noreply 邮箱，历史中未发现疑似密钥） |
 | I2 | `trust.yml` 的写法 | 只用标准库，没有 YAML 解析器，所以本切片只读得懂**与 JSON 兼容的 YAML**。文件存在但读不懂时，按 L0 处理，不会悄悄忽略这一条限制 |
 | I3 | `allowed-tools.json` 初始为空 | repo-readiness 发布 v0.1.0 之前，所有 PR 都报 L0。这是预期行为 |
-| I4 | 临时 schema | `schemas/conclusion.v1.tmp.json` 按 repo-readiness SPEC §3.3 编写，多加了一个必填字段 `schema`，`tier` 的取值暂定为 `unmet`、`basic`、`standard`、`high`。这两点要和 readiness-tool 核对，等对方正式 schema 发布后整体替换 |
+| I4 | ~~临时 schema~~ | **2026-11-19 已替换**：改用 repo-readiness `v0.1.0`（提交 `8af61cab0725518159662806999cc87e8fd517a0`）的 `schemas/conclusion.v1.json`，原样拷入 `schemas/vendor/repo-readiness/`，来源与 sha256 记在同目录 `SOURCE.json`，测试会核对哈希。与临时 schema 的差异：`tier` 是 `{id, name}` 对象；`trust_cap`、`apps[].trust_cap` 可为 null 或任意字符串，准入把 null 和不在 L0–L5 里的值一律按 L0；`basis.tool` 用 `commit`；一个文件可同时属于多个应用，所有相关上限都参与取最低 |
 | I5 | `hub_ref` 输入 | 调用方要在 `uses:` 和 `hub_ref` 里写同一个 40 位 SHA，因为可复用 workflow 无法可靠地拿到自身的提交号 |
+| I3b | `allowed-tools.json` 已填 | 收录 repo-readiness `0.1.0` @ `8af61cab…`。只有用这个提交的干净检出签发的结论才会被接受 |
+| I6 | 改名 autopilot（设计 r6） | 检查名、标签、评论标记、降级块改为 `autopilot/admission`、`autopilot:cap-Lx`、`<!-- autopilot-admission -->`、`autopilot-degrade:v1`、`autopilot:degrade`。**仓库内的文件路径 `.github/autopr/` 暂不改**：autopr-standard 的接口层契约和 repo-readiness 都在用这个目录，要改需各方一起定 |
