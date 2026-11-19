@@ -1,0 +1,27 @@
+# Drill for slice 2 on autopilot-hub itself. Runs the degrade workflow from the default branch
+# (push / workflow_run / issues events always use the workflow file on the default branch).
+# Drill: label any issue `autopilot:freeze` -> a degrade issue (L0) opens; the next PR's admission
+# lists it under `limits`; closing the degrade issue lifts it.
+name: self-degrade
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: read
+
+jobs:
+  degrade:
+    uses: ./.github/workflows/degrade.yml
+    with:
+      hub_ref: ${{ github.sha }}
