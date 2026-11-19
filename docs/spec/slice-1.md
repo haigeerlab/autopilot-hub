@@ -107,7 +107,7 @@
 
 | # | 事项 | 结论 |
 | --- | --- | --- |
-| I1 | **中心仓库的可见性** | GitHub 规定：公开仓库只能调用公开仓库里的可复用 workflow；私有仓库的 workflow 只能被同一账号下的私有仓库调用（[Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)）。agent-relay 是公开仓库，所以 **autopilot-hub 必须改为公开**，否则切片 1 跑不起来。仓库里只有规则和脚本，没有密钥。改可见性待用户决定 |
+| I1 | **中心仓库的可见性** | GitHub 规定：公开仓库只能调用公开仓库里的可复用 workflow；私有仓库的 workflow 只能被同一账号下的私有仓库调用（[Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)）。agent-relay 是公开仓库，所以 **autopilot-hub 必须改为公开**，否则切片 1 跑不起来。仓库里只有规则和脚本，没有密钥。**已于 2026-11-19 按用户决定改为公开**（改之前核对过：全部提交使用 noreply 邮箱，历史中未发现疑似密钥） |
 | I2 | `trust.yml` 的写法 | 只用标准库，没有 YAML 解析器，所以本切片只读得懂**与 JSON 兼容的 YAML**。文件存在但读不懂时，按 L0 处理，不会悄悄忽略这一条限制 |
 | I3 | `allowed-tools.json` 初始为空 | repo-readiness 发布 v0.1.0 之前，所有 PR 都报 L0。这是预期行为 |
 | I4 | 临时 schema | `schemas/conclusion.v1.tmp.json` 按 repo-readiness SPEC §3.3 编写，多加了一个必填字段 `schema`，`tier` 的取值暂定为 `unmet`、`basic`、`standard`、`high`。这两点要和 readiness-tool 核对，等对方正式 schema 发布后整体替换 |
