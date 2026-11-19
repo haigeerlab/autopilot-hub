@@ -1,5 +1,7 @@
 {
   "schema": "autopilot-hub.allowed-tools/v1",
-  "$comment": "Released tool versions whose conclusions admission accepts. Match is on version AND 40-char SHA. Empty until repo-readiness publishes v0.1.0 (its checkpoint A); until then every PR reports L0. Editing this file is a T4 change.",
-  "tools": []
+  "$comment": "Released tool versions whose conclusions admission accepts. Match is on version AND 40-char commit (conclusion basis.tool). Must stay in step with schemas/vendor/repo-readiness/SOURCE.json. Editing this file is a T4 change.",
+  "tools": [
+    {"name": "repo-readiness", "version": "0.1.0", "commit": "8af61cab0725518159662806999cc87e8fd517a0"}
+  ]
 }

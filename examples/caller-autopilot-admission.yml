@@ -1,7 +1,7 @@
-# Copy to <repo>/.github/workflows/autopr-admission.yml in a caller repo (e.g. agent-relay).
+# Copy to <repo>/.github/workflows/autopilot-admission.yml in a caller repo (e.g. agent-relay).
 # Replace BOTH <HUB_SHA> occurrences with the same 40-char autopilot-hub commit SHA.
 # Adding or updating this file is a T4 change: the repo owner commits it, a human merges it.
-name: autopr-admission
+name: autopilot-admission
 
 on:
   pull_request:

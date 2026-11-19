@@ -1,9 +1,9 @@
 {
   "schema": "repo-readiness.conclusion/v1",
   "repo": "haigeerlab/agent-relay",
-  "head": "1111111111111111111111111111111111111111",
   "default_branch": "main",
-  "tier": "basic",
+  "head": "1111111111111111111111111111111111111111",
+  "tier": {"id": "basic", "name": "基础档"},
   "trust_cap": "L2",
   "apps": [
     {"id": "relay-core", "paths": ["src/core/**"], "tier": "standard", "trust_cap": "L3"},
@@ -11,12 +11,14 @@
   ],
   "basis": {
     "report_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "clauses": {"id": "autopr-standard", "version": "2.0", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-    "tool": {"version": "0.1.0", "sha": "2222222222222222222222222222222222222222"}
+    "rulesets": [
+      {"id": "autopr-onboarding", "kind": "base", "version": "2.0", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ],
+    "tool": {"version": "0.1.0", "commit": "2222222222222222222222222222222222222222"}
   },
   "issued_at": "2026-11-19T00:00:00Z",
   "valid_until": "2026-12-03T00:00:00Z",
-  "declarations_expire_at": "2027-02-17T00:00:00Z",
+  "declarations_expire_at": "2027-02-17",
   "waivers": [],
-  "attestation": null
+  "attestation": {"method": "none"}
 }

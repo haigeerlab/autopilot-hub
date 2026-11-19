@@ -1,0 +1,8 @@
+{
+  "$comment": "Verbatim copy of repo-readiness schemas/conclusion.v1.json at tag v0.1.0. Do not edit the copy; re-vendor from a new tag instead. Updating this directory is a T4 change.",
+  "repo": "haigeerlab/repo-readiness",
+  "tag": "v0.1.0",
+  "commit": "8af61cab0725518159662806999cc87e8fd517a0",
+  "path": "schemas/conclusion.v1.json",
+  "sha256": "ef165a422d68c4c6396726664c8dacfa1f67d9bba6561750971b4352c87e81c7"
+}

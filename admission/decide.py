@@ -7,10 +7,10 @@ import datetime as dt
 import json
 import re
 
-LEVELS = ("L0", "L1", "L2", "L3", "L4")
+LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5")
 STEP_IDS = ("exists", "schema", "repo", "valid_until", "tool", "app_cap", "limits")
 ATTESTATION_NOTE = "发布证明未校验：attestation 机制尚未定（repo-readiness 接口清单 #14）"
-DEGRADE_BLOCK = re.compile(r"<!--\s*autopr-degrade:v1\s+(.*?)\s*-->", re.S)
+DEGRADE_BLOCK = re.compile(r"<!--\s*autopilot-degrade:v1\s+(.*?)\s*-->", re.S)
 
 
 def rank(level):
@@ -19,6 +19,11 @@ def rank(level):
 
 def lowest(levels):
     return min(levels, key=rank)
+
+
+def as_level(value):
+    """Conclusion caps are free strings or null (the tool copies them from the ruler): anything else is L0."""
+    return value if value in LEVELS else "L0"
 
 
 def parse_time(value):
@@ -33,17 +38,39 @@ def parse_time(value):
     return parsed if parsed.tzinfo else None
 
 
-def validate(value, schema, path="$"):
-    """Minimal JSON Schema subset: type, required, properties, items, enum, pattern, minLength, format=date-time."""
+TYPE_CHECKS = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "null": lambda v: v is None,
+}
+
+
+def parse_date(value):
+    try:
+        return dt.date.fromisoformat(value) if isinstance(value, str) and len(value) == 10 else None
+    except ValueError:
+        return None
+
+
+def validate(value, schema, path="$", root=None):
+    """JSON Schema subset used by repo-readiness conclusion.v1: type (incl. lists and null), const, enum,
+    required, properties, additionalProperties=false, items, minItems, pattern, minLength,
+    format date-time / date, and local $ref to #/$defs/<name>. Unknown keywords are ignored."""
+    root = schema if root is None else root
+    if "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        if not schema["$ref"].startswith("#/$defs/") or name not in root.get("$defs", {}):
+            return [f"{path}: 无法解析的 $ref {schema['$ref']}"]
+        return validate(value, root["$defs"][name], path, root)
     errors = []
     expected = schema.get("type")
-    checks = {
-        "object": lambda v: isinstance(v, dict),
-        "array": lambda v: isinstance(v, list),
-        "string": lambda v: isinstance(v, str),
-    }
-    if expected and not checks[expected](value):
-        return [f"{path}: 应为 {expected}"]
+    if expected:
+        allowed = expected if isinstance(expected, list) else [expected]
+        if not any(TYPE_CHECKS[t](value) for t in allowed):
+            return [f"{path}: 应为 {'/'.join(allowed)}"]
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path}: 应为 {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: 取值 {value!r} 不在 {schema['enum']}")
     if isinstance(value, str):
@@ -53,16 +80,26 @@ def validate(value, schema, path="$"):
             errors.append(f"{path}: 长度不足")
         if schema.get("format") == "date-time" and parse_time(value) is None:
             errors.append(f"{path}: 不是带时区的 RFC 3339 时间")
+        if schema.get("format") == "date" and parse_date(value) is None:
+            errors.append(f"{path}: 不是 YYYY-MM-DD 日期")
     if isinstance(value, dict):
         for key in schema.get("required", []):
             if key not in value:
                 errors.append(f"{path}.{key}: 缺少必填字段")
-        for key, sub in schema.get("properties", {}).items():
+        props = schema.get("properties", {})
+        for key, sub in props.items():
             if key in value:
-                errors.extend(validate(value[key], sub, f"{path}.{key}"))
-    if isinstance(value, list) and "items" in schema:
-        for i, item in enumerate(value):
-            errors.extend(validate(item, schema["items"], f"{path}[{i}]"))
+                errors.extend(validate(value[key], sub, f"{path}.{key}", root))
+        if schema.get("additionalProperties") is False:
+            for key in value:
+                if key not in props:
+                    errors.append(f"{path}.{key}: 不允许的字段")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            errors.append(f"{path}: 至少 {schema['minItems']} 项")
+        if "items" in schema:
+            for i, item in enumerate(value):
+                errors.extend(validate(item, schema["items"], f"{path}[{i}]", root))
     return errors
 
 
@@ -86,7 +123,7 @@ def glob_match(pattern, path):
 
 
 def degrade_levels(issues, repo):
-    """Levels from open `autopr:degrade` issues scoped to this repo. Unparseable blocks fail closed to L0."""
+    """Levels from open `autopilot:degrade` issues scoped to this repo. Unparseable blocks fail closed to L0."""
     found = []
     for issue in issues:
         for block in DEGRADE_BLOCK.findall(issue.get("body") or ""):
@@ -109,26 +146,27 @@ def tool_allowed(tool, allowed):
     for entry in allowed.get("tools", []):
         if (entry.get("name") == "repo-readiness"
                 and entry.get("version") == tool.get("version")
-                and entry.get("sha") == tool.get("sha")):
+                and entry.get("commit") == tool.get("commit")):
             return True
     return False
 
 
 def app_cap(conclusion, changed_files):
-    """Cap for the changed files: one app -> that app's cap; several -> lowest; any unmapped path -> repo cap joins."""
-    repo_cap = conclusion["trust_cap"]
+    """Cap for the changed files. A file belongs to every app whose paths match it (all their caps apply);
+    a file no app claims gets the repo cap. The result is the lowest cap involved. Null or non-level caps are L0."""
+    repo_cap = as_level(conclusion["trust_cap"])
     apps = conclusion.get("apps") or []
     if not changed_files:
         return repo_cap, "没有改动文件，按仓库级上限"
     caps, owners = [], set()
     for path in changed_files:
-        owner = next((a for a in apps if any(glob_match(p, path) for p in a["paths"])), None)
-        if owner is None:
+        matched = [a for a in apps if any(glob_match(p, path) for p in a["paths"])]
+        if not matched:
             caps.append(repo_cap)
             owners.add("（仓库级）")
-        else:
-            caps.append(owner["trust_cap"])
-            owners.add(owner["id"])
+        for app in matched:
+            caps.append(as_level(app["trust_cap"]))
+            owners.add(app["id"])
     return lowest(caps), "涉及：" + "、".join(sorted(owners))
 
 
@@ -176,8 +214,8 @@ def decide(*, conclusion, schema, repo, default_branch, now, allowed_tools,
 
     tool = conclusion["basis"]["tool"]
     if not tool_allowed(tool, allowed_tools):
-        return fail("tool", f"工具 repo-readiness {tool.get('version')}@{tool.get('sha')} 不在允许列表里")
-    ok("tool", f"工具 repo-readiness {tool['version']}@{tool['sha'][:12]} 在允许列表里")
+        return fail("tool", f"工具 repo-readiness {tool.get('version')}@{tool.get('commit')} 不在允许列表里")
+    ok("tool", f"工具 repo-readiness {tool['version']}@{tool['commit'][:12]} 在允许列表里")
     if attestation_note:
         notes.append(ATTESTATION_NOTE)
 

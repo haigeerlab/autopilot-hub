@@ -24,7 +24,7 @@ class CliTest(unittest.TestCase):
         out_md = os.path.join(self.tmp, "out.md")
         args = [sys.executable, "-B", CLI,
                 "--conclusion", conclusion,
-                "--schema", os.path.join(ROOT, "schemas", "conclusion.v1.tmp.json"),
+                "--schema", os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "conclusion.v1.json"),
                 "--allowed-tools", os.path.join(FIX, "allowed-tools.json"),
                 "--repo", "haigeerlab/agent-relay", "--default-branch", "main",
                 "--now", "2026-11-20T12:00:00Z",
@@ -42,7 +42,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(result["cap"], "L2")
         self.assertEqual(len(result["conclusion_sha256"]), 64)
-        self.assertTrue(md.startswith("<!-- autopr-admission -->"))
+        self.assertTrue(md.startswith("<!-- autopilot-admission -->"))
         self.assertIn("信任上限 L2（只报告）", md)
 
     def test_missing_conclusion_still_exits_zero_with_L0(self):
@@ -66,7 +66,7 @@ class CliTest(unittest.TestCase):
             f.write("src/core/a.py\n")
         issues = os.path.join(self.tmp, "issues.json")
         with open(issues, "w") as f:
-            json.dump([{"body": '<!-- autopr-degrade:v1 {"scope":{"repo":"haigeerlab/agent-relay","tier":"*"},"level":"L2"} -->'}], f)
+            json.dump([{"body": '<!-- autopilot-degrade:v1 {"scope":{"repo":"haigeerlab/agent-relay","tier":"*"},"level":"L2"} -->'}], f)
         proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"),
                                        ["--changed-files", changed, "--degrade-issues", issues])
         self.assertEqual(proc.returncode, 0, proc.stderr)

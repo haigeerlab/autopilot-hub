@@ -17,7 +17,7 @@ if __package__ in (None, ""):
 
 from admission import decide as d  # noqa: E402
 
-MARKER = "<!-- autopr-admission -->"
+MARKER = "<!-- autopilot-admission -->"
 
 
 def read_json(path, *, optional):
@@ -41,7 +41,7 @@ def sha256_of(path):
 
 
 def render_markdown(result, conclusion_sha):
-    lines = [MARKER, f"### autopr/admission：{result['reason']}", ""]
+    lines = [MARKER, f"### autopilot/admission：{result['reason']}", ""]
     lines.append("| 步骤 | 结果 | 说明 |")
     lines.append("| --- | --- | --- |")
     for step in result["steps"]:
@@ -57,12 +57,12 @@ def render_markdown(result, conclusion_sha):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="autopr slice-1 admission (report-only)")
+    p = argparse.ArgumentParser(description="autopilot slice-1 admission (report-only)")
     p.add_argument("--conclusion", required=True, help="path to readiness-conclusion.json from the BASE branch (may be absent)")
     p.add_argument("--schema", required=True)
     p.add_argument("--allowed-tools", required=True)
     p.add_argument("--trust", help="optional .github/autopr/trust.yml (JSON-compatible YAML only)")
-    p.add_argument("--degrade-issues", help="optional JSON array of open autopr:degrade issues ({body: ...})")
+    p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({body: ...})")
     p.add_argument("--changed-files", help="optional file with one changed path per line")
     p.add_argument("--repo", required=True)
     p.add_argument("--default-branch", required=True)
