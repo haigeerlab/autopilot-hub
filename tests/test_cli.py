@@ -97,6 +97,21 @@ class CliTest(unittest.TestCase):
         proc, _, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"), ["--trust", "x"])
         self.assertEqual(proc.returncode, 2)
 
+    def test_real_m1_conclusion_is_L0_with_v0_2_0(self):
+        # First real conclusion for agent-relay, signed by repo-readiness v0.2.0 (unmet, trust_cap L0).
+        out_json = os.path.join(self.tmp, "o.json")
+        proc = subprocess.run([sys.executable, "-B", CLI,
+                               "--conclusion", os.path.join(FIX, "conclusion.agent-relay-m1.json"),
+                               "--schema", os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "conclusion.v1.json"),
+                               "--allowed-tools", os.path.join(ROOT, "allowed-tools.json"),
+                               "--repo", "haigeerlab/agent-relay", "--default-branch", "main",
+                               "--now", "2026-11-20T12:00:00Z", "--out-json", out_json, "--out-md", out_json + ".md"],
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.load(open(out_json, encoding="utf-8"))
+        self.assertEqual(result["cap"], "L0")
+        self.assertTrue(all(s["ok"] for s in result["steps"]), result["steps"])
+
     def test_bad_tier_map_exits_2(self):
         bad = os.path.join(self.tmp, "map.json")
         with open(bad, "w") as f:
