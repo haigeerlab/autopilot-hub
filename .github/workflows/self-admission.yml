@@ -1,0 +1,21 @@
+# End-to-end smoke test: autopilot-hub runs its own admission workflow on its own PRs,
+# using the scripts from the PR head (so the code under review is the code being exercised).
+# autopilot-hub has no readiness conclusion, so the expected result is L0 "没有接入结论"
+# with a neutral check run, label autopr:cap-L0 and one summary comment.
+name: self-admission
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  admission:
+    uses: ./.github/workflows/admission.yml
+    with:
+      hub_ref: ${{ github.event.pull_request.head.sha }}
