@@ -1,0 +1,119 @@
+# Reusable workflow: slice-1 admission (report-only). Spec: docs/spec/slice-1.md
+#
+# Callers pin BOTH the `uses:` ref and `hub_ref` to the same 40-char commit SHA of autopilot-hub,
+# see examples/caller-autopr-admission.yml. Updating that SHA in a caller repo is a T4 change.
+#
+# Safety:
+# - Triggered by the caller's `pull_request` event (never pull_request_target).
+# - Never checks out or runs PR code. The conclusion and trust files are read from the BASE branch via the API.
+# - All event values reach shell only through env vars, never inlined into `run:` scripts.
+# - The check run is always `neutral`: it reports a cap, it never blocks.
+name: autopr-admission
+
+on:
+  workflow_call:
+    inputs:
+      hub_ref:
+        description: "40-char autopilot-hub commit SHA; must equal the SHA in the caller's `uses:` line"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  admission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      HUB_REF: ${{ inputs.hub_ref }}
+    steps:
+      - name: Check hub_ref is a full commit SHA
+        run: |
+          case "${HUB_REF}" in
+            *[!0-9a-f]*|"") echo "::error::hub_ref must be a 40-char lowercase commit SHA"; exit 2 ;;
+          esac
+          [ "${#HUB_REF}" -eq 40 ] || { echo "::error::hub_ref must be 40 chars"; exit 2; }
+
+      - name: Check out autopilot-hub at the pinned SHA (scripts only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haigeerlab/autopilot-hub
+          ref: ${{ inputs.hub_ref }}
+          path: .hub
+          persist-credentials: false
+
+      - name: Collect inputs from the base branch and the PR (read-only API calls)
+        run: |
+          mkdir -p .admission
+          fetch() {  # $1 = repo path, $2 = output file; absent file stays absent
+            if gh api "repos/${REPO}/contents/$1?ref=${BASE_REF}" --jq .content > .admission/b64 2>/dev/null; then
+              base64 -d < .admission/b64 > "$2" || rm -f "$2"
+            fi
+          }
+          fetch .github/autopr/readiness-conclusion.json .admission/conclusion.json
+          fetch .github/autopr/trust.yml .admission/trust.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > .admission/changed.txt
+          gh issue list -R "${REPO}" --label autopr:degrade --state open --limit 200 --json body > .admission/degrade.json || echo '[]' > .admission/degrade.json
+
+      - name: Decide
+        run: |
+          python3 -B .hub/admission/cli.py \
+            --conclusion .admission/conclusion.json \
+            --schema .hub/schemas/conclusion.v1.tmp.json \
+            --allowed-tools .hub/allowed-tools.json \
+            --trust .admission/trust.json \
+            --degrade-issues .admission/degrade.json \
+            --changed-files .admission/changed.txt \
+            --repo "${REPO}" --default-branch "${DEFAULT_BRANCH}" \
+            --out-json .admission/result.json --out-md .admission/summary.md
+          cat .admission/summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Fork PR note
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "fork PR：token 只读，不写检查结果、标签和评论；结论见本次运行的 Summary。" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Publish neutral check run, label and summary comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          CAP="$(python3 -c 'import json;print(json.load(open(".admission/result.json"))["cap"])')"
+          TITLE="$(python3 -c 'import json;print(json.load(open(".admission/result.json"))["reason"])')"
+          python3 - <<'PY' > .admission/check.json
+          import json, os
+          print(json.dumps({
+              "name": "autopr/admission",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {"title": json.load(open(".admission/result.json"))["reason"],
+                         "summary": open(".admission/summary.md", encoding="utf-8").read()[:60000]},
+          }, ensure_ascii=False))
+          PY
+          gh api "repos/${REPO}/check-runs" --method POST --input .admission/check.json > /dev/null
+
+          for level in L0 L1 L2 L3 L4; do
+            [ "${level}" = "${CAP}" ] && continue
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/labels/autopr:cap-${level}" --method DELETE > /dev/null 2>&1 || true
+          done
+          gh label create "autopr:cap-${CAP}" -R "${REPO}" --color BFD4F2 --description "autopr 信任上限（只报告）" > /dev/null 2>&1 || true
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --method POST -f "labels[]=autopr:cap-${CAP}" > /dev/null
+
+          COMMENT_ID="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- autopr-admission -->"))][0].id // empty')"
+          python3 -c 'import json;print(json.dumps({"body":open(".admission/summary.md",encoding="utf-8").read()},ensure_ascii=False))' > .admission/comment.json
+          if [ -n "${COMMENT_ID}" ]; then
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --method PATCH --input .admission/comment.json > /dev/null
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --method POST --input .admission/comment.json > /dev/null
+          fi
+          echo "published cap=${CAP}: ${TITLE}"

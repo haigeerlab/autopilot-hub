@@ -53,7 +53,7 @@
 
 - 触发用 `pull_request`，**不用 `pull_request_target`**。本切片只需要读 base 分支上的文件和 API，不需要更高权限，正好避开 Scorecard 的 Dangerous-Workflow 高危模式（[standard-references.md](standard-references.md) 第 4 节第 7 条）。
 - 不 checkout、不执行 PR 分支上的任何代码。
-- 权限只开 `contents: read`、`checks: write`、`pull-requests: write`、`issues: read`。
+- 权限只开 `contents: read`、`checks: write`、`pull-requests: write`、`issues: write`。（实现时修订：标签不存在时要先创建，这需要 `issues: write`。）
 - 所有 action 按 40 位 SHA 固定，不用 `@v7` 这类标签。
 - 来自 fork 的 PR：这时 token 只读，检查结果可能写不上；在摘要里注明"fork PR 无法写入"，不算错误。
 
@@ -102,3 +102,13 @@
 | D1 | **中心仓库的名字和可见性**。改名的讨论还没结束（需求拷问），而中心仓库名一旦建好，各仓库就要按它引用 | 先用一个**与最终品牌无关的中性名字**，例如 `haigeerlab/autopilot-hub`，私有。以后改名时 GitHub 会自动重定向，引用的是 SHA，影响很小。也可以现在就把系统的名字定下来 |
 | D2 | **在 GitHub 上新建这个仓库**，这是对外的操作 | 由你明确同意后，我用 `gh repo create` 建，或者你自己建 |
 | D3 | agent 身份（设计 Q2） | **本切片不需要**：只报告、不开 PR、不发证据评论。它推迟到下一个切片再定，不阻塞本切片 |
+
+## 11. 实现时确定的事项（2026-11-19）
+
+| # | 事项 | 结论 |
+| --- | --- | --- |
+| I1 | **中心仓库的可见性** | GitHub 规定：公开仓库只能调用公开仓库里的可复用 workflow；私有仓库的 workflow 只能被同一账号下的私有仓库调用（[Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)）。agent-relay 是公开仓库，所以 **autopilot-hub 必须改为公开**，否则切片 1 跑不起来。仓库里只有规则和脚本，没有密钥。**已于 2026-11-19 按用户决定改为公开**（改之前核对过：全部提交使用 noreply 邮箱，历史中未发现疑似密钥） |
+| I2 | `trust.yml` 的写法 | 只用标准库，没有 YAML 解析器，所以本切片只读得懂**与 JSON 兼容的 YAML**。文件存在但读不懂时，按 L0 处理，不会悄悄忽略这一条限制 |
+| I3 | `allowed-tools.json` 初始为空 | repo-readiness 发布 v0.1.0 之前，所有 PR 都报 L0。这是预期行为 |
+| I4 | 临时 schema | `schemas/conclusion.v1.tmp.json` 按 repo-readiness SPEC §3.3 编写，多加了一个必填字段 `schema`，`tier` 的取值暂定为 `unmet`、`basic`、`standard`、`high`。这两点要和 readiness-tool 核对，等对方正式 schema 发布后整体替换 |
+| I5 | `hub_ref` 输入 | 调用方要在 `uses:` 和 `hub_ref` 里写同一个 40 位 SHA，因为可复用 workflow 无法可靠地拿到自身的提交号 |
