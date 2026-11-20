@@ -3,6 +3,7 @@
   "$comment": "Released tool versions whose conclusions admission accepts. Match is on version AND 40-char commit (conclusion basis.tool). Must include the release in schemas/vendor/repo-readiness/SOURCE.json; later releases may be added while conclusion.v1 is unchanged. Editing this file is a T4 change.",
   "tools": [
     {"name": "repo-readiness", "version": "0.1.0", "commit": "8af61cab0725518159662806999cc87e8fd517a0"},
-    {"name": "repo-readiness", "version": "0.2.0", "commit": "c77aabad9351e78e27e2415df776bce6c8306fd5"}
+    {"name": "repo-readiness", "version": "0.2.0", "commit": "c77aabad9351e78e27e2415df776bce6c8306fd5"},
+    {"name": "repo-readiness", "version": "0.3.1", "commit": "c5194789a0cb338436865f29e40f32a6be2833f6"}
   ]
 }

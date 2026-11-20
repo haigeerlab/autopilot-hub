@@ -299,3 +299,12 @@ class VendoredSchemaTest(unittest.TestCase):
         allowed = json.load(open(os.path.join(ROOT, "allowed-tools.json"), encoding="utf-8"))
         self.assertIn({"name": "repo-readiness", "version": source["tag"].lstrip("v"), "commit": source["commit"]},
                       allowed["tools"])
+
+
+class AllowedListTest(unittest.TestCase):
+    def test_released_versions_are_pinned(self):
+        allowed = json.load(open(os.path.join(ROOT, "allowed-tools.json"), encoding="utf-8"))
+        pairs = {(t["version"], t["commit"]) for t in allowed["tools"] if t["name"] == "repo-readiness"}
+        self.assertIn(("0.2.0", "c77aabad9351e78e27e2415df776bce6c8306fd5"), pairs)  # signed the M1 conclusion
+        self.assertIn(("0.3.1", "c5194789a0cb338436865f29e40f32a6be2833f6"), pairs)
+        self.assertNotIn("0.3.0", {v for v, _ in pairs})
