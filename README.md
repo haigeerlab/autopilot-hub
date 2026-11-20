@@ -8,6 +8,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 
 - **切片 1**（只报告）：准入脚本读取 repo-readiness 出具的接入结论，算出 PR 的信任上限。试点仓库是 agent-relay。规格见 [docs/spec/slice-1.md](docs/spec/slice-1.md)。
 - **切片 2**：出事时自动开 `autopilot:degrade` issue（撤回 autopilot 的 PR、它合并后主干变红、手动打 `autopilot:regression` 或 `autopilot:freeze`），准入读它压低上限；关闭 issue 即解除。规格见 [docs/spec/slice-2.md](docs/spec/slice-2.md)。
+- **切片 3**：在用户的 Mac 上每周复检接入就绪度，repo-readiness 报告出掉档信号时自动开 `autopilot:degrade` issue（原因 `readiness-drop`）。手动运行 `python3 -B recheck/run.py`，配置放 `~/.autopilot/recheck/config.json`（示例 `examples/recheck-config.example.json`），定时示例 `examples/com.haigeerlab.autopilot-recheck.plist`。规格见 [docs/spec/slice-3.md](docs/spec/slice-3.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
 ## 规则
