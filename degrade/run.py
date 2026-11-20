@@ -35,11 +35,16 @@ REASON_TEXT = {
     "main-red": "autopilot 的 PR 合并后，main 上的主 CI 失败",
     "regression": "有 issue 被标记为回归（autopilot:regression）",
     "freeze": "有 issue 被打上冻结标签（autopilot:freeze）",
+    "readiness-drop": "每周复检发现接入档掉档（repo-readiness 的掉档信号）",
 }
 
 
 class ApiError(Exception):
     pass
+
+
+class NotFound(ApiError):
+    """The API answered 404."""
 
 
 def parse_pages(text):
@@ -67,7 +72,8 @@ def gh_api(path, method="GET", body=None):
     proc = subprocess.run(args, input=json.dumps(body) if body is not None else None,
                           capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
-        raise ApiError(f"{method} {path} failed: {proc.stderr.strip()[:300]}")
+        err = NotFound if "HTTP 404" in proc.stderr else ApiError
+        raise err(f"{method} {path} failed: {proc.stderr.strip()[:300]}")
     try:
         return parse_pages(proc.stdout) if proc.stdout.strip() else None
     except ValueError as e:
