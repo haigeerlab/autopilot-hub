@@ -5,7 +5,8 @@ so the flow itself is testable with fakes. Every stop leaves one bot comment say
 is merged unless the local admission -- the same code as the reusable workflow, fed fresh inputs -- says
 "可以自动合并" on the exact head SHA that was checked and reviewed.
 
-Steps: PR guards -> open degrade issues -> takeover comment -> risk pre-check -> checks in a throwaway clone
+Steps: PR guards -> open degrade issues -> takeover (spec-guard projects: base-branch .agent/config.json once the
+module is known from its acceptance record; others: .github/autopr/takeover.yml) -> risk pre-check -> checks in a throwaway clone
 -> local check evidence file (read by spec-guard) -> review: spec-guard modules reuse the final-acceptance
 review recorded outside the commit, other repos run delegate (round 2 rechecks against round 1) -> evidence
 comment -> admission -> merge --match-head-commit -> read back -> labels.
@@ -58,6 +59,58 @@ def base_file(io, repo, path, ref):
     if not isinstance(data, dict) or "content" not in data:
         return None
     return base64.b64decode(data["content"]).decode("utf-8")
+
+
+SG_CAPABILITY_MAP = "spec/CAPABILITY-MAP.md"
+SG_CONFIG = ".agent/config.json"
+SG_PRESETS = {"none": "human", "plan": "human", "merge": "auto"}
+SG_ITEMS = {"spec": ("human", "codex"), "plan": ("human", "codex"), "merge": ("human", "auto"),
+            "release": ("human", "prepare", "auto-confirm", "auto")}
+
+
+def say_takeover(say, module, merge, source):
+    say(f"接管档位（来源 {source}" + (f"，模块 {module}" if module else "") + f"）：合并 {merge}\n\n"
+        + block("autopilot-takeover", {"module": module, "merge": merge, "source": source}) + "\n")
+
+
+def read_sg_config(io, repo, base_ref, notes):
+    """spec-guard's `.agent/config.json` on the BASE branch (a PR cannot widen its own takeover); {} when absent."""
+    text = base_file(io, repo, SG_CONFIG, base_ref)
+    if text is None:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        notes.append(f"{SG_CONFIG} 读不懂，合并一律按人合")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def takeover_merge(value):
+    """`merge` of one spec-guard takeover value (preset or item object, spec/takeover-config.md); None if invalid."""
+    if isinstance(value, str):
+        return SG_PRESETS.get(value)
+    if isinstance(value, dict) and all(k in SG_ITEMS and v in SG_ITEMS[k] for k, v in value.items()):
+        return value.get("merge", "human")
+    return None
+
+
+def module_merge(config, module):
+    """Effective merge item for `module`, as spec-guard 0.91 resolves it: the module's own moduleTakeover entry,
+    else the project takeover, else none. Any bad moduleTakeover entry invalidates the whole key; anything
+    unreadable means human."""
+    project = takeover_merge(config.get("takeover", "none")) or "human"
+    entries = config.get("moduleTakeover", {})
+    if not isinstance(entries, dict) or any(takeover_merge(v) is None for v in entries.values()):
+        return project
+    return takeover_merge(entries[module]) if module in entries else project
+
+
+def any_auto_merge(config):
+    """Cheap pre-check before running checks: could any module of this project merge automatically?"""
+    entries = config.get("moduleTakeover", {})
+    modules = list(entries) if isinstance(entries, dict) else []
+    return module_merge(config, None) == "auto" or any(module_merge(config, m) == "auto" for m in modules)
 
 
 def read_takeover(io, repo, base_ref, notes):
@@ -251,15 +304,18 @@ def run(io, repo, number, *, dry_run=False):
         if not degrade["ok"]:
             raise Stop("degrade", degrade["detail"])
 
-        takeover = read_takeover(io, repo, pr["base"]["ref"], notes)
-        module = io.spec_guard_module(repo, pr)
-        if module:
-            takeover["module"] = module
-        say(f"接管档位（来源 {takeover['source']}）：合并 {takeover['merge']}\n\n"
-            + block("autopilot-takeover", {"module": takeover["module"], "merge": takeover["merge"],
-                                           "source": takeover["source"]}) + "\n")
-        if takeover["merge"] != "auto":
-            raise Stop("takeover", "接管档位里合并由人，autopilot 不合并，交你")
+        base_ref = pr["base"]["ref"]
+        sg_config = None
+        if base_file(io, repo, SG_CAPABILITY_MAP, base_ref) is not None:
+            sg_config = read_sg_config(io, repo, base_ref, notes)
+            if not any_auto_merge(sg_config):
+                say_takeover(say, None, "human", SG_CONFIG)
+                raise Stop("takeover", "spec-guard 项目的接管配置里没有任何模块的合并是 auto，交你")
+        else:
+            takeover = read_takeover(io, repo, base_ref, notes)
+            say_takeover(say, None, takeover["merge"], takeover["source"])
+            if takeover["merge"] != "auto":
+                raise Stop("takeover", "接管档位里合并由人，autopilot 不合并，交你")
 
         pre = evaluate(io, repo, pr, bot)
         risk_item = next(i for i in pre["items"] if i["id"] == "risk")
@@ -275,12 +331,23 @@ def run(io, repo, number, *, dry_run=False):
                 raise Stop("check", f"检查 `{command}` 退出码 {check['exit']}，交作者修")
             io.write_check_evidence(repo, check_evidence(repo, head, command, check, io.now()))
             acceptance = None
-            if takeover["module"]:
-                acceptance, report = accepted_review(io, repo, takeover["module"], head)
+            if sg_config is not None:
+                modules = io.find_modules(repo, head)
+                if not modules:
+                    raise Stop("acceptance", "这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
+                                             "本机检查证据已写好，等 spec-guard 验收后再运行")
+                if len(modules) > 1:
+                    raise Stop("acceptance", "当前提交有多条验收记录（" + "、".join(sorted(modules)) + "），拿不准属于哪个模块")
+                module = modules[0]
+                merge = module_merge(sg_config, module)
+                say_takeover(say, module, merge, SG_CONFIG)
+                if merge != "auto":
+                    raise Stop("takeover", f"模块 {module} 的接管档位里合并由人，交你")
+                acceptance, report = accepted_review(io, repo, module, head)
                 fp, rounds = gate_review(report), 1
                 if blocking_of(report):
                     raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
-                notes.append(f"模块 {takeover['module']} 沿用 spec-guard 的验收审查报告，不另审")
+                notes.append(f"模块 {module} 沿用 spec-guard 的验收审查报告，不另审")
             else:
                 report, rounds, fp = review(io, repo, pr, work, notes)
 

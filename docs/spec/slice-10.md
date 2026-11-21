@@ -62,5 +62,24 @@ python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 2 --
   满足后，**直接用这份验收审查报告，不再另审**，同一提交不用花两次 Codex 额度。证据评论的 `acceptance` 写成 `{marker, sha}`。
 - **还没有验收时**：编排写完本机证据就停在「acceptance」。spec-guard 读到证据、完成验收后，再运行一次编排；同一提交上的检查会重跑，但审查不会再花额度。
 - **限制**：
-  - PR 属于哪个模块要从 spec-guard 0.91 的 `/map --json` 读，0.91 发布前 `spec_guard_module()` 一律返回"不是模块"，这一路只在测试里跑过；
   - 只有人批、没有审查报告的 `approved` 记录，现在按"报告读不到"停下。
+
+## 增补：spec-guard 项目的判定与接管档位（2026-11-22，spec-guard 0.91.0 发版后）
+
+和 sg-coord 商定（#21984–#21986、#21992），按"拿不准就停"处理：
+
+- **是不是 spec-guard 项目**：看基础分支上有没有 `spec/CAPABILITY-MAP.md`。不看 CLAUDE.md、AGENTS.md，因为有的项目只在本机启用 spec-guard，这两个文件不提交。
+- **是 spec-guard 项目时**：
+  - 先粗查一遍：基础分支的 `.agent/config.json` 里，项目和所有模块的合并都不是 `auto`，就在跑检查之前停下。
+  - 检查通过、写好本机证据后，在你本机检出里列出 `git rev-parse --git-path spec-guard/acceptance` 目录下的记录，取 `sha == head` 的那条，确定模块：
+    - 没有 → 停在「acceptance」，不退回普通审查。不属于任何模块的 PR 也停在这里，交人合并。
+    - 多于一条 → 停。
+  - 这个模块的合并档位按 spec-guard 0.91 的规则从**基础分支**的 `.agent/config.json` 算（PR 改不了它）：
+    - 先用模块自己的 `moduleTakeover` 那一项，没有就用项目的 `takeover`，都没有按 `none` 算；
+    - 预设 `merge` → auto，`none`、`plan` → human；
+    - 写成对象时看它的 `merge` 项，缺了就是 human；
+    - `moduleTakeover` 里只要有一项不合法，整个键都作废，退回项目的 `takeover`；
+    - 读不懂一律按 human。
+  - 不是 `auto` 就停；是 `auto` 就按上一节复用验收审查。
+- **不是 spec-guard 项目**：照旧读 `.github/autopr/takeover.yml`。
+- 接管评论在模块确定之后才发，写上模块名和来源（`.agent/config.json`）。准入据此要求证据里带验收标记。
