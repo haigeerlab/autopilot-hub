@@ -11,8 +11,8 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from admission import decide as d  # noqa: E402
-from risk import tiers  # noqa: E402
+from admission import decide as d
+from risk import tiers
 
 REPO = "haigeerlab/agent-relay"
 TEMPLATES = tiers.load_templates()
