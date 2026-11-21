@@ -2,7 +2,7 @@
   "schema": "autopilot.risk-templates/v1",
   "$comment": "Slice 4 (docs/spec/slice-4.md). Common rules apply to every repo; a repo picks one category with .github/autopr/risk-tiers.json {\"extends\": \"<category>\"} and may add paths. All matching rules count and the highest tier wins, so a repo can only add or tighten, never lower. Unmatched files get the category default (T3 when no category). Editing this file is a T4 change.",
   "common": {
-    "T4": [".github/**", "LICENSE", ".agent/**"],
+    "T4": [".github/**", "LICENSE", "**/LICENSE", ".agent/**"],
     "T3": ["CLAUDE.md", "AGENTS.md", "**/CLAUDE.md", "**/AGENTS.md"],
     "T0": ["README*.md", "**/README*.md", "CHANGELOG.md", "**/CHANGELOG.md"]
   },
@@ -31,7 +31,9 @@
   "categories": {
     "plugin": {
       "default": "T3",
-      "T4": [".claude-plugin/**", ".codex-plugin/**", "**/plugin.json", "plugin.json"],
+      "T4": [".claude-plugin/**", "**/.claude-plugin/**", ".codex-plugin/**", "**/.codex-plugin/**",
+             "plugin.json", "**/plugin.json", "interface.json", "**/interface.json",
+             "RELEASING*.md", "**/RELEASING*.md", "scripts/validate.sh", "**/scripts/validate.sh"],
       "T2": ["commands/**", "skills/**", "**/commands/**", "**/skills/**"],
       "T1": ["test/**", "tests/**", "**/test-*.sh", "**/test_*.py", "docs/research/**"],
       "T0": ["docs/**"]
