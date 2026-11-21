@@ -6,8 +6,9 @@ is merged unless the local admission -- the same code as the reusable workflow, 
 "可以自动合并" on the exact head SHA that was checked and reviewed.
 
 Steps: PR guards -> open degrade issues -> takeover comment -> risk pre-check -> checks in a throwaway clone
--> delegate review (round 2 rechecks against round 1) -> evidence comment -> admission -> merge
---match-head-commit -> read back -> labels.
+-> local check evidence file (read by spec-guard) -> review: spec-guard modules reuse the final-acceptance
+review recorded outside the commit, other repos run delegate (round 2 rechecks against round 1) -> evidence
+comment -> admission -> merge --match-head-commit -> read back -> labels.
 """
 import base64
 import hashlib
@@ -143,11 +144,7 @@ def review(io, repo, pr, work, notes):
                        "started_at": started, "stopped_at": io.now()})
             raise Stop("review", f"审查没有结论（{status}）。Codex 不可用时一律停下等你，不退回别的审查方式")
         io.save_review(repo, pr["number"], {"head_sha": head, "rounds": rounds, "report": report})
-    if report.get("unreviewed"):
-        raise Stop("review", "有文件没审到：" + "、".join(str((u or {}).get("path")) for u in report["unreviewed"]))
-    fp = ((report.get("scope") or {}).get("fingerprint") or {}).get("sha256")
-    if not fp:
-        raise Stop("review", "审查报告没有补丁指纹，证据无法绑定提交")
+    fp = gate_review(report)
     n = blocking_of(report)
     if n and rounds >= MAX_REVIEW_ROUNDS:
         raise Stop("review", f"复审 {rounds} 轮后仍有 {n} 条 blocking，停下交你")
@@ -156,13 +153,59 @@ def review(io, repo, pr, work, notes):
     return report, rounds, fp
 
 
-def evidence_body(head, command, check, report, rounds, fp):
+ACCEPTANCE_MARKERS = ("codex-approved", "approved")
+
+
+def check_evidence(repo, head, command, check, ran_at):
+    """`autopilot.check-evidence/v1`: the local file spec-guard reads before recording final acceptance."""
+    return {"schema": "autopilot.check-evidence/v1", "repo": repo, "head_sha": head,
+            "runner": "autopilot-orchestrator", "non_author": True, "clone": "throwaway", "ran_at": ran_at,
+            "checks": [{"cmd": command, "exit": check["exit"], "output_sha256": check["output_sha256"],
+                        "tail": check["tail"]}]}
+
+
+def accepted_review(io, repo, module, head):
+    """Final acceptance of a spec-guard module, recorded outside the commit
+    (`git rev-parse --git-path spec-guard/acceptance/<module>.json`). Returns (acceptance, report). Raises Stop."""
+    found = io.acceptance(repo, module)
+    if not found:
+        raise Stop("acceptance", f"模块 {module} 还没有最终验收：本机检查证据已写好，等 spec-guard 让 Codex 对照 Spec 验收后再运行")
+    rec = found.get("record") or {}
+    if rec.get("module") != module or rec.get("marker") not in ACCEPTANCE_MARKERS:
+        raise Stop("acceptance", f"模块 {module} 的验收记录不对（模块或标记不符）")
+    if rec.get("sha") != head:
+        raise Stop("acceptance", f"模块 {module} 的验收绑定的是 {str(rec.get('sha'))[:12]}，不是当前提交 {head[:12]}，要重新验收")
+    text = found.get("report_text")
+    if text is None or hashlib.sha256(text.encode("utf-8")).hexdigest() != rec.get("report_sha256"):
+        raise Stop("acceptance", "验收审查报告读不到，或和记录里的 sha256 对不上")
+    try:
+        report = json.loads(text)
+    except ValueError:
+        raise Stop("acceptance", "验收审查报告不是 JSON") from None
+    if not conclusive(report):
+        raise Stop("acceptance", "验收审查报告没有结论")
+    if ((report.get("scope") or {}).get("baseline") or {}).get("to") != head:
+        raise Stop("acceptance", "验收审查报告审的不是当前提交")
+    return {"marker": rec["marker"], "sha": head}, report
+
+
+def gate_review(report):
+    """Same bar for our own review and a reused acceptance review: all files seen, a fingerprint, no blocking."""
+    if report.get("unreviewed"):
+        raise Stop("review", "有文件没审到：" + "、".join(str((u or {}).get("path")) for u in report["unreviewed"]))
+    fp = ((report.get("scope") or {}).get("fingerprint") or {}).get("sha256")
+    if not fp:
+        raise Stop("review", "审查报告没有补丁指纹，证据无法绑定提交")
+    return fp
+
+
+def evidence_body(head, command, check, report, rounds, fp, acceptance=None):
     payload = {"head_sha": head, "runner": "autopilot-orchestrator",
                "checks": [{"cmd": command, "exit": check["exit"], "output_sha256": check["output_sha256"]}],
                "review": {"backend": report.get("backend"), "status": report.get("execution_status"),
                           "outcome": report.get("review_outcome"), "fingerprint": fp,
                           "blocking": blocking_of(report), "rounds": rounds},
-               "acceptance": None}
+               "acceptance": acceptance}
     tail = "\n".join(check["tail"])
     return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`）\n\n"
             f"- 检查：`{command}`，退出码 {check['exit']}（在一次性克隆里由本机编排重新运行）\n"
@@ -209,6 +252,9 @@ def run(io, repo, number, *, dry_run=False):
             raise Stop("degrade", degrade["detail"])
 
         takeover = read_takeover(io, repo, pr["base"]["ref"], notes)
+        module = io.spec_guard_module(repo, pr)
+        if module:
+            takeover["module"] = module
         say(f"接管档位（来源 {takeover['source']}）：合并 {takeover['merge']}\n\n"
             + block("autopilot-takeover", {"module": takeover["module"], "merge": takeover["merge"],
                                            "source": takeover["source"]}) + "\n")
@@ -227,12 +273,21 @@ def run(io, repo, number, *, dry_run=False):
             check = work.run_check(command)
             if check["exit"] != 0:
                 raise Stop("check", f"检查 `{command}` 退出码 {check['exit']}，交作者修")
-            report, rounds, fp = review(io, repo, pr, work, notes)
+            io.write_check_evidence(repo, check_evidence(repo, head, command, check, io.now()))
+            acceptance = None
+            if takeover["module"]:
+                acceptance, report = accepted_review(io, repo, takeover["module"], head)
+                fp, rounds = gate_review(report), 1
+                if blocking_of(report):
+                    raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
+                notes.append(f"模块 {takeover['module']} 沿用 spec-guard 的验收审查报告，不另审")
+            else:
+                report, rounds, fp = review(io, repo, pr, work, notes)
 
         if dry_run:
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
                     "notes": notes, "head_sha": head}
-        say(evidence_body(head, command, check, report, rounds, fp))
+        say(evidence_body(head, command, check, report, rounds, fp, acceptance))
 
         decision = evaluate(io, repo, pr, bot)
         if not decision["auto_merge"]:

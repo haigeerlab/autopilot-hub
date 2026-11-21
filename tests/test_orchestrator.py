@@ -52,8 +52,11 @@ class FakeWork:
 
 class FakeIO:
     def __init__(self, *, merge="auto", files=("docs/a.md",), author=None, fork=False, degrade=(), takeover=True,
-                 reports=None, check_exit=0, check_command="make test", stored=None, merged_ok=True, bot=BOT):
+                 reports=None, check_exit=0, check_command="make test", stored=None, merged_ok=True, bot=BOT,
+                 module=None, acceptance=None):
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
+        self.evidence_files = []
+        self.module, self.acceptance_record = module, acceptance
         self.bot = bot
         self.check_command, self.check_exit = check_command, check_exit
         self.reports = list(reports if reports is not None else [report()])
@@ -119,6 +122,15 @@ class FakeIO:
 
     def ledger(self, event):
         self.events.append(event)
+
+    def write_check_evidence(self, repo, data):
+        self.evidence_files.append(data)
+
+    def spec_guard_module(self, repo, pr):
+        return self.module
+
+    def acceptance(self, repo, module):
+        return self.acceptance_record
 
     def now(self):
         return T0
@@ -275,6 +287,134 @@ class StopTest(unittest.TestCase):
         run(io)
         self.assertTrue(io.comments[-1]["body"].startswith(flow.RUN_MARKER))
         self.assertIn("「check」", io.comments[-1]["body"])
+
+
+def accepted(report_obj=None, sha=HEAD, marker="codex-approved", module="m", tamper=False):
+    import hashlib
+    text = json.dumps(report_obj if report_obj is not None else report_for(HEAD))
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    return {"record": {"marker": marker, "sha": sha, "module": module, "report": "/x/report.json",
+                       "report_sha256": "0" * 64 if tamper else digest, "at": T0},
+            "report_text": text}
+
+
+def report_for(to):
+    r = report()
+    r["scope"]["baseline"] = {"mode": "commits", "from": "b" * 40, "to": to}
+    return r
+
+
+class CheckEvidenceFileTest(unittest.TestCase):
+    def test_written_after_checks_pass(self):
+        io = FakeIO()
+        run(io)
+        ev = io.evidence_files[0]
+        self.assertEqual(ev["schema"], "autopilot.check-evidence/v1")
+        self.assertEqual((ev["repo"], ev["head_sha"], ev["runner"], ev["non_author"], ev["clone"]),
+                         (REPO, HEAD, "autopilot-orchestrator", True, "throwaway"))
+        self.assertEqual(ev["checks"][0]["cmd"], "make test")
+        self.assertEqual(ev["checks"][0]["exit"], 0)
+        self.assertEqual(len(ev["checks"][0]["output_sha256"]), 64)
+
+    def test_written_in_dry_run_too(self):
+        io = FakeIO()
+        run(io, dry_run=True)
+        self.assertEqual(len(io.evidence_files), 1)
+
+    def test_not_written_when_check_fails(self):
+        io = FakeIO(check_exit=1)
+        run(io)
+        self.assertEqual(io.evidence_files, [])
+
+
+class AcceptanceTest(unittest.TestCase):
+    """spec-guard modules: final acceptance recorded outside the commit; its review report replaces ours."""
+
+    def test_module_without_acceptance_stops_after_writing_evidence(self):
+        io = FakeIO(module="m")
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
+        self.assertEqual(len(io.evidence_files), 1)
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_valid_acceptance_reuses_its_report_and_merges(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[])
+        res = run(io)
+        self.assertEqual(res["result"], "merged", res)
+        self.assertEqual(io.reviews, [])
+        ev = json.loads(flow_block([c["body"] for c in io.comments if "autopilot-evidence" in c["body"]][0],
+                                   "autopilot-evidence"))
+        self.assertEqual(ev["acceptance"], {"marker": "codex-approved", "sha": HEAD})
+
+    def test_takeover_comment_names_the_module(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[])
+        run(io)
+        self.assertIn('"module": "m"', io.comments[0]["body"])
+
+    def test_bad_acceptance_records(self):
+        cases = {
+            "旧提交": accepted(sha="b" * 40),
+            "标记": accepted(marker="pending"),
+            "模块": accepted(module="other"),
+            "sha256": accepted(tamper=True),
+            "报告提交": accepted(report_obj=report_for("c" * 40)),
+            "blocking": accepted(report_obj=dict(report_for(HEAD), findings=[{"severity": "blocking"}],
+                                                review_outcome="findings")),
+        }
+        for name, acc in cases.items():
+            io = FakeIO(module="m", acceptance=acc, reports=[])
+            res = run(io)
+            self.assertEqual(res["result"], "stopped", name)
+            self.assertIn(res["step"], ("acceptance", "review"), name)
+            self.assertEqual(io.merge_calls(), [], name)
+
+    def test_human_approved_acceptance_counts(self):
+        self.assertEqual(run(FakeIO(module="m", acceptance=accepted(marker="approved"), reports=[]))["result"], "merged")
+
+
+class LocalIOTest(unittest.TestCase):
+    """The file side of LocalIO: evidence file and acceptance record, in a temp HOME-like state dir."""
+
+    def setUp(self):
+        import tempfile
+        from orchestrator import cli
+        self.cli = cli
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old_state = cli.STATE
+        cli.STATE = os.path.join(self.tmp.name, "state")
+        self.addCleanup(setattr, cli, "STATE", self.old_state)
+        self.io = cli.LocalIO("t", "/nonexistent")
+
+    def test_evidence_file_path_and_content(self):
+        data = flow.check_evidence(REPO, HEAD, "make test", flow.check_result(0, "ok\n"), T0)
+        self.io.write_check_evidence(REPO, data)
+        path = os.path.join(self.cli.STATE, "evidence", "haigeerlab__autopilot-sandbox", HEAD + ".json")
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), data)
+
+    def test_acceptance_from_git_path(self):
+        import subprocess
+        root = os.path.join(self.tmp.name, "checkout")
+        os.makedirs(root)
+        subprocess.run(["git", "-C", root, "init", "-q"], check=True)
+        os.makedirs(self.cli.STATE)
+        with open(os.path.join(self.cli.STATE, "config.json"), "w") as fh:
+            json.dump({"checkouts": {REPO: root}}, fh)
+        self.assertIsNone(self.io.acceptance(REPO, "m"))
+        report_path = os.path.join(self.tmp.name, "report.json")
+        with open(report_path, "w") as fh:
+            fh.write("{}")
+        acc_dir = os.path.join(root, ".git", "spec-guard", "acceptance")
+        os.makedirs(acc_dir)
+        with open(os.path.join(acc_dir, "m.json"), "w") as fh:
+            json.dump({"marker": "codex-approved", "sha": HEAD, "module": "m", "report": report_path}, fh)
+        found = self.io.acceptance(REPO, "m")
+        self.assertEqual(found["record"]["sha"], HEAD)
+        self.assertEqual(found["report_text"], "{}")
+        self.assertIsNone(self.io.acceptance(REPO, "../m"))
+        self.assertIsNone(self.io.acceptance("other/repo", "m"))
 
 
 class AdmissionAgreesTest(unittest.TestCase):
