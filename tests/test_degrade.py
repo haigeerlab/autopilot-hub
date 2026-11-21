@@ -105,7 +105,8 @@ class RevertTest(unittest.TestCase):
         self.assertEqual(payload["ref"], REVERT_COMMIT)
         self.assertEqual(payload["scope"], {"repo": REPO, "tier": "*"})
         self.assertIn("关闭本 issue", body)
-        self.assertEqual(admission.degrade_levels([{"body": body}], REPO), ["L2"])
+        self.assertFalse(admission.degrade_item([{"number": 1, "body": body}], REPO)[0]["ok"])
+        self.assertIn("这个仓库不会自动合并", body)
         self.assertEqual(out["opened"], 1)
 
     def test_revert_of_human_pr_does_nothing(self):

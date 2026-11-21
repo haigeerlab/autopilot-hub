@@ -1,7 +1,0 @@
-{
-  "tool_version": "0.3.1",
-  "repos": [
-    {"repo": "haigeerlab/agent-relay",
-     "seed_report": "/Users/<you>/Documents/haigeerlab/repo-readiness/out/m1-agent-relay/report.json"}
-  ]
-}

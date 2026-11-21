@@ -6,7 +6,7 @@
 # Safety:
 # - Triggered by the caller's push / workflow_run / issues events. Never checks out or runs PR code.
 # - Event values reach the script only through the event JSON file, never inlined into `run:`.
-# - Only opens or comments on `autopilot:degrade` issues; degrading can only lower the admission cap.
+# - Only opens or comments on `autopilot:degrade` issues; an open degrade issue only stops auto-merge.
 # - Any API failure fails the run (red) without writing anything.
 name: autopilot-degrade
 

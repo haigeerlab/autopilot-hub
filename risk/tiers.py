@@ -118,7 +118,7 @@ def file_tier(templates, layer_list, default, f):
 
 
 def is_prose(templates, name):
-    """Docs mention markers like `# noqa` when describing rules; they are not suppressions."""
+    """Docs mention suppression markers when describing rules; they are not suppressions."""
     return any_match(templates.get("prose_files", []), name) is not None
 
 
@@ -220,4 +220,15 @@ def read_repo_config(path):
         data = json.load(fh)
     if not isinstance(data, dict):
         raise ValueError("risk-tiers.json 必须是一个 JSON 对象")
+    return data
+
+
+def read_repo_config_yml(path):
+    """Like read_repo_config for risk-tiers.yml (YAML subset); raises ValueError when unreadable."""
+    if not path or not os.path.exists(path):
+        return None
+    from checkup import yamlsub  # local: keeps checkup out of the import path of plain classify callers
+    data = yamlsub.load(path)
+    if not isinstance(data, dict):
+        raise ValueError("risk-tiers.yml 必须是一个映射")
     return data

@@ -3,14 +3,14 @@
 Ported from repo-readiness src/repo_readiness/remedy/__init__.py at commit ac13f17: the branch
 ruleset body and its `gh api` command (generator github.branch-rules), `_patch` (difflib unified
 diff) and the autopilot-exception section of the instructions file (generator
-instructions.autopr-exception). Messages rewritten in Chinese. The risk-tiers.json guess is new.
+instructions.autopr-exception). Messages rewritten in Chinese. The risk-tiers.yml guess is new.
 """
 import difflib
 import json
 import os
 
 FRONTEND_DEPS = ("react", "vue", "svelte", "@angular/core", "next", "nuxt", "vite")
-RISK_TIERS_PATH = ".github/autopr/risk-tiers.json"
+RISK_TIERS_PATH = ".github/autopr/risk-tiers.yml"  # slice 7: back to YAML
 
 
 def unified_patch(path, old, new):
@@ -120,7 +120,7 @@ def build_fixes(root, name, branch, findings, command, out_dir):
     if status.get("C11") == "missing":
         cat = guess_category(root)
         if cat:
-            rel = write(RISK_TIERS_PATH, json.dumps({"extends": cat}) + "\n")
+            rel = write(RISK_TIERS_PATH, "extends: %s\n" % cat)
             add("F2", "C11", "风险分级配置", [rel], ["# 复制到仓库：%s" % RISK_TIERS_PATH],
                 "类别「%s」是按目录特征猜的，请确认" % cat)
         else:

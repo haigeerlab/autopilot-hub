@@ -299,10 +299,10 @@ class FixesTest(unittest.TestCase):
         for files, want in cases:
             root, out = make_repo(self, files), self.out_dir()
             self.build(root, out)
-            path = os.path.join(out, ".github", "autopr", "risk-tiers.json")
+            path = os.path.join(out, ".github", "autopr", "risk-tiers.yml")
             text = read(path)
             self.assertEqual(len(text.strip().splitlines()), 1)
-            cfg = tiers.read_repo_config(path)  # readable by slice 4
+            cfg = tiers.read_repo_config_yml(path)  # readable by admission (slice 7)
             self.assertEqual(cfg, {"extends": want})
             classified = tiers.classify([{"filename": "README.md", "status": "modified", "additions": 1,
                                           "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}], tiers.load_templates(), cfg)
@@ -313,7 +313,7 @@ class FixesTest(unittest.TestCase):
         fixes = {f["id"]: f for f in self.build(root, out)}
         self.assertEqual(fixes["F2"]["files"], [])
         self.assertIn("告诉我是哪一类", fixes["F2"]["note"])
-        self.assertFalse(os.path.exists(os.path.join(out, ".github", "autopr", "risk-tiers.json")))
+        self.assertFalse(os.path.exists(os.path.join(out, ".github", "autopr", "risk-tiers.yml")))
 
     def test_instructions_patch_applies_to_new_and_existing_file(self):
         for files in ({"a": "x"}, {"CLAUDE.md": "# Proj\n\nold text\n"}, {"AGENTS.md": "# Agents\nno newline at end"}):
@@ -465,3 +465,9 @@ class LegacyHeadingTest(unittest.TestCase):
     def test_autopr_heading_counts_for_c12(self):
         self.assertTrue(checks._AUTOPILOT_HEADING.search("# 项目\n\n## autopr（自动维护）\n内容\n"))
         self.assertFalse(checks._AUTOPILOT_HEADING.search("# 项目\n\n## 发版\n"))
+
+
+class RiskConfigYmlTest(unittest.TestCase):
+    def test_c11_accepts_yml_and_prefers_it(self):
+        from checkup import checks as ck
+        self.assertEqual(ck.RISK_CONFIGS[0], ".github/autopr/risk-tiers.yml")

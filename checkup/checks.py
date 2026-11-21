@@ -11,7 +11,7 @@ from checkup import entry, ghprobe, workflow
 from checkup.ecosystem import manifest_names, lockfile_installed
 from checkup.proc import run
 
-RISK_CONFIG = ".github/autopr/risk-tiers.json"
+RISK_CONFIGS = (".github/autopr/risk-tiers.yml", ".github/autopr/risk-tiers.json")  # slice 7: .yml first
 _AUTOPILOT_HEADING = re.compile(r"^#{1,6}\s+.*(autopilot|autopr)", re.I | re.M)  # autopr: the old name, still used by .github/autopr/
 
 TITLES = {
@@ -47,7 +47,7 @@ FIX_HOW = {
     "C8": (False, "不能代劳，已列出要改的引用：把 @版本号 换成 40 位提交 SHA"),
     "C9": (False, "不能代劳，已列出位置：不要在 pull_request_target / workflow_run 里检出或执行 PR 代码"),
     "C10": (False, "不能代劳，已列出问题：补锁文件，CI 里用锁定安装命令"),
-    "C11": (True, "生成一行 .github/autopr/risk-tiers.json（类别按目录特征猜，猜不出就问你）"),
+    "C11": (True, "生成一行 .github/autopr/risk-tiers.yml（类别按目录特征猜，猜不出就问你）"),
     "C12": (True, "生成 CLAUDE.md / AGENTS.md 里的 autopilot 说明草稿（补丁）"),
 }
 
@@ -182,16 +182,18 @@ def run_checks(root, base, gh, repo_name, run_check=False, runner=entry.run_chec
             findings.append(finding("C10", st, detail))
 
     # C11
-    cfg = os.path.join(root, RISK_CONFIG)
-    if os.path.isfile(cfg):
+    present = [rel for rel in RISK_CONFIGS if os.path.isfile(os.path.join(root, rel))]
+    if present:
+        rel = present[0]
         try:
             from risk import tiers
-            tiers.read_repo_config(cfg)
-            findings.append(finding("C11", "ok", "%s 存在且读得通" % RISK_CONFIG))
+            reader = tiers.read_repo_config_yml if rel.endswith(".yml") else tiers.read_repo_config
+            reader(os.path.join(root, rel))
+            findings.append(finding("C11", "ok", "%s 存在且读得通" % rel))
         except (OSError, ValueError) as e:
-            findings.append(finding("C11", "unknown", "%s 存在但读不了：%s" % (RISK_CONFIG, e)))
+            findings.append(finding("C11", "unknown", "%s 存在但读不了：%s" % (rel, e)))
     else:
-        findings.append(finding("C11", "missing", "没有 %s" % RISK_CONFIG))
+        findings.append(finding("C11", "missing", "没有 %s（也没有 .json）" % RISK_CONFIGS[0]))
 
     # C12
     hit = None

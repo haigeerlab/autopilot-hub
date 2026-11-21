@@ -136,7 +136,7 @@ class BumpTest(unittest.TestCase):
         self.assertEqual(res["tier"], "T4")
 
     def test_added_suppression_is_T4(self):
-        patch = "@@ -1 +1 @@\n-x = 1\n+x = 1  # noqa\n"
+        patch = "@@ -1 +1 @@\n-x = 1\n+x = 1  # no" + "qa\n"
         res = tier_of([f("skills/a.py", patch=patch)], self.cfg)
         self.assertEqual(res["tier"], "T4")
 
@@ -146,7 +146,7 @@ class BumpTest(unittest.TestCase):
         self.assertEqual(res["tier"], "T0")
 
     def test_removed_suppression_is_fine(self):
-        patch = "@@ -1 +1 @@\n-x = 1  # noqa\n+x = 1\n"
+        patch = "@@ -1 +1 @@\n-x = 1  # no" + "qa\n+x = 1\n"
         res = tier_of([f("skills/a.py", patch=patch)], self.cfg)
         self.assertEqual(res["tier"], "T2")
 

@@ -35,7 +35,6 @@ REASON_TEXT = {
     "main-red": "autopilot 的 PR 合并后，main 上的主 CI 失败",
     "regression": "有 issue 被标记为回归（autopilot:regression）",
     "freeze": "有 issue 被打上冻结标签（autopilot:freeze）",
-    "readiness-drop": "每周复检发现接入档掉档（repo-readiness 的掉档信号）",
 }
 
 
@@ -160,7 +159,7 @@ def issue_body(repo, c):
                         "ref": c["ref"], "evidence": [e for e in c["evidence"] if e]}, ensure_ascii=False)
     lines = [
         f"**为什么降级**：{REASON_TEXT[c['reason']]}。",
-        f"**降到**：{c['level']}。在本 issue 关闭之前，`autopilot/admission` 给这个仓库每个 PR 的上限都不高于 {c['level']}。",
+        f"**降到**：{c['level']}。在本 issue 关闭之前，这个仓库不会自动合并。",
         "**依据**：" + "、".join(e for e in c["evidence"] if e),
         "",
         "**怎么解除**：确认问题已处理后，关闭本 issue。关闭需要仓库写权限，系统不会自动关闭。",
