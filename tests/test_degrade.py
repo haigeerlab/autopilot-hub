@@ -191,6 +191,57 @@ class LabelTest(unittest.TestCase):
         self.assertEqual(api.writes(), [])
 
 
+def closed_event(sender_login="haigeerlab", sender_type="User", labels=("autopilot:degrade",)):
+    return {"action": "closed", "repository": {"full_name": REPO, "default_branch": "main"},
+            "sender": {"login": sender_login, "type": sender_type},
+            "issue": {"number": 42, "html_url": "https://github.com/haigeerlab/agent-relay/issues/42",
+                      "labels": [{"name": n} for n in labels]}}
+
+
+def permission_of(login, perm):
+    return {f"repos/{REPO}/collaborators/{login}/permission": {"permission": perm}}
+
+
+class CloseCheckTest(unittest.TestCase):
+    """Slice 11 (B11): only a repo admin closing a degrade issue lifts it; anyone else's close is undone."""
+
+    def reopened(self, api):
+        return [c for c in api.calls if c[0] == "PATCH" and c[1] == f"repos/{REPO}/issues/42"]
+
+    def test_admin_close_stands(self):
+        api = FakeApi(permission_of("haigeerlab", "admin"))
+        out = r.run("issues", closed_event(), api)
+        self.assertEqual(self.reopened(api), [])
+        self.assertEqual(out["reopened"], 0)
+
+    def test_writer_close_is_reopened_with_comment(self):
+        api = FakeApi(permission_of("helper", "write"))
+        out = r.run("issues", closed_event("helper"), api)
+        self.assertEqual(self.reopened(api)[0][2], {"state": "open"})
+        comments = [c for c in api.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues/42/comments"]
+        self.assertIn("管理员", comments[0][2]["body"])
+        self.assertEqual(out["reopened"], 1)
+
+    def test_bot_close_is_reopened_without_permission_lookup(self):
+        api = FakeApi()
+        r.run("issues", closed_event("haigeerlab-autopilot[bot]", "Bot"), api)
+        self.assertEqual(len(self.reopened(api)), 1)
+        self.assertFalse([c for c in api.calls if "collaborators" in c[1]])
+
+    def test_non_degrade_issue_close_is_ignored(self):
+        api = FakeApi()
+        r.run("issues", closed_event("helper", labels=("bug",)), api)
+        self.assertEqual(api.writes(), [])
+
+
+class RevertLabelTest(unittest.TestCase):
+    def test_revert_labels_the_reverted_pr(self):
+        api = FakeApi(pulls_of(REVERTED, [AUTHORED]))
+        r.run("push", push_event(revert_message()), api)
+        labels = [c for c in api.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues/7/labels"]
+        self.assertEqual(labels[0][2], {"labels": ["autopilot:reverted"]})
+
+
 class IdempotencyAndErrorsTest(unittest.TestCase):
     def existing(self, reason, ref):
         block = json.dumps({"scope": {"repo": REPO, "tier": "*"}, "level": "L2", "reason": reason, "ref": ref})

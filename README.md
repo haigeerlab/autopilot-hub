@@ -16,6 +16,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 8**：准入只认 autopilot 机器人（`bot-identity.json` 里的 App slug 与数字 ID）发出、且没被编辑过的接管评论；不合格的忽略并在摘要里计数；hub 没配机器人身份时永远“不会自动合并”。规格见 [docs/spec/slice-8.md](docs/spec/slice-8.md)。
 - **切片 9**：硬卡证据。准入读机器人发的 `autopilot-evidence:v1` 评论，只认绑定当前 head SHA 的那条：检查全过、审查完成且没有 blocking；接管评论带 spec-guard 模块时还要最终验收标记。规格见 [docs/spec/slice-9.md](docs/spec/slice-9.md)。
 - **切片 10**：本机编排 `orchestrator/cli.py run --repo <owner/name> --pr <n> [--dry-run]`：以机器人身份发接管评论、在一次性克隆里跑检查、调 delegate 审查（第 2 轮对照第 1 轮复审）、发证据、用同一份准入代码重算，然后按审过的 head SHA 合并并读回。规格见 [docs/spec/slice-10.md](docs/spec/slice-10.md)。
+- **切片 11**：收窄与计数。本机编排遇到撤回、主干变红、回归引起的降级 issue 时，在 spec-guard 项目里用 spec-guard 的 `narrow` 开一个收窄 PR（T4，你合并），其他仓库留言提醒；降级 issue 只有仓库管理员本人关闭才算解除，否则自动重开；`orchestrator/cli.py stats` 给出自动合并、被撤回或返修、因 Codex 不可用停下三个数。规格见 [docs/spec/slice-11.md](docs/spec/slice-11.md)。
 - **切片 12**：模块产物改档。spec-guard 模块 PR 里改的本模块 `spec/<模块>.md`、`tasks/<模块>/**`，由本机编排在 head 上用 spec-guard 的 `map_view.py` 核对批准仍有效、写进证据后，从 T4 降为 T2；能力图、别的模块的产物和 `.agent/**` 永远 T4。规格见 [docs/spec/slice-12.md](docs/spec/slice-12.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 

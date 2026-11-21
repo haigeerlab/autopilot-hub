@@ -59,6 +59,7 @@ class FakeIO:
                  module=None, acceptance=None, sg_config=None):
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
         self.evidence_files = []
+        self.issue_comments, self.narrow_prs, self.narrow_result = {}, [], "https://github.com/x/pull/9"
         self.view = {"modules": [{"id": module, "review": {"spec": "codex-approved", "plan": "approved"},
                                   "reviewApprovedBy": {"spec": "codex", "plan": "user"}}]} if module else None
         self.module, self.acceptance_record = module, acceptance
@@ -105,6 +106,9 @@ class FakeIO:
             return self.pr
         if path.startswith(f"repos/{REPO}/issues/7/comments"):
             return list(self.comments)
+        for n, cs in self.issue_comments.items():
+            if path.startswith(f"repos/{REPO}/issues/{n}/comments"):
+                return list(cs)
         if path.startswith(f"repos/{REPO}/pulls/7/files"):
             return self.files
         if path.startswith(f"repos/{REPO}/issues?labels=autopilot:degrade"):
@@ -134,6 +138,10 @@ class FakeIO:
 
     def write_check_evidence(self, repo, data):
         self.evidence_files.append(data)
+
+    def open_narrow_pr(self, repo, base_ref, module, issue_number, reason):
+        self.narrow_prs.append((module, issue_number, reason))
+        return self.narrow_result
 
     def find_modules(self, repo, head):
         rec = (self.acceptance_record or {}).get("record") or {}
@@ -467,6 +475,109 @@ class ModuleArtifactsTest(unittest.TestCase):
         self.assertEqual(flow.verify_artifacts(view, "m", ["spec/m.md", "tasks/m/todo.md", "spec/mm.md", "src/x.py"]),
                          ["spec/m.md", "tasks/m/todo.md"])
         self.assertEqual(flow.verify_artifacts(view, "n", ["spec/n.md"]), [])
+
+
+def degrade_block(number, reason="revert", pr_url="https://github.com/haigeerlab/autopilot-sandbox/pull/5"):
+    payload = {"scope": {"repo": REPO, "tier": "*"}, "level": "L2", "reason": reason, "ref": "c" * 40,
+               "evidence": [pr_url] if pr_url else []}
+    return {"number": number, "body": "降级\n" + flow.block("autopilot-degrade", payload).replace("autopilot-degrade:v1", "autopilot-degrade:v1")}
+
+
+class NarrowTest(unittest.TestCase):
+    """Slice 11 (B10): an open degrade issue from a revert / red main / regression narrows the takeover once."""
+
+    def io(self, **kw):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], **kw)
+        io.degrade = [degrade_block(3)]
+        io.issue_comments[5] = [{"id": 1, "body": flow.block("autopilot-takeover", {"module": "m", "merge": "auto"}),
+                                 "user": BOT_USER, "performed_via_github_app": {"slug": BOT["app_slug"]},
+                                 "created_at": T0, "updated_at": T0}]
+        io.issue_comments[3] = []
+        return io
+
+    def issue_comment_posts(self, io, n):
+        return [c for c in io.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues/{n}/comments"]
+
+    def test_narrows_the_pr_module_then_stops_on_degrade(self):
+        io = self.io()
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "degrade"))
+        self.assertEqual(io.narrow_prs[0][:2], ("m", 3))
+        posted = self.issue_comment_posts(io, 3)
+        self.assertIn("autopilot-narrowed:v1", posted[0][2]["body"])
+        self.assertIn("pull/9", posted[0][2]["body"])
+
+    def test_already_narrowed_issue_is_skipped(self):
+        io = self.io()
+        io.issue_comments[3] = [{"id": 2, "body": flow.block("autopilot-narrowed", {"pr": "x"}), "user": BOT_USER,
+                                 "performed_via_github_app": {"slug": BOT["app_slug"]}, "created_at": T0, "updated_at": T0}]
+        run(io)
+        self.assertEqual(io.narrow_prs, [])
+
+    def test_forged_narrowed_marker_does_not_skip(self):
+        io = self.io()
+        io.issue_comments[3] = [{"id": 2, "body": flow.block("autopilot-narrowed", {"pr": "x"}),
+                                 "user": {"login": "x", "id": 5, "type": "User"}, "created_at": T0, "updated_at": T0}]
+        run(io)
+        self.assertEqual(len(io.narrow_prs), 1)
+
+    def test_regression_without_pr_narrows_the_project(self):
+        io = self.io()
+        io.degrade = [degrade_block(3, reason="regression", pr_url=None)]
+        run(io)
+        self.assertEqual(io.narrow_prs[0][:2], (None, 3))
+
+    def test_freeze_does_not_narrow(self):
+        io = self.io()
+        io.degrade = [degrade_block(3, reason="freeze", pr_url=None)]
+        run(io)
+        self.assertEqual(io.narrow_prs, [])
+
+    def test_already_strictest_is_recorded_without_pr(self):
+        io = self.io()
+        io.narrow_result = None
+        run(io)
+        self.assertIn("已是最严", self.issue_comment_posts(io, 3)[0][2]["body"])
+
+    def test_non_spec_guard_repo_only_comments(self):
+        io = FakeIO()
+        io.degrade = [degrade_block(3)]
+        io.issue_comments[3] = []
+        run(io)
+        self.assertEqual(io.narrow_prs, [])
+        self.assertIn("takeover.yml", self.issue_comment_posts(io, 3)[0][2]["body"])
+
+    def test_dry_run_does_not_narrow(self):
+        io = self.io()
+        run(io, dry_run=True)
+        self.assertEqual(io.narrow_prs, [])
+        self.assertEqual(io.writes(), [])
+
+
+class StatsTest(unittest.TestCase):
+    def test_three_counts(self):
+        class StatsIO:
+            def api(self, path, method="GET", body=None):
+                if "labels=autopilot:auto-merged" in path:
+                    return [{"number": 2, "pull_request": {}, "closed_at": "2026-11-20T00:00:00Z", "labels": []},
+                            {"number": 4, "pull_request": {}, "closed_at": "2026-11-20T00:00:00Z",
+                             "labels": [{"name": "autopilot:reverted"}]},
+                            {"number": 6, "pull_request": {}, "closed_at": "2026-11-01T00:00:00Z", "labels": []},
+                            {"number": 9, "labels": []}]  # an issue, not a PR
+                if "labels=autopilot:regression" in path:
+                    return [{"number": 10, "body": "回归，见 #2", "created_at": "2026-11-21T00:00:00Z"},
+                            {"number": 11, "body": "见 #6", "created_at": "2026-11-21T00:00:00Z"},  # > 14 days
+                            {"number": 12, "body": "见 #4", "created_at": "2026-11-21T00:00:00Z"},  # already reverted
+                            {"number": 13, "body": "见 #22", "created_at": "2026-11-21T00:00:00Z"}]
+                raise AssertionError(path)
+
+            def ledger_events(self):
+                return [{"event": "codex_unavailable", "repo": REPO, "started_at": "2026-11-21T01:00:00Z",
+                         "stopped_at": "2026-11-21T01:30:00Z"},
+                        {"event": "codex_unavailable", "repo": "other/repo", "started_at": T0, "stopped_at": T0}]
+        out = flow.stats(StatsIO(), REPO)
+        self.assertEqual((out["auto_merged"], out["reverted"], out["reworked"], out["reverted_or_reworked"]), (3, 1, 1, 2))
+        self.assertEqual((out["codex_unavailable_stops"], out["codex_unavailable_minutes"]), (1, 30.0))
 
 
 class TakeoverConfigTest(unittest.TestCase):
