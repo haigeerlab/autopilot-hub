@@ -14,6 +14,9 @@ FILE_DOC = {"filename": "docs/a.md", "status": "modified", "additions": 1, "dele
 FILE_CI = {"filename": ".github/workflows/ci.yml", "status": "modified", "additions": 1, "deletions": 0,
            "patch": "@@ -1 +1 @@\n+x\n"}
 TAKEOVER_AUTO = '<!-- autopilot-takeover:v1 {"module": "m", "merge": "auto"} -->'
+BOT_TAKEOVER_AUTO = {"id": 1, "body": TAKEOVER_AUTO, "app": "haigeerlab-autopilot",
+                     "user": {"login": "haigeerlab-autopilot[bot]", "id": 359574582, "type": "Bot"},
+                     "created_at": "2026-11-22T01:00:00Z", "updated_at": "2026-11-22T01:00:00Z"}
 
 
 class CliTest(unittest.TestCase):
@@ -62,7 +65,7 @@ class CliTest(unittest.TestCase):
 
     def test_all_but_gate_ok_still_not_auto_merge(self):
         files = self.write("files.json", [FILE_DOC])
-        comments = self.write("c.json", [TAKEOVER_AUTO])
+        comments = self.write("c.json", [BOT_TAKEOVER_AUTO])
         cfg = self.write("r.yml", "extends: plugin\n", raw=True)
         proc, result, md = self.run_cli(files, ["--comments", comments, "--risk-config-yml", cfg])
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -70,6 +73,23 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result["headline"], "不会自动合并（硬卡：还没有证据）")
         self.assertRegex(md, r"\| risk \| ✅ \|")
         self.assertRegex(md, r"\| takeover \| ✅ \|")
+
+    def test_without_bot_identity_takeover_is_not_trusted(self):
+        files = self.write("files.json", [FILE_DOC])
+        comments = self.write("c.json", [BOT_TAKEOVER_AUTO])
+        proc, result, md = self.run_cli(files, ["--comments", comments,
+                                                "--bot-identity", os.path.join(self.tmp, "missing.json")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(result["auto_merge"])
+        self.assertRegex(md, r"\| takeover \| — \| hub 没配机器人身份")
+
+    def test_human_takeover_comment_is_ignored_with_note(self):
+        files = self.write("files.json", [FILE_DOC])
+        human = dict(BOT_TAKEOVER_AUTO, user={"login": "haigeerlab", "id": 1, "type": "User"}, app=None)
+        proc, result, md = self.run_cli(files, ["--comments", self.write("c.json", [human])])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(md, r"\| takeover \| — \| 没有接管评论")
+        self.assertIn("忽略了 1 条", md)
 
     def test_open_degrade_issue_listed(self):
         files = self.write("files.json", [FILE_DOC])
@@ -164,6 +184,13 @@ class WorkflowLabelTest(unittest.TestCase):
     def test_reads_base_branch_yml_and_json_and_comments(self):
         for part in ("risk-tiers.yml", "risk-tiers.json", "--comments", "--risk-config-yml", "--risk-config-json"):
             self.assertIn(part, self.text)
+
+    def test_comments_carry_author_fields(self):
+        for part in (".user.id", ".user.type", ".performed_via_github_app.slug", "created_at", "updated_at"):
+            self.assertIn(part, self.text)
+
+    def test_own_summary_comment_must_be_by_github_actions(self):
+        self.assertIn('.user.login == "github-actions[bot]"', self.text)
 
     def test_check_name_and_conclusion_unchanged(self):
         self.assertIn('"name": "autopilot/admission"', self.text)

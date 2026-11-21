@@ -23,10 +23,24 @@ def risk_of(name="docs/a.md", patch="@@ -1 +1 @@\n+x\n", config=None):
     return tiers.classify([f], TEMPLATES, config or {"extends": "plugin"})
 
 
-def takeover(merge, extra=None):
+BOT = {"app_slug": "haigeerlab-autopilot", "login": "haigeerlab-autopilot[bot]", "id": 359574582}
+T0 = "2026-11-22T01:00:00Z"
+
+
+def bot(body, *, edited=False, user=None, app="haigeerlab-autopilot"):
+    """A PR comment as the workflow passes it: posted by the App bot unless `user`/`app` say otherwise."""
+    return {"id": 1, "body": body, "user": user or {"login": BOT["login"], "id": BOT["id"], "type": "Bot"},
+            "app": app, "created_at": T0, "updated_at": "2026-11-22T02:00:00Z" if edited else T0}
+
+
+def takeover_body(merge, extra=None):
     payload = {"module": "m", "spec": "human", "plan": "human", "merge": merge, "release": "human"}
     payload.update(extra or {})
     return "编排写入的接管档位\n<!-- autopilot-takeover:v1 " + json.dumps(payload) + " -->\n"
+
+
+def takeover(merge, extra=None, **kw):
+    return bot(takeover_body(merge, extra), **kw)
 
 
 def degrade_issue(number, repo=REPO, level="L2"):
@@ -34,8 +48,9 @@ def degrade_issue(number, repo=REPO, level="L2"):
     return {"number": number, "body": "降级\n<!-- autopilot-degrade:v1 " + block + " -->\n"}
 
 
-def run(risk=None, comments=(), issues=()):
-    return d.decide(risk=risk or risk_of(), comments=list(comments), degrade_issues=list(issues), repo=REPO)
+def run(risk=None, comments=(), issues=(), bot_identity=BOT):
+    return d.decide(risk=risk or risk_of(), comments=list(comments), degrade_issues=list(issues), repo=REPO,
+                    bot=bot_identity)
 
 
 def item(result, item_id):
@@ -75,12 +90,12 @@ class TakeoverItemTest(unittest.TestCase):
         self.assertIn("没有接管评论，合并按“人合”处理", item(res, "takeover")["detail"])
 
     def test_unparseable_block_is_not_ok_with_reason(self):
-        res = run(comments=["<!-- autopilot-takeover:v1 {not json} -->"])
+        res = run(comments=[bot("<!-- autopilot-takeover:v1 {not json} -->")])
         self.assertFalse(item(res, "takeover")["ok"])
         self.assertIn("读不懂", item(res, "takeover")["detail"])
 
     def test_non_object_block_is_not_ok(self):
-        self.assertFalse(item(run(comments=["<!-- autopilot-takeover:v1 [1] -->"]), "takeover")["ok"])
+        self.assertFalse(item(run(comments=[bot("<!-- autopilot-takeover:v1 [1] -->")]), "takeover")["ok"])
 
     def test_latest_block_wins(self):
         self.assertTrue(item(run(comments=[takeover("human"), "x", takeover("auto")]), "takeover")["ok"])
@@ -88,7 +103,75 @@ class TakeoverItemTest(unittest.TestCase):
 
     def test_old_levels_comment_is_not_read(self):
         old = '<!-- autopilot-' + 'levels:v1 {"spec_guard":{"tier":"relaxed"}} -->'
-        self.assertFalse(item(run(comments=[old]), "takeover")["ok"])
+        self.assertFalse(item(run(comments=[bot(old)]), "takeover")["ok"])
+
+
+class BotIdentityTest(unittest.TestCase):
+    """Slice 8: only takeover comments posted by the App bot and never edited count."""
+
+    def test_human_comment_is_ignored_and_counted(self):
+        human = {"login": "haigeerlab", "id": 1, "type": "User"}
+        res = run(comments=[takeover("auto", user=human, app=None)])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertIn("没有接管评论", item(res, "takeover")["detail"])
+        self.assertTrue(any("忽略了 1 条" in n for n in res["notes"]), res["notes"])
+
+    def test_plain_string_comment_is_ignored(self):
+        res = run(comments=[takeover_body("auto")])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertTrue(any("忽略了 1 条" in n for n in res["notes"]), res["notes"])
+
+    def test_edited_bot_comment_is_ignored(self):
+        res = run(comments=[takeover("auto", edited=True)])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertTrue(any("忽略了 1 条" in n for n in res["notes"]), res["notes"])
+
+    def test_missing_timestamps_count_as_edited(self):
+        c = takeover("auto")
+        del c["updated_at"]
+        self.assertFalse(item(run(comments=[c]), "takeover")["ok"])
+
+    def test_other_bot_is_ignored(self):
+        other = {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}
+        self.assertFalse(item(run(comments=[takeover("auto", user=other, app="github-actions")]), "takeover")["ok"])
+
+    def test_same_login_other_id_is_ignored(self):
+        fake = {"login": BOT["login"], "id": 7, "type": "Bot"}
+        self.assertFalse(item(run(comments=[takeover("auto", user=fake)]), "takeover")["ok"])
+
+    def test_renamed_login_same_id_still_counts(self):
+        renamed = {"login": "renamed[bot]", "id": BOT["id"], "type": "Bot"}
+        self.assertTrue(item(run(comments=[takeover("auto", user=renamed)]), "takeover")["ok"])
+
+    def test_wrong_app_slug_is_ignored(self):
+        self.assertFalse(item(run(comments=[takeover("auto", app="someone-else")]), "takeover")["ok"])
+
+    def test_forged_human_comment_after_bot_does_not_override(self):
+        human = {"login": "haigeerlab", "id": 1, "type": "User"}
+        res = run(comments=[takeover("human"), takeover("auto", user=human, app=None)])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertIn("合并 'human'", item(res, "takeover")["detail"])
+
+    def test_no_bot_identity_never_auto_merges(self):
+        gate = {"id": "gate", "ok": True, "detail": "有证据"}
+        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=None)
+        self.assertFalse(res["auto_merge"])
+        self.assertIn("没配机器人身份", item(res, "takeover")["detail"])
+        self.assertIn("没配机器人身份", res["headline"])
+
+    def test_load_bot_identity(self):
+        self.assertEqual(d.load_bot_identity(os.path.join(ROOT, "bot-identity.json"))["id"], BOT["id"])
+        self.assertIsNone(d.load_bot_identity(os.path.join(ROOT, "no-such-file.json")))
+
+    def test_load_bot_identity_rejects_bad_shape(self):
+        import tempfile
+        for bad in ({"id": "359574582", "app_slug": "x"}, {"id": 1}, [1], {"id": True, "app_slug": "x"}):
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+                json.dump(bad, fh)
+            try:
+                self.assertIsNone(d.load_bot_identity(fh.name), bad)
+            finally:
+                os.unlink(fh.name)
 
 
 class GateItemTest(unittest.TestCase):
@@ -136,7 +219,7 @@ class HeadlineTest(unittest.TestCase):
 
     def test_headline_ok_only_when_all_four_ok(self):
         gate = {"id": "gate", "ok": True, "detail": "有证据"}
-        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate)
+        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=BOT)
         self.assertTrue(res["auto_merge"])
         self.assertEqual(res["headline"], "可以自动合并")
         # Dropping any single item flips it.
@@ -146,13 +229,13 @@ class HeadlineTest(unittest.TestCase):
             "degrade": dict(degrade_issues=[degrade_issue(3)]),
         }
         for name, change in cases.items():
-            args = dict(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate)
+            args = dict(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=BOT)
             args.update(change)
             res = d.decide(**args)
             self.assertFalse(res["auto_merge"], name)
             self.assertTrue(res["headline"].startswith("不会自动合并（"), name)
         res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO,
-                       gate={"id": "gate", "ok": False, "detail": "x"})
+                       gate={"id": "gate", "ok": False, "detail": "x"}, bot=BOT)
         self.assertFalse(res["auto_merge"])
 
     def test_reasons_are_listed(self):
@@ -161,9 +244,9 @@ class HeadlineTest(unittest.TestCase):
         for part in ("风险档 T4", "没有接管评论", "硬卡", "#5"):
             self.assertIn(part, res["headline"])
 
-    def test_author_note_and_risk_notes_present(self):
-        res = run()
-        self.assertIn(d.AUTHOR_NOTE, res["notes"])
+    def test_no_author_note_any_more(self):
+        self.assertFalse(hasattr(d, "AUTHOR_NOTE"))
+        self.assertEqual(run()["notes"], [])
 
     def test_inputs_not_mutated(self):
         risk = risk_of()

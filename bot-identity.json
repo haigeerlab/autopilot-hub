@@ -1,0 +1,6 @@
+{
+  "schema": "autopilot.bot-identity/v1",
+  "app_slug": "haigeerlab-autopilot",
+  "login": "haigeerlab-autopilot[bot]",
+  "id": 359574582
+}

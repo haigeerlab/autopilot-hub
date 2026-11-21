@@ -6,7 +6,8 @@
 # Safety:
 # - Triggered by the caller's `pull_request` event (never pull_request_target).
 # - Never checks out or runs PR code. The risk config is read from the BASE branch via the API.
-# - The merge setting comes from the latest `autopilot-takeover:v1` PR comment written by the local orchestrator.
+# - The merge setting comes from the latest `autopilot-takeover:v1` PR comment written by the local orchestrator;
+#   only comments by the App bot in the hub's bot-identity.json that were never edited count (slice 8).
 # - All event values reach shell only through env vars, never inlined into `run:` scripts.
 # - The check run is always `neutral`: it reports eligibility, it never blocks.
 name: autopilot-admission
@@ -62,7 +63,8 @@ jobs:
               base64 -d < .admission/b64 > "$2" || rm -f "$2"
             fi
           }
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '[.[].body]' | python3 -c 'import json,sys;print(json.dumps([b for page in sys.stdin.read().split("\n") if page.strip() for b in json.loads(page)]))' > .admission/comments.json || echo '[]' > .admission/comments.json
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | {id, body, user: {login: .user.login, id: .user.id, type: .user.type}, app: .performed_via_github_app.slug, created_at, updated_at}]' | python3 -c 'import json,sys;print(json.dumps([b for page in sys.stdin.read().split("\n") if page.strip() for b in json.loads(page)]))' > .admission/comments.json || echo '[]' > .admission/comments.json
           fetch .github/autopr/risk-tiers.yml .admission/risk-tiers.yml
           fetch .github/autopr/risk-tiers.json .admission/risk-tiers.json
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '[.[] | {filename, status, additions, deletions, patch}]' \
@@ -111,7 +113,7 @@ jobs:
           gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --method POST -f "labels[]=autopilot:risk-${TIER}" > /dev/null
 
           COMMENT_ID="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '[.[] | select(.body | startswith("<!-- autopilot-admission -->") or startswith("<!-- autopr-admission -->"))][0].id // empty')"
+            --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("<!-- autopilot-admission -->") or startswith("<!-- autopr-admission -->"))][0].id // empty')"
           python3 -c 'import json;print(json.dumps({"body":open(".admission/summary.md",encoding="utf-8").read()},ensure_ascii=False))' > .admission/comment.json
           if [ -n "${COMMENT_ID}" ]; then
             gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --method PATCH --input .admission/comment.json > /dev/null
