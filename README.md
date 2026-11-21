@@ -14,6 +14,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 6**：纠错沉淀。同一类错误不让 AI 犯第三次：`python3 -B correction/cli.py record --repo <owner/name> --class <类名> --summary "…" [--ref …]` 把纠正记成该仓库的 issue（标签 `correction`、`correction:<类名>`），同一类第 2 次开「晋升候选」issue 并问要不要沉淀；`classes --repo …` 列类名和次数；切片 2 的撤回降级同时记 `revert` 类。三个检查脚本 `rules/`（`no_weakened_assertion.py` 不许弱化断言、`suppression_budget.py` 压制只减不增且豁免要过期、`chinese_commit.py` 提交用中文）由可复用 workflow `.github/workflows/rules.yml` 提供，各出一条检查 `autopilot/rule/<名>`，只提醒不设为必需，调用示例 `examples/caller-autopilot-rules.yml`；晋升做法见 `skills/correction-promotion/SKILL.md`。规格见 [docs/spec/slice-6.md](docs/spec/slice-6.md)。
 - **切片 7**：退役 repo-readiness 依赖。准入不再读接入结论、不再报信任上限，改报一句话结论“能不能自动合并”：风险档（T0–T2）、接管评论 `autopilot-takeover:v1` 里的合并为 `auto`、硬卡证据（第二批才有，现在恒为“还没有”）、没有未关闭的降级 issue，四项都满足才写“可以自动合并”，否则列出原因。仍然只报告，检查结果是 `neutral`；PR 上打 `autopilot:risk-T<n>` 标签；风险配置优先读 `.github/autopr/risk-tiers.yml`，没有再读 `.json`。规格见 [docs/spec/slice-7.md](docs/spec/slice-7.md)。
 - **切片 8**：准入只认 autopilot 机器人（`bot-identity.json` 里的 App slug 与数字 ID）发出、且没被编辑过的接管评论；不合格的忽略并在摘要里计数；hub 没配机器人身份时永远“不会自动合并”。规格见 [docs/spec/slice-8.md](docs/spec/slice-8.md)。
+- **切片 9**：硬卡证据。准入读机器人发的 `autopilot-evidence:v1` 评论，只认绑定当前 head SHA 的那条：检查全过、审查完成且没有 blocking；接管评论带 spec-guard 模块时还要最终验收标记。规格见 [docs/spec/slice-9.md](docs/spec/slice-9.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
 ## 规则

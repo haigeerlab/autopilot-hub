@@ -1,6 +1,6 @@
 """Slice-7 admission: can this PR be merged automatically? (report-only)
 
-Spec: docs/spec/slice-7.md, docs/spec/slice-8.md. Four items -- risk tier, takeover merge setting, hard-gate
+Spec: docs/spec/slice-7.md, docs/spec/slice-8.md, docs/spec/slice-9.md (gate: admission/gate.py). Four items -- risk tier, takeover merge setting, hard-gate
 evidence, open degrade issues -- all of which must hold. Stdlib only; supports Python 3.9.
 
 Slice 8: takeover comments count only when posted by the autopilot App bot (numeric user id + App slug from
@@ -13,7 +13,7 @@ import re
 TAKEOVER_BLOCK = re.compile(r"<!--\s*autopilot-takeover:v1\s+(.*?)\s*-->", re.S)
 DEGRADE_BLOCK = re.compile(r"<!--\s*autopilot-degrade:v1\s+(.*?)\s*-->", re.S)
 BOT_MISSING = "hub 没配机器人身份（bot-identity.json），不认任何接管评论，合并按“人合”处理"
-GATE_DETAIL = "还没有“非作者在最终提交上跑过检查”的证据（第二批）"
+BOT_MISSING_SHORT = "没配机器人身份"
 
 
 def glob_match(pattern, path):
@@ -71,7 +71,7 @@ def trusted(comment, bot):
 def takeover_item(comments, bot, notes):
     """Latest trusted `autopilot-takeover:v1` block; only its `merge` field matters here."""
     if bot is None:
-        return {"id": "takeover", "ok": False, "detail": BOT_MISSING}, "没配机器人身份"
+        return {"id": "takeover", "ok": False, "detail": BOT_MISSING}, BOT_MISSING_SHORT, None
     comments = [as_comment(c) for c in comments]
     with_block = [c for c in comments if TAKEOVER_BLOCK.search(c.get("body") or "")]
     good = [c for c in with_block if trusted(c, bot)]
@@ -79,19 +79,19 @@ def takeover_item(comments, bot, notes):
         notes.append(f"忽略了 {len(with_block) - len(good)} 条接管评论：不是 autopilot 机器人发的，或发出后被编辑过")
     blocks = [b for c in good for b in TAKEOVER_BLOCK.findall(c.get("body") or "")]
     if not blocks:
-        return {"id": "takeover", "ok": False, "detail": "没有接管评论，合并按“人合”处理"}, "没有接管评论，合并按人合"
+        return {"id": "takeover", "ok": False, "detail": "没有接管评论，合并按“人合”处理"}, "没有接管评论，合并按人合", None
     try:
         payload = json.loads(blocks[-1])
         if not isinstance(payload, dict):
             raise ValueError("不是 JSON 对象")
     except ValueError as e:
         return ({"id": "takeover", "ok": False, "detail": f"接管评论读不懂（{e}），合并按“人合”处理"},
-                "接管评论读不懂")
+                "接管评论读不懂", None)
     merge = payload.get("merge")
     if merge == "auto":
-        return {"id": "takeover", "ok": True, "detail": "接管档位：合并 auto"}, ""
+        return {"id": "takeover", "ok": True, "detail": "接管档位：合并 auto"}, "", payload
     return ({"id": "takeover", "ok": False, "detail": f"接管档位：合并 {merge!r}，按“人合”处理"},
-            "接管档位：合并由人")
+            "接管档位：合并由人", payload)
 
 
 def degrade_item(issues, repo):
@@ -113,12 +113,16 @@ def degrade_item(issues, repo):
     return {"id": "degrade", "ok": False, "detail": f"有未关闭的降级 issue：{names}"}, f"有未关闭的降级 issue {names}"
 
 
-def decide(*, risk, comments, degrade_issues, repo, gate=None, bot=None):
-    """`gate` is the hard-gate item ({"id": "gate", "ok", "detail"}); slice 9 supplies it from the evidence
-    comment. Until then it is always "no evidence". `bot` is the loaded bot identity; None trusts nothing."""
-    gate = gate or {"id": "gate", "ok": False, "detail": GATE_DETAIL}
-    items, shorts, notes = [], [], []
-    for item, short in (risk_item(risk), takeover_item(comments, bot, notes), (gate, "硬卡：还没有证据"),
+def decide(*, risk, comments, degrade_issues, repo, bot=None, head_sha=None):
+    """`bot` is the loaded bot identity (None trusts no comment); `head_sha` is the PR head the evidence must
+    be bound to. The spec-guard module named in the trusted takeover comment also requires final acceptance."""
+    from admission.gate import gate_item  # local: gate imports helpers from this module
+    notes = []
+    takeover, takeover_short, payload = takeover_item(comments, bot, notes)
+    module = payload.get("module") if isinstance(payload, dict) else None
+    module = module if isinstance(module, str) and module else None
+    items, shorts = [], []
+    for item, short in (risk_item(risk), (takeover, takeover_short), gate_item(comments, bot, head_sha, module, notes),
                         degrade_item(degrade_issues, repo)):
         items.append(item)
         if not item["ok"]:
