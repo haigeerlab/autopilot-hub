@@ -37,6 +37,8 @@ class FakeApi:
         if self.fail:
             raise r.ApiError("boom")
         if method == "GET":
+            if "labels=correction" in path:  # slice 6: revert also records a correction event
+                return self.responses.get(path, [])
             if path not in self.responses:
                 raise r.ApiError(f"unexpected GET {path}")
             return self.responses[path]
@@ -46,7 +48,8 @@ class FakeApi:
         return [c for c in self.calls if c[0] != "GET"]
 
     def created(self):
-        return [c for c in self.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues"]
+        return [c for c in self.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues"
+                and "autopilot:degrade" in (c[2].get("labels") or [])]
 
 
 def push_event(message, sha=REVERT_COMMIT, ref="refs/heads/main"):

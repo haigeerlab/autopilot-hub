@@ -1,0 +1,23 @@
+# Copy to <repo>/.github/workflows/autopilot-rules.yml in a caller repo.
+# Replace BOTH <HUB_SHA> occurrences with the same 40-char autopilot-hub commit SHA.
+# Adding or updating this file is a T4 change: the repo owner commits it, a human merges it.
+# The three checks only report (check runs autopilot/rule/*); do not make them required until the
+# owner decides so after two weeks without false positives.
+# An open-source repo that writes English commits opts out of chinese-commit with
+# .github/autopr/rules.json: {"chinese_commit": false}
+name: autopilot-rules
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: read
+
+jobs:
+  rules:
+    uses: haigeerlab/autopilot-hub/.github/workflows/rules.yml@<HUB_SHA>
+    with:
+      hub_ref: <HUB_SHA>
