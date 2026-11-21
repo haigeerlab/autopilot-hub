@@ -1,6 +1,7 @@
 """Command line for slice-4 risk tiers.
 
-  paths    --repo <local checkout> [--json]   T3/T4 path lists for one repo (read-only interface for spec-guard)
+  paths    --repo <local checkout> [--json]   T3/T4 path lists for one repo; reads risk-tiers.yml, then .json.
+           The --json text is what the checkup writes to .github/autopr/risk-paths.json (C13) for spec-guard
   classify --files <pr-files.json> [--config <risk-tiers.json>]   tier of a PR's changed files (JSON out)
 
 Exit codes: 0 ok; 2 bad input (unreadable files or config).
@@ -15,9 +16,6 @@ if __package__ in (None, ""):
 
 from risk import tiers  # noqa: E402
 
-CONFIG_PATH = os.path.join(".github", "autopr", "risk-tiers.json")
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot risk tiers")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -31,7 +29,10 @@ def main(argv=None):
     templates = tiers.load_templates()
     try:
         if a.cmd == "paths":
-            config = tiers.read_repo_config(os.path.join(a.repo, CONFIG_PATH))
+            config = tiers.read_repo_config_at(a.repo)
+            if a.json:
+                sys.stdout.write(tiers.risk_paths_text(templates, config))
+                return 0
             out = tiers.risk_paths(templates, config)
         else:
             with open(a.files, encoding="utf-8") as fh:

@@ -1,4 +1,4 @@
-"""Unit tests for slice-5 checkup (docs/spec/slice-5.md): C1-C12, the three fixes, exit codes, conclusion.
+"""Unit tests for slice-5 checkup (docs/spec/slice-5.md): C1-C13, the three fixes, exit codes, conclusion.
 
 Run: python3 -B -m unittest discover -s tests -v
 No test touches the network: GitHub answers come from an injected fake transport.
@@ -260,6 +260,50 @@ class C11C12Test(unittest.TestCase):
         self.assertEqual(status(make_repo(self, {"AGENTS.md": "## Autopilot rules\n"}), "C12"), "ok")
 
 
+class C13RiskPathsTest(unittest.TestCase):
+    """C13: .github/autopr/risk-paths.json, read by spec-guard 0.91, equals `risk/cli.py paths --json`."""
+
+    def current(self, config):
+        return tiers.risk_paths_text(tiers.load_templates(), config)
+
+    def test_missing(self):
+        root = make_repo(self, {"a": "x"})
+        self.assertEqual(status(root, "C13"), "missing")
+
+    def test_up_to_date_with_yml_config(self):
+        cfg = "extends: plugin\nT4:\n  - bridge/**\n"
+        root = make_repo(self, {".github/autopr/risk-tiers.yml": cfg,
+                                ".github/autopr/risk-paths.json": self.current({"extends": "plugin", "T4": ["bridge/**"]})})
+        self.assertEqual(status(root, "C13"), "ok")
+
+    def test_stale_after_repo_rules_change(self):
+        root = make_repo(self, {".github/autopr/risk-tiers.yml": "extends: plugin\nT4:\n  - bridge/**\n",
+                                ".github/autopr/risk-paths.json": self.current({"extends": "plugin"})})
+        found = run_checks(root)[0]["C13"]
+        self.assertEqual(found["status"], "missing")
+        self.assertIn("过期", found["detail"])
+
+    def test_unreadable(self):
+        root = make_repo(self, {".github/autopr/risk-paths.json": "{oops"})
+        self.assertEqual(status(root, "C13"), "unknown")
+
+    def test_patch_creates_and_updates_the_file(self):
+        for files in ({".github/autopr/risk-tiers.yml": "extends: plugin\n"},
+                      {".github/autopr/risk-tiers.yml": "extends: plugin\nT3:\n  - x/**\n",
+                       ".github/autopr/risk-paths.json": self.current({"extends": "plugin"})}):
+            root = make_repo(self, files)
+            import tempfile
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            found = run_checks(root, {"repos/o/n": repo_meta()})[0]
+            fixes = {f["id"]: f for f in remedy.build_fixes(root, NAME, "main", list(found.values()), "make test", tmp.name)}
+            patch = os.path.join(tmp.name, fixes["F4"]["files"][0])
+            subprocess.run(["git", "-C", root, "apply", patch], check=True)
+            self.assertEqual(status(root, "C13"), "ok")
+            data = json.loads(read(os.path.join(root, ".github", "autopr", "risk-paths.json")))
+            self.assertEqual(data["schema"], "autopilot.risk-paths/v1")
+
+
 class FixesTest(unittest.TestCase):
     def build(self, root, out, extra=None):
         found = run_checks(root, {"repos/o/n": repo_meta(), **(extra or {})})[0]
@@ -288,7 +332,7 @@ class FixesTest(unittest.TestCase):
     def test_no_files_without_out(self):
         root = make_repo(self, {".claude-plugin/plugin.json": "{}"})
         fixes = self.build(root, None)
-        self.assertEqual({f["id"] for f in fixes}, {"F1", "F2", "F3"})
+        self.assertEqual({f["id"] for f in fixes}, {"F1", "F2", "F3", "F4"})
         self.assertTrue(all(f["files"] == [] for f in fixes))
         self.assertFalse(os.path.exists(os.path.join(root, ".github/autopr/risk-tiers.json")))
 
@@ -319,7 +363,7 @@ class FixesTest(unittest.TestCase):
         for files in ({"a": "x"}, {"CLAUDE.md": "# Proj\n\nold text\n"}, {"AGENTS.md": "# Agents\nno newline at end"}):
             root, out = make_repo(self, files), self.out_dir()
             self.build(root, out)
-            patches = [f for f in os.listdir(out) if f.endswith(".patch")]
+            patches = [f for f in os.listdir(out) if f.startswith("instructions-") and f.endswith(".patch")]
             self.assertEqual(len(patches), 1)
             patch = os.path.join(out, patches[0])
             subprocess.run(["git", "-C", root, "apply", "--check", patch], check=True)
@@ -333,7 +377,8 @@ class FixesTest(unittest.TestCase):
             self.assertEqual(status(root, "C12"), "ok")  # the draft satisfies C12
 
     def test_nothing_generated_when_everything_is_fine(self):
-        root = make_repo(self, {**GOOD, "CLAUDE.md": "## autopilot\n", ".github/autopr/risk-tiers.json": "{}\n"})
+        root = make_repo(self, {**GOOD, "CLAUDE.md": "## autopilot\n", ".github/autopr/risk-tiers.json": "{}\n",
+                                ".github/autopr/risk-paths.json": tiers.risk_paths_text(tiers.load_templates(), {})})
         out = self.out_dir()
         found = run_checks(root, good_github())[0]
         self.assertEqual(remedy.build_fixes(root, NAME, "main", list(found.values()), None, out), [])
@@ -399,13 +444,14 @@ class CliTest(unittest.TestCase):
             code, out, _ = self.go(root, "--json", "--out", out_dir, transport=FakeTransport(good_github()))
             self.assertEqual(code, 0)
             data = json.loads(out)
-            self.assertEqual([f["id"] for f in data["findings"]], ["C%d" % i for i in range(1, 13)])
+            self.assertEqual([f["id"] for f in data["findings"]], ["C%d" % i for i in range(1, 14)])
             for f in data["findings"]:
                 self.assertIn(f["status"], ("ok", "missing", "unknown"))
             self.assertEqual(data["repo"], NAME)
             self.assertEqual(data["conclusion"]["level"], "只接管 Plan")
-            self.assertEqual({f["id"] for f in data["fixes"]}, {"F2", "F3"})
+            self.assertEqual({f["id"] for f in data["fixes"]}, {"F2", "F3", "F4"})
             self.assertTrue(os.path.exists(os.path.join(out_dir, "instructions-claude-md.patch")))
+            self.assertTrue(os.path.exists(os.path.join(out_dir, "risk-paths.patch")))
 
     def test_run_check_flag(self):
         root = make_repo(self, {".github/autopr/interface.yml": 'entries:\n  check:\n    run: "exit 1"\n'}, remote=NAME)
@@ -430,7 +476,7 @@ class CliTest(unittest.TestCase):
 
 class ConclusionTest(unittest.TestCase):
     def fs(self, **st):
-        base = {"C%d" % i: "ok" for i in range(1, 13)}
+        base = {"C%d" % i: "ok" for i in range(1, 14)}
         base.update(st)
         return [{"id": k, "status": v, "skipped": False} for k, v in sorted(base.items(), key=lambda kv: int(kv[0][1:]))]
 

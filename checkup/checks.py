@@ -1,9 +1,10 @@
-"""The C1-C12 checklist. Each check returns a finding dict; nothing here changes the repository.
+"""The C1-C13 checklist. Each check returns a finding dict; nothing here changes the repository.
 
 Finding: id, title, scope (仓库/增量), status (ok / missing / unknown), detail (what was seen),
 impact (plain-Chinese "缺了会怎样"), fix ({can_generate, how} or None), evidence (extra lines),
 skipped (True only for C2 without --run-check).
 """
+import json
 import os
 import re
 
@@ -18,7 +19,7 @@ TITLES = {
     "C1": "有能跑的检查命令", "C2": "检查真的能跑", "C3": "分支保护生效", "C4": "主干 CI 是绿的",
     "C5": "PR 会跑检查", "C6": "密钥扫描与推送保护", "C7": "workflow 默认权限只读",
     "C8": "action 固定到 40 位提交", "C9": "没有危险触发写法", "C10": "依赖按锁文件装",
-    "C11": "风险分级配置", "C12": "指令文件里的 autopilot 例外",
+    "C11": "风险分级配置", "C12": "指令文件里的 autopilot 例外", "C13": "风险路径清单（给 spec-guard）",
 }
 SCOPES = {"C8": "增量", "C9": "增量", "C10": "增量"}
 IMPACTS = {
@@ -34,6 +35,7 @@ IMPACTS = {
     "C10": "同一提交两次装出不同依赖，检查结论不可信。",
     "C11": "没有时按通用规则，很多路径会被当成 T3。",
     "C12": "开「接管到合并」前没有它，AI 在 autopilot/* 分支上提交、推送会被你自己的规则拦住。",
+    "C13": "spec-guard 靠它判断重要需求：没有或读不了时，交 Codex 批 Spec 的模块一律按重要处理、Spec 交你批；过期时按旧清单判断。",
 }
 # how a non-ok finding can be fixed: (can_generate, text)
 FIX_HOW = {
@@ -49,6 +51,7 @@ FIX_HOW = {
     "C10": (False, "不能代劳，已列出问题：补锁文件，CI 里用锁定安装命令"),
     "C11": (True, "生成一行 .github/autopr/risk-tiers.yml（类别按目录特征猜，猜不出就问你）"),
     "C12": (True, "生成 CLAUDE.md / AGENTS.md 里的 autopilot 说明草稿（补丁）"),
+    "C13": (True, "生成 .github/autopr/risk-paths.json 的补丁（内容 = risk/cli.py paths --json）；改它算 T4，由你审后提交"),
 }
 
 
@@ -209,7 +212,37 @@ def run_checks(root, base, gh, repo_name, run_check=False, runner=entry.run_chec
                 pass
     findings.append(finding("C12", "ok", "%s 里有 autopilot 一节" % hit) if hit
                     else finding("C12", "missing", "CLAUDE.md / AGENTS.md 里没有标题含 autopilot 的一节（或没有这两个文件）"))
+
+    # C13
+    findings.append(risk_paths_finding(root))
     return findings, ctx
+
+
+def expected_risk_paths(root):
+    """(text, None) or (None, problem): the risk-paths.json this checkout should have."""
+    from risk import tiers
+    try:
+        return tiers.risk_paths_text(tiers.load_templates(), tiers.read_repo_config_at(root)), None
+    except (OSError, ValueError) as e:
+        return None, "风险分级配置读不了（%s），算不出风险路径清单" % e
+
+
+def risk_paths_finding(root):
+    from risk import tiers
+    want, problem = expected_risk_paths(root)
+    if problem:
+        return finding("C13", "unknown", problem)
+    path = os.path.join(root, tiers.RISK_PATHS_FILE)
+    if not os.path.isfile(path):
+        return finding("C13", "missing", "没有 %s" % tiers.RISK_PATHS_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        return finding("C13", "unknown", "%s 读不了：%s" % (tiers.RISK_PATHS_FILE, e))
+    if have != json.loads(want):
+        return finding("C13", "missing", "%s 过期：和现在的 hub 模板加本仓库 risk-tiers 算出来的不一致" % tiers.RISK_PATHS_FILE)
+    return finding("C13", "ok", "%s 是最新的" % tiers.RISK_PATHS_FILE)
 
 
 def conclusion(findings, ran_check):

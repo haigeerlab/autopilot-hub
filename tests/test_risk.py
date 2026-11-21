@@ -257,6 +257,17 @@ class PathsCliTest(unittest.TestCase):
         self.assertIn("CLAUDE.md", out["T3"])
         self.assertIn("spec/**", out["T4"])
 
+    def test_paths_reads_yml_first(self):
+        os.makedirs(os.path.join(self.tmp, ".github", "autopr"))
+        with open(os.path.join(self.tmp, ".github", "autopr", "risk-tiers.yml"), "w") as fh:
+            fh.write("extends: plugin\nT4:\n  - from-yml/**\n")
+        with open(os.path.join(self.tmp, ".github", "autopr", "risk-tiers.json"), "w") as fh:
+            json.dump({"extends": "plugin", "T4": ["from-json/**"]}, fh)
+        proc = self.run_paths()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, r.risk_paths_text(T, {"extends": "plugin", "T4": ["from-yml/**"]}))
+        self.assertIn("from-yml/**", json.loads(proc.stdout)["T4"])
+
     def test_paths_without_config_is_generic(self):
         proc = self.run_paths()
         self.assertEqual(proc.returncode, 0, proc.stderr)
