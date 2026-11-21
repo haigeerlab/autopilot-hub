@@ -17,7 +17,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from risk.tiers import changed_lines, count_markers, load_templates
+from risk.tiers import changed_lines, count_markers, is_prose, load_templates
 from rules.common import emit, load_json, parse_today, render, waiver_state
 
 RULE = "suppression-budget"
@@ -31,6 +31,8 @@ def check_patches(files, templates, today):
     added_n = removed_n = 0
     errors, where = [], []
     for f in files:
+        if is_prose(templates, f["filename"]):
+            continue
         removed, added = changed_lines(f.get("patch"))
         removed_n += count_markers(removed, markers)
         for line in added:
