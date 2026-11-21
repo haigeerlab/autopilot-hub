@@ -192,7 +192,26 @@ def run(event_name, event, api):
             "body": issue_body(repo, c), "labels": [DEGRADE_LABEL]})
         result["opened"] += 1
         result["actions"].append({"opened": (created or {}).get("html_url"), **c})
+        if c["reason"] == "revert":
+            record_revert_correction(api, repo, c, notes)
     return result
+
+
+def record_revert_correction(api, repo, c, notes):
+    """Slice 6: a revert of an autopilot PR is also a correction event of class `revert`.
+
+    Goes through the same code path as `correction/cli.py record` (ref dedupe, promotion candidate at 2).
+    A failure here must not hide the degrade that was just opened, so it is reported as a note.
+    """
+    from correction.cli import record  # lazy: correction.cli imports this module
+    pr_url = (c["evidence"] or [None])[0]
+    try:
+        res = record(api, repo, "revert", f"main 上撤回了 autopilot 的 PR（{pr_url}）", c["ref"])
+    except ApiError as e:
+        notes.append(f"纠错记录没写成（降级已开）：{e}")
+        return
+    if res.get("ask"):
+        notes.append(res["ask"])
 
 
 def main(argv=None):

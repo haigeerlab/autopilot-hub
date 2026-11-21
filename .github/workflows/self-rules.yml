@@ -1,0 +1,18 @@
+# Smoke test: autopilot-hub runs its own rule checks on its own PRs, with the scripts from the PR head.
+# Report-only: the check runs autopilot/rule/* are not required.
+name: self-rules
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: read
+
+jobs:
+  rules:
+    uses: ./.github/workflows/rules.yml
+    with:
+      hub_ref: ${{ github.event.pull_request.head.sha }}

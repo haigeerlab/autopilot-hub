@@ -1,0 +1,115 @@
+# Reusable workflow: slice-6 rule checks (report-only). Spec: docs/spec/slice-6.md
+#
+# Callers pin BOTH the `uses:` ref and `hub_ref` to the same 40-char commit SHA of autopilot-hub,
+# see examples/caller-autopilot-rules.yml. Updating that SHA in a caller repo is a T4 change.
+#
+# Runs three checks, each publishing its own check run (not a required check):
+#   autopilot/rule/no-weakened-assertion, autopilot/rule/suppression-budget, autopilot/rule/chinese-commit
+#
+# Safety:
+# - Triggered by the caller's `pull_request` event (never pull_request_target).
+# - Never checks out or runs PR code: PR files, title, body and commits come from the API; the repo
+#   config comes from the BASE branch; the waiver scan runs on a checkout of the BASE branch.
+# - All event values reach shell only through env vars, never inlined into `run:` scripts.
+name: autopilot-rules
+
+on:
+  workflow_call:
+    inputs:
+      hub_ref:
+        description: "40-char autopilot-hub commit SHA; must equal the SHA in the caller's `uses:` line"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: read
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HUB_REF: ${{ inputs.hub_ref }}
+    steps:
+      - name: Check hub_ref is a full commit SHA
+        run: |
+          case "${HUB_REF}" in
+            *[!0-9a-f]*|"") echo "::error::hub_ref must be a 40-char lowercase commit SHA"; exit 2 ;;
+          esac
+          [ "${#HUB_REF}" -eq 40 ] || { echo "::error::hub_ref must be 40 chars"; exit 2; }
+
+      - name: Check out autopilot-hub at the pinned SHA (scripts only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haigeerlab/autopilot-hub
+          ref: ${{ inputs.hub_ref }}
+          path: .hub
+          persist-credentials: false
+
+      - name: Check out the BASE branch of this repo (for the waiver scan; never the PR head)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: .base
+          persist-credentials: false
+
+      - name: Collect inputs from the API (read-only)
+        run: |
+          mkdir -p .rules
+          if gh api "repos/${REPO}/contents/.github/autopr/rules.json?ref=${BASE_REF}" --jq .content > .rules/b64 2>/dev/null; then
+            base64 -d < .rules/b64 > .rules/rules.json || rm -f .rules/rules.json
+          fi
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '[.[] | {filename, status, additions, deletions, patch}]' \
+            | python3 -c 'import json,sys;print(json.dumps([f for page in sys.stdin.read().split("\n") if page.strip() for f in json.loads(page)]))' > .rules/files.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '{title, body}' > .rules/pr.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '[.[].commit.message]' \
+            | python3 -c 'import json,sys;print(json.dumps([m for page in sys.stdin.read().split("\n") if page.strip() for m in json.loads(page)]))' > .rules/commits.json
+          python3 -c 'import json;d=json.load(open(".rules/pr.json"));d["commits"]=json.load(open(".rules/commits.json"));json.dump(d,open(".rules/chinese.json","w"),ensure_ascii=False)'
+
+      - name: Run the three checks
+        run: |
+          mkdir -p .rules/out
+          rc=0
+          python3 -B .hub/rules/no_weakened_assertion.py --pr-files .rules/files.json \
+            --out-md .rules/out/no-weakened-assertion.md || { [ $? -eq 1 ] && echo failed > .rules/out/no-weakened-assertion.failed || rc=2; }
+          python3 -B .hub/rules/suppression_budget.py --pr-files .rules/files.json --scan .base \
+            --out-md .rules/out/suppression-budget.md || { [ $? -eq 1 ] && echo failed > .rules/out/suppression-budget.failed || rc=2; }
+          cfg=""
+          [ -f .rules/rules.json ] && cfg="--config .rules/rules.json"
+          python3 -B .hub/rules/chinese_commit.py --input .rules/chinese.json ${cfg} \
+            --out-md .rules/out/chinese-commit.md || { [ $? -eq 1 ] && echo failed > .rules/out/chinese-commit.failed || rc=2; }
+          for f in .rules/out/*.md; do { echo "### $(basename "$f" .md)"; echo '```text'; cat "$f"; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"; done
+          exit "${rc}"
+
+      - name: Fork PR note
+        if: always() && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "fork PR：token 只读，不写检查结果；结论见本次运行的 Summary。" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Publish one check run per rule (never required)
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          for name in no-weakened-assertion suppression-budget chinese-commit; do
+            [ -f ".rules/out/${name}.md" ] || continue
+            if [ -f ".rules/out/${name}.failed" ]; then conclusion=failure; else conclusion=success; fi
+            RULE_NAME="${name}" CONCLUSION="${conclusion}" python3 - <<'PY' > .rules/check.json
+          import json, os
+          name = os.environ["RULE_NAME"]
+          text = open(f".rules/out/{name}.md", encoding="utf-8").read()
+          print(json.dumps({
+              "name": f"autopilot/rule/{name}",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": os.environ["CONCLUSION"],
+              "output": {"title": text.splitlines()[0][:200] if text else name, "summary": text[:60000]},
+          }, ensure_ascii=False))
+          PY
+            gh api "repos/${REPO}/check-runs" --method POST --input .rules/check.json > /dev/null
+            echo "published ${name}: ${conclusion}"
+          done
