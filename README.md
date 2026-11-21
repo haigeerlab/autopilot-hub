@@ -15,6 +15,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 7**：退役 repo-readiness 依赖。准入不再读接入结论、不再报信任上限，改报一句话结论“能不能自动合并”：风险档（T0–T2）、接管评论 `autopilot-takeover:v1` 里的合并为 `auto`、硬卡证据（第二批才有，现在恒为“还没有”）、没有未关闭的降级 issue，四项都满足才写“可以自动合并”，否则列出原因。仍然只报告，检查结果是 `neutral`；PR 上打 `autopilot:risk-T<n>` 标签；风险配置优先读 `.github/autopr/risk-tiers.yml`，没有再读 `.json`。规格见 [docs/spec/slice-7.md](docs/spec/slice-7.md)。
 - **切片 8**：准入只认 autopilot 机器人（`bot-identity.json` 里的 App slug 与数字 ID）发出、且没被编辑过的接管评论；不合格的忽略并在摘要里计数；hub 没配机器人身份时永远“不会自动合并”。规格见 [docs/spec/slice-8.md](docs/spec/slice-8.md)。
 - **切片 9**：硬卡证据。准入读机器人发的 `autopilot-evidence:v1` 评论，只认绑定当前 head SHA 的那条：检查全过、审查完成且没有 blocking；接管评论带 spec-guard 模块时还要最终验收标记。规格见 [docs/spec/slice-9.md](docs/spec/slice-9.md)。
+- **切片 10**：本机编排 `orchestrator/cli.py run --repo <owner/name> --pr <n> [--dry-run]`：以机器人身份发接管评论、在一次性克隆里跑检查、调 delegate 审查（第 2 轮对照第 1 轮复审）、发证据、用同一份准入代码重算，然后按审过的 head SHA 合并并读回。规格见 [docs/spec/slice-10.md](docs/spec/slice-10.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
 ## 规则
