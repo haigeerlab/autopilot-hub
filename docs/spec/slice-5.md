@@ -74,3 +74,17 @@ python3 -B <autopilot-hub>/checkup/cli.py --repo <本地检出> [--base main] [-
 | autopr-design | 规格、搬代码、测试、hub 的 PR、三个仓库实跑 |
 | readiness-tool | 搬的时候按函数说明边界情况（它在 #21851 主动提出） |
 | 你 | 批准本规格（含 A1–A7）；合并 hub 的 PR；抽看实跑报告；实测一次计时 |
+
+## 增补：C13 风险路径清单（2026-11-22）
+
+spec-guard 0.91 判断"重要需求"时，需要知道哪些路径是 T3/T4。合并方案定了"调用方向只能是 autopilot → 插件"，所以 spec-guard 不调 hub 的代码，只读项目里的 `.github/autopr/risk-paths.json`。位置已与 sg-coord 商定（#21975–#21977）。
+
+- **内容**：就是 `risk/cli.py paths --repo <检出> --json` 的输出（`autopilot.risk-paths/v1`），由 hub 模板加本仓库 `risk-tiers.yml`（没有就读 `.json`）算出。
+- **C13 的状态**：
+  - 文件没有 → 缺；
+  - 文件和现在算出来的不一致 → 缺，标"过期"；
+  - 文件读不了，或风险配置读不了 → 判不了；
+  - 一致 → 有。
+- **补丁 F4**：生成 `risk-paths.patch`，新建或更新这个文件。改它算 T4，由用户审后提交。
+- C13 只提醒，不影响"能开到哪一档"的结论。spec-guard 读不到或读不懂这个文件时，按 risk-unknown 处理：交 Codex 批 Spec 的模块一律判为重要。
+- 顺带修正：`risk/cli.py paths` 原先只读 `risk-tiers.json`，现在和准入一致，先读 `.yml`。

@@ -126,6 +126,20 @@ def build_fixes(root, name, branch, findings, command, out_dir):
         else:
             add("F2", "C11", "风险分级配置", [], [],
                 "看不出仓库类别（可选 plugin / contract / frontend / content），没有生成，请告诉我是哪一类")
+    if status.get("C13") == "missing":
+        from checkup.checks import expected_risk_paths
+        from risk import tiers
+        want, _ = expected_risk_paths(root)
+        if want is not None:
+            old = None
+            existing = os.path.join(root, tiers.RISK_PATHS_FILE)
+            if os.path.isfile(existing):
+                with open(existing, encoding="utf-8") as fh:
+                    old = fh.read()
+            rel = write("risk-paths.patch", unified_patch(tiers.RISK_PATHS_FILE, old, want))
+            add("F4", "C13", "风险路径清单（给 spec-guard）", [rel],
+                ["git apply %s   # 在仓库的新分支上应用，提交后开 PR" % (rel or "<补丁>")],
+                "改的是 .github/ 下的文件，算 T4，须经你审后提交")
     if status.get("C12") == "missing":
         target, patch = instructions_patch(root, command)
         rel = write("instructions-%s.patch" % target.lower().replace(".", "-"), patch)

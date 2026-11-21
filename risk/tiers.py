@@ -234,6 +234,23 @@ def risk_paths(templates, config=None):
     return out
 
 
+REPO_CONFIGS = (".github/autopr/risk-tiers.yml", ".github/autopr/risk-tiers.json")  # .yml wins (slice 7)
+RISK_PATHS_FILE = ".github/autopr/risk-paths.json"  # what spec-guard 0.91 reads; written by the checkup (C13)
+
+
+def risk_paths_text(templates, config=None):
+    """Canonical text of risk-paths.json: exactly what `risk/cli.py paths --json` prints."""
+    return json.dumps(risk_paths(templates, config), ensure_ascii=False, indent=1) + "\n"
+
+
+def read_repo_config_at(root):
+    """The repo's risk config from a checkout: .yml first, then .json; None when neither exists."""
+    yml, js = (os.path.join(root, rel) for rel in REPO_CONFIGS)
+    if os.path.exists(yml):
+        return read_repo_config_yml(yml)
+    return read_repo_config(js)
+
+
 def read_repo_config(path):
     """Config dict, None when absent; raises ValueError when present but not valid JSON object."""
     if not path or not os.path.exists(path):
