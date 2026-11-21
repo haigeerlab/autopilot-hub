@@ -12,7 +12,7 @@ from checkup.ecosystem import manifest_names, lockfile_installed
 from checkup.proc import run
 
 RISK_CONFIG = ".github/autopr/risk-tiers.json"
-_AUTOPILOT_HEADING = re.compile(r"^#{1,6}\s+.*autopilot", re.I | re.M)
+_AUTOPILOT_HEADING = re.compile(r"^#{1,6}\s+.*(autopilot|autopr)", re.I | re.M)  # autopr: the old name, still used by .github/autopr/
 
 TITLES = {
     "C1": "有能跑的检查命令", "C2": "检查真的能跑", "C3": "分支保护生效", "C4": "主干 CI 是绿的",
@@ -213,7 +213,7 @@ def run_checks(root, base, gh, repo_name, run_check=False, runner=entry.run_chec
 def conclusion(findings, ran_check):
     """{level, missing, reminders, text}: the highest takeover level that can be enabled now."""
     by = {f["id"]: f for f in findings}
-    need = ["C1"] + (["C2"] if ran_check else [])
+    need = ["C1"] + (["C2"] if ran_check else []) + ["C12"]
     blockers = [c for c in need if by[c]["status"] != "ok"]
     reminders = [f["id"] for f in findings if f["status"] != "ok" and not f["skipped"] and f["id"] not in blockers]
     if not blockers:
@@ -221,9 +221,11 @@ def conclusion(findings, ran_check):
         text = "结论：现在可以开到「接管到合并」。"
     else:
         level = "只接管 Plan"
-        why = "、".join("%s（%s）" % (c, {"missing": "没找到" if c == "C1" else "没跑通", "unknown": "判不了"}[by[c]["status"]])
-                       for c in blockers)
+        label = {"C1": "没找到", "C2": "没跑通", "C12": "指令文件里还没有 autopilot 例外"}
+        why = "、".join("%s（%s）" % (c, label[c] if by[c]["status"] == "missing" else "判不了") for c in blockers)
         text = "结论：现在只能开到「只接管 Plan」；开「接管到合并」还差 %s。" % why
     if reminders:
         text += "其余提醒（不卡接入）：%s。" % "、".join(reminders)
+    if level == "接管到合并":
+        text += "另外，在真实仓库打开「接管到合并」前还要先建好 GitHub App 机器人身份（合并方案 8.10 前提一）。"
     return {"level": level, "missing": blockers, "reminders": reminders, "text": text}

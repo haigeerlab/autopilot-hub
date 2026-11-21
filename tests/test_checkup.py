@@ -363,7 +363,7 @@ class CliTest(unittest.TestCase):
     def test_exit_0_when_all_good(self):
         code, out, _ = self.go(self.good_repo(), transport=FakeTransport(good_github()))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[-1], "结论：现在可以开到「接管到合并」。")
+        self.assertTrue(out.splitlines()[-1].startswith("结论：现在可以开到「接管到合并」。"), out.splitlines()[-1])
 
     def test_exit_2_for_bad_input(self):
         import tempfile
@@ -434,11 +434,15 @@ class ConclusionTest(unittest.TestCase):
         base.update(st)
         return [{"id": k, "status": v, "skipped": False} for k, v in sorted(base.items(), key=lambda kv: int(kv[0][1:]))]
 
-    def test_merge_level_needs_only_c1(self):
-        c = checks.conclusion(self.fs(C3="missing", C12="missing"), False)
+    def test_merge_level_needs_c1_and_c12(self):
+        c = checks.conclusion(self.fs(C3="missing"), False)
         self.assertEqual(c["level"], "接管到合并")
-        self.assertEqual(c["reminders"], ["C3", "C12"])
+        self.assertEqual(c["reminders"], ["C3"])
         self.assertIn("其余提醒", c["text"])
+        self.assertIn("机器人身份", c["text"])
+        c = checks.conclusion(self.fs(C12="missing"), False)
+        self.assertEqual((c["level"], c["missing"]), ("只接管 Plan", ["C12"]))
+        self.assertIn("autopilot 例外", c["text"])
 
     def test_missing_c1_leaves_plan_only(self):
         c = checks.conclusion(self.fs(C1="missing"), False)
@@ -455,3 +459,9 @@ class ConclusionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyHeadingTest(unittest.TestCase):
+    def test_autopr_heading_counts_for_c12(self):
+        self.assertTrue(checks._AUTOPILOT_HEADING.search("# 项目\n\n## autopr（自动维护）\n内容\n"))
+        self.assertFalse(checks._AUTOPILOT_HEADING.search("# 项目\n\n## 发版\n"))
