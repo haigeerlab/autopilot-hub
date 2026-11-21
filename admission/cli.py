@@ -17,6 +17,7 @@ from admission import decide as d  # noqa: E402
 from risk import tiers as risk_tiers  # noqa: E402
 
 MARKER = "<!-- autopilot-admission -->"
+HUB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MISMATCH_NOTE = "risk-tiers.yml 和 .json 不一致，以 .yml 为准"
 
 
@@ -79,7 +80,10 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot slice-7 admission (report-only)")
     p.add_argument("--pr-files", required=True,
                    help="JSON array of PR files ({filename, status, additions, deletions, patch})")
-    p.add_argument("--comments", help="optional JSON array of PR comment bodies, oldest first")
+    p.add_argument("--comments", help="optional JSON array of PR comments, oldest first: REST objects with "
+                   "body, user {login, id, type}, app (performed_via_github_app.slug), created_at, updated_at")
+    p.add_argument("--bot-identity", default=os.path.join(HUB_ROOT, "bot-identity.json"),
+                   help="bot identity file (default: the hub's bot-identity.json); absent -> trust no comment")
     p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({number, body})")
     p.add_argument("--risk-config", help="risk-tiers config from the BASE branch; .yml/.yaml or .json by suffix")
     p.add_argument("--risk-config-yml", help="risk-tiers.yml from the BASE branch (wins over the .json)")
@@ -101,7 +105,7 @@ def main(argv=None):
     pr_files = [x for x in pr_files if isinstance(x, dict) and "filename" in x]
 
     comments = read_json(a.comments, optional=True)
-    comments = [c for c in comments if isinstance(c, str)] if isinstance(comments, list) else []
+    comments = [c for c in comments if isinstance(c, (str, dict))] if isinstance(comments, list) else []
     issues = read_json(a.degrade_issues, optional=True)
     issues = [i for i in issues if isinstance(i, dict)] if isinstance(issues, list) else []
 
@@ -116,7 +120,8 @@ def main(argv=None):
 
     risk = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
     risk["notes"] = config_notes + risk["notes"]
-    result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=a.repo)
+    result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=a.repo,
+                      bot=d.load_bot_identity(a.bot_identity))
     result["risk"] = risk
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
