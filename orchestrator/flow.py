@@ -68,6 +68,27 @@ SG_ITEMS = {"spec": ("human", "codex"), "plan": ("human", "codex"), "merge": ("h
             "release": ("human", "prepare", "auto-confirm", "auto")}
 
 
+APPROVED = ("approved", "codex-approved")
+
+
+def sg_artifact(path):
+    return (path.startswith("spec/") or path.startswith("tasks/")) and path != risk_tiers.CAPABILITY_MAP
+
+
+def verify_artifacts(view, module, changed):
+    """Slice 12: changed spec/<module>.md and tasks/<module>/** count as verified only when spec-guard (run on the
+    head commit) says both the module's Spec and Plan approvals are still in effect. Other modules' files and
+    the capability map are never verified."""
+    mod = next((m for m in (view or {}).get("modules") or [] if m.get("id") == module), None)
+    if not mod:
+        return []
+    review, by = mod.get("review") or {}, mod.get("reviewApprovedBy") or {}
+    if any(review.get(k) not in APPROVED or not by.get(k) for k in ("spec", "plan")):
+        return []
+    own = [p for p in changed if p == f"spec/{module}.md" or p.startswith(f"tasks/{module}/")]
+    return sorted(own)
+
+
 def say_takeover(say, module, merge, source):
     say(f"接管档位（来源 {source}" + (f"，模块 {module}" if module else "") + f"）：合并 {merge}\n\n"
         + block("autopilot-takeover", {"module": module, "merge": merge, "source": source}) + "\n")
@@ -139,7 +160,7 @@ def read_takeover(io, repo, base_ref, notes):
     return out
 
 
-def evaluate(io, repo, pr, bot):
+def evaluate(io, repo, pr, bot, optimistic_artifacts=None):
     """Admission decision with fresh inputs, exactly as the reusable workflow computes it."""
     number, head, base_ref = pr["number"], pr["head"]["sha"], pr["base"]["ref"]
     comments = [rest_comment(c) for c in io.api(f"repos/{repo}/issues/{number}/comments?per_page=100") or []]
@@ -158,7 +179,8 @@ def evaluate(io, repo, pr, bot):
                 with open(paths[ext], "w", encoding="utf-8") as fh:
                     fh.write(text)
         config = admission_cli.load_risk_config(paths.get("yml"), paths.get("json"), notes)
-    risk = risk_tiers.classify(files, risk_tiers.load_templates(), config)
+    verified = d.verified_artifacts(comments, bot, head) if optimistic_artifacts is None else optimistic_artifacts
+    risk = risk_tiers.classify(files, risk_tiers.load_templates(), config, verified)
     risk["notes"] = notes + risk["notes"]
     result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=repo, bot=bot, head_sha=head)
     result["risk"] = risk
@@ -252,13 +274,15 @@ def gate_review(report):
     return fp
 
 
-def evidence_body(head, command, check, report, rounds, fp, acceptance=None):
+def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None):
     payload = {"head_sha": head, "runner": "autopilot-orchestrator",
                "checks": [{"cmd": command, "exit": check["exit"], "output_sha256": check["output_sha256"]}],
                "review": {"backend": report.get("backend"), "status": report.get("execution_status"),
                           "outcome": report.get("review_outcome"), "fingerprint": fp,
                           "blocking": blocking_of(report), "rounds": rounds},
                "acceptance": acceptance}
+    if artifacts is not None:
+        payload["artifacts"] = artifacts
     tail = "\n".join(check["tail"])
     return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`）\n\n"
             f"- 检查：`{command}`，退出码 {check['exit']}（在一次性克隆里由本机编排重新运行）\n"
@@ -317,7 +341,10 @@ def run(io, repo, number, *, dry_run=False):
             if takeover["merge"] != "auto":
                 raise Stop("takeover", "接管档位里合并由人，autopilot 不合并，交你")
 
-        pre = evaluate(io, repo, pr, bot)
+        changed = [f.get("filename") for f in io.api(f"repos/{repo}/pulls/{number}/files?per_page=100") or []]
+        # spec-guard projects: spec/tasks artifacts are verified after the checks; assume they will be for the pre-check
+        optimistic = {p for p in changed if sg_artifact(p)} if sg_config is not None else None
+        pre = evaluate(io, repo, pr, bot, optimistic)
         risk_item = next(i for i in pre["items"] if i["id"] == "risk")
         if not risk_item["ok"]:
             raise Stop("risk", risk_item["detail"])
@@ -330,7 +357,7 @@ def run(io, repo, number, *, dry_run=False):
             if check["exit"] != 0:
                 raise Stop("check", f"检查 `{command}` 退出码 {check['exit']}，交作者修")
             io.write_check_evidence(repo, check_evidence(repo, head, command, check, io.now()))
-            acceptance = None
+            acceptance = artifacts = None
             if sg_config is not None:
                 modules = io.find_modules(repo, head)
                 if not modules:
@@ -348,13 +375,14 @@ def run(io, repo, number, *, dry_run=False):
                 if blocking_of(report):
                     raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
                 notes.append(f"模块 {module} 沿用 spec-guard 的验收审查报告，不另审")
+                artifacts = {"module": module, "verified": verify_artifacts(work.module_view(), module, changed)}
             else:
                 report, rounds, fp = review(io, repo, pr, work, notes)
 
         if dry_run:
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
                     "notes": notes, "head_sha": head}
-        say(evidence_body(head, command, check, report, rounds, fp, acceptance))
+        say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts))
 
         decision = evaluate(io, repo, pr, bot)
         if not decision["auto_merge"]:

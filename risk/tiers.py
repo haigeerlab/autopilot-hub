@@ -121,9 +121,14 @@ def spec_guard_tier(templates, f):
     return None
 
 
-def file_tier(templates, layer_list, default, f):
+CAPABILITY_MAP = "spec/CAPABILITY-MAP.md"  # new modules always need the user's approval: never verified
+
+
+def file_tier(templates, layer_list, default, f, verified=()):
     path = f["filename"]
     sg = spec_guard_tier(templates, f)
+    if sg and sg[0] == "T4" and path in verified and path != CAPABILITY_MAP:
+        sg = ("T2", "spec-guard 模块产物，编排已核对批准仍有效（切片 12）")
     protective, ordinary = [], []
     for label, rules in layer_list:
         for t in TIERS:
@@ -148,14 +153,17 @@ def count_markers(lines, markers):
     return sum(1 for line in lines for m in markers if m in line)
 
 
-def classify(files, templates, config=None):
+def classify(files, templates, config=None, verified=()):
+    """`verified`: spec/** and tasks/** paths the orchestrator verified as still approved (slice 12; read
+    from the bot's evidence comment on the current head). They drop from T4 to T2; nothing else changes."""
+    verified = set(verified or ())
     notes, reasons, per_file = [], [], []
     layer_list, category, default = layers(templates, config, notes)
     if not files:
         return {"tier": "T0", "reasons": ["没有改动文件"], "auto_merge_eligible": True, "stop": False,
                 "category": category, "files": [], "notes": notes}
     for f in files:
-        t, why = file_tier(templates, layer_list, default, f)
+        t, why = file_tier(templates, layer_list, default, f, verified)
         per_file.append({"file": f["filename"], "tier": t, "rule": why})
     top = max(per_file, key=lambda x: rank(x["tier"]))
     tier = top["tier"]

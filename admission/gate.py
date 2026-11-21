@@ -50,14 +50,10 @@ def problems(p, head_sha, module):
     return out
 
 
-def gate_item(comments, bot, head_sha, module, notes):
-    """The `gate` admission item. `module` is the spec-guard module from the trusted takeover comment
-    (None for repos without spec-guard): when set, the final acceptance must be in the evidence too."""
-    from admission.decide import BOT_MISSING_SHORT, as_comment, trusted  # local: decide imports this module
-    if bot is None:
-        return {"id": "gate", "ok": False, "detail": "hub 没配机器人身份，不认任何证据评论"}, BOT_MISSING_SHORT
-    if not isinstance(head_sha, str) or len(head_sha) != 40:
-        return {"id": "gate", "ok": False, "detail": "不知道当前提交（head SHA），无法核对证据"}, "硬卡：不知道当前提交"
+def current_evidence(comments, bot, head_sha, notes=None):
+    """Payloads of trusted evidence comments bound to `head_sha`, oldest first."""
+    from admission.decide import as_comment, trusted  # local: decide imports this module
+    notes = [] if notes is None else notes
     comments = [as_comment(c) for c in comments]
     with_block = [c for c in comments if EVIDENCE_BLOCK.search(c.get("body") or "")]
     good = [c for c in with_block if trusted(c, bot)]
@@ -81,6 +77,18 @@ def gate_item(comments, bot, head_sha, module, notes):
         notes.append(f"有 {stale} 条证据评论绑定的不是当前提交 {head_sha[:12]}，不算")
     if unreadable:
         notes.append(f"有 {unreadable} 条证据评论读不懂，不算")
+    return current
+
+
+def gate_item(comments, bot, head_sha, module, notes):
+    """The `gate` admission item. `module` is the spec-guard module from the trusted takeover comment
+    (None for repos without spec-guard): when set, the final acceptance must be in the evidence too."""
+    from admission.decide import BOT_MISSING_SHORT  # local: decide imports this module
+    if bot is None:
+        return {"id": "gate", "ok": False, "detail": "hub 没配机器人身份，不认任何证据评论"}, BOT_MISSING_SHORT
+    if not isinstance(head_sha, str) or len(head_sha) != 40:
+        return {"id": "gate", "ok": False, "detail": "不知道当前提交（head SHA），无法核对证据"}, "硬卡：不知道当前提交"
+    current = current_evidence(comments, bot, head_sha, notes)
     if not current:
         return {"id": "gate", "ok": False, "detail": NO_EVIDENCE}, "硬卡：还没有证据"
     bad = problems(current[-1], head_sha, module)
