@@ -206,7 +206,9 @@ def record_revert_correction(api, repo, c, notes):
     from correction.cli import record  # lazy: correction.cli imports this module
     pr_url = (c["evidence"] or [None])[0]
     try:
-        res = record(api, repo, "revert", f"main 上撤回了 autopilot 的 PR（{pr_url}）", c["ref"])
+        # No read-back wait here: a revert is recorded once per push, and the degrade run must stay short.
+        res = record(api, repo, "revert", f"main 上撤回了 autopilot 的 PR（{pr_url}）", c["ref"],
+                     sleep=lambda _seconds: None)
     except ApiError as e:
         notes.append(f"纠错记录没写成（降级已开）：{e}")
         return

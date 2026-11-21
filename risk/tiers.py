@@ -117,6 +117,11 @@ def file_tier(templates, layer_list, default, f):
     return default, f"没有规则匹配，按默认 {default}"
 
 
+def is_prose(templates, name):
+    """Docs mention markers like `# noqa` when describing rules; they are not suppressions."""
+    return any_match(templates.get("prose_files", []), name) is not None
+
+
 def count_markers(lines, markers):
     return sum(1 for line in lines for m in markers if m in line)
 
@@ -171,6 +176,8 @@ def classify(files, templates, config=None):
 
     removed_all, added_all = [], []
     for f in files:
+        if is_prose(templates, f["filename"]):
+            continue
         r_, a_ = changed_lines(f.get("patch"))
         removed_all += r_
         added_all += a_

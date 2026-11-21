@@ -37,7 +37,7 @@ class FakeApi:
         if self.fail:
             raise r.ApiError("boom")
         if method == "GET":
-            if "labels=correction" in path:  # slice 6: revert also records a correction event
+            if "issues?state=all" in path:  # slice 6: revert also records a correction event
                 return self.responses.get(path, [])
             if path not in self.responses:
                 raise r.ApiError(f"unexpected GET {path}")

@@ -140,6 +140,11 @@ class BumpTest(unittest.TestCase):
         res = tier_of([f("skills/a.py", patch=patch)], self.cfg)
         self.assertEqual(res["tier"], "T4")
 
+    def test_marker_in_docs_is_not_a_suppression(self):
+        patch = "@@ -1 +1 @@\n+| rule | counts `# no" + "qa` and `eslint-disable` |\n"
+        res = tier_of([f("docs/spec/rules.md", patch=patch)], self.cfg)
+        self.assertEqual(res["tier"], "T0")
+
     def test_removed_suppression_is_fine(self):
         patch = "@@ -1 +1 @@\n-x = 1  # noqa\n+x = 1\n"
         res = tier_of([f("skills/a.py", patch=patch)], self.cfg)

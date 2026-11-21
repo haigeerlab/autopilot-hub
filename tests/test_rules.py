@@ -146,6 +146,11 @@ class SuppressionBudgetPatchTest(TempDirCase):
     def test_waiver_line_alone_is_not_a_suppression(self):
         self.assertEqual(self.check(added=[waiver("no-weakened-assertion")]), [])
 
+    def test_markers_mentioned_in_docs_are_not_counted(self):
+        # PR #14: docs/spec/slice-6.md describes the rule and mentions the marker; that is not a suppression
+        docs = pfile("docs/spec/slice-6.md", self.patch(added=[f"| suppression-budget | counts `{NOQA}` |"]))
+        self.assertEqual(sb.check_patches([docs], TEMPLATES, TODAY), [])
+
     def test_missing_patch_is_skipped(self):
         self.assertEqual(sb.check_patches([pfile("a.png", None)], TEMPLATES, TODAY), [])
 

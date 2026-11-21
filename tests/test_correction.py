@@ -30,7 +30,7 @@ class FakeGitHub:
         if self.fail_on and method == self.fail_on[0] and self.fail_on[1] in path:
             raise c.ApiError("boom")
         if method == "GET" and "/issues?" in path:
-            wanted = path.split("labels=")[1].split("&")[0].split(",")
+            wanted = path.split("labels=")[1].split("&")[0].split(",") if "labels=" in path else []
             state = path.split("state=")[1].split("&")[0]
             return [i for i in self.issues if set(wanted) <= {lb["name"] for lb in i["labels"]}
                     and (state == "all" or i["state"] == state)]
@@ -137,7 +137,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(c.record(api, REPO, "x-class", "three", "r3")["count"], 3)
 
     def test_read_failure_writes_nothing(self):
-        api = FakeGitHub(fail_on=("GET", "labels=correction:x-class"))
+        api = FakeGitHub(fail_on=("GET", "issues?state=all"))
         with self.assertRaises(c.ApiError):
             c.record(api, REPO, "x-class", "one", "r1")
         self.assertEqual(api.writes(), [])
@@ -238,7 +238,7 @@ class DegradeRevertCorrectionTest(unittest.TestCase):
 
     def test_correction_failure_does_not_hide_the_degrade(self):
         api, call = self.fake()
-        api.fail_on = ("GET", "labels=correction:revert")
+        api.fail_on = ("GET", "issues?state=all")
         out = degrade.run("push", self.event(), call)
         self.assertEqual(out["opened"], 1)
         self.assertTrue(any("纠错记录没写成" in n for n in out["notes"]))
@@ -254,3 +254,52 @@ class DegradeRevertCorrectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LabelFilterLagTest(unittest.TestCase):
+    """The labels= list filter lags behind issue creation; record must not depend on it (slice-6 drill)."""
+
+    def test_second_record_counts_the_first_even_if_label_filter_lags(self):
+        api = FakeGitHub()
+        real = api.__call__
+
+        def lagging(path, method="GET", body=None):
+            if method == "GET" and "labels=" in path:
+                return []  # the label index has not caught up
+            return real(path, method, body)
+        c.record(lagging, REPO, "x-class", "one", "r1")
+        out = c.record(lagging, REPO, "x-class", "two", "r2")
+        self.assertEqual(out["count"], 2)
+        self.assertIsNotNone(out["candidate"])
+        dup = c.record(lagging, REPO, "x-class", "again", "r2")
+        self.assertEqual(dup["status"], "duplicate")
+
+
+class ReadBackTest(unittest.TestCase):
+    def test_waits_until_new_issue_is_listed(self):
+        api = FakeGitHub()
+        real = api.__call__
+        hidden = {"n": 2}  # the new issue is missing from the first two list reads
+
+        def lagging(path, method="GET", body=None):
+            out = real(path, method, body)
+            if method == "GET" and "/issues?" in path and hidden["n"] > 0 and out:
+                hidden["n"] -= 1
+                return out[:-1]
+            return out
+        slept = []
+        res = c.record(lagging, REPO, "x-class", "one", "r1", sleep=slept.append)
+        self.assertTrue(res["visible"])
+        self.assertEqual(len(slept), 2)
+
+    def test_gives_up_after_a_few_tries(self):
+        api = FakeGitHub()
+        real = api.__call__
+
+        def never(path, method="GET", body=None):
+            out = real(path, method, body)
+            return [] if method == "GET" and "/issues?" in path else out
+        slept = []
+        res = c.record(never, REPO, "x-class", "one", "r1", sleep=slept.append)
+        self.assertFalse(res["visible"])
+        self.assertEqual(len(slept), 5)

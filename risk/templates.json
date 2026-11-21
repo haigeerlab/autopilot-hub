@@ -58,6 +58,7 @@
     }
   },
   "assertion_markers": ["assert", "expect(", "assertEqual", "assertTrue", "assertFalse", "assertIn", "assertRaises", ".should", "t.is(", "t.deepEqual(", "toBe(", "toEqual("],
+  "prose_files": ["*.md", "**/*.md", "*.txt", "**/*.txt", "*.rst", "**/*.rst"],
   "suppression_markers": ["# noqa", "eslint-disable", "@ts-ignore", "@ts-expect-error", "# type: ignore", "shellcheck disable", "pylint: disable", "//nolint", "autopilot-allow"],
   "bumps": {
     "non_test_lines_over": 200,

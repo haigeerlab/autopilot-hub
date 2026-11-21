@@ -12,6 +12,7 @@ first write, so an API failure never leaves a half-written record.
 """
 import argparse
 import json
+import time
 import os
 import re
 import sys
@@ -63,8 +64,32 @@ def is_event(issue):
     return "pull_request" not in issue and CANDIDATE not in label_names(issue)
 
 
-def class_events(api, repo, slug):
-    return [i for i in api(f"repos/{repo}/issues?labels={LABEL}:{slug}&state=all&per_page=100") or [] if is_event(i)]
+def all_issues(api, repo):
+    """Every issue of the repo (paginated), filtered locally.
+
+    The labels= filter of the list endpoint is eventually consistent: an issue created a moment ago
+    is missing from it, which broke the count and the --ref dedupe (found in the slice-6 drill)."""
+    return [i for i in api(f"repos/{repo}/issues?state=all&per_page=100") or [] if "pull_request" not in i]
+
+
+def wait_visible(api, repo, number, sleep, tries=5, delay=2.0):
+    """Read back until the new issue shows up in the list endpoint (it lags a few seconds), so the next
+    `record` counts it and can dedupe on its ref. Returns False if it never showed up."""
+    for _ in range(tries):
+        if any(i.get("number") == number for i in all_issues(api, repo)):
+            return True
+        sleep(delay)
+    return False
+
+
+def labelled(issue, *names):
+    have = {lb.get("name") for lb in issue.get("labels") or []}
+    return all(n in have for n in names)
+
+
+def class_events(api, repo, slug, issues=None):
+    issues = all_issues(api, repo) if issues is None else issues
+    return [i for i in issues if labelled(i, f"{LABEL}:{slug}") and is_event(i)]
 
 
 def ensure_label(api, repo, name):
@@ -97,7 +122,7 @@ def candidate_body(slug, events):
     return "\n".join(lines) + "\n"
 
 
-def record(api, repo, slug, summary, ref=None):
+def record(api, repo, slug, summary, ref=None, sleep=None):
     """Record one correction event. Returns {status, number, url, count, candidate, ask}."""
     validate(repo, slug)
     if not isinstance(summary, str) or not summary.strip():
@@ -105,7 +130,8 @@ def record(api, repo, slug, summary, ref=None):
     summary = " ".join(summary.split())
     ref = ref.strip() if isinstance(ref, str) and ref.strip() else None
 
-    events = class_events(api, repo, slug)  # all reads first
+    issues = all_issues(api, repo)  # all reads first
+    events = class_events(api, repo, slug, issues)
     if ref:
         for i in events:
             if (issue_payload(i) or {}).get("ref") == ref:
@@ -113,8 +139,8 @@ def record(api, repo, slug, summary, ref=None):
                         "count": len(events), "candidate": None, "ask": None}
     existing_candidate = None
     if len(events) + 1 >= PROMOTE_AT:
-        found = api(f"repos/{repo}/issues?labels={CANDIDATE},{LABEL}:{slug}&state=open&per_page=100") or []
-        existing_candidate = next((i for i in found if "pull_request" not in i), None)
+        existing_candidate = next((i for i in issues if i.get("state") == "open"
+                                   and labelled(i, CANDIDATE, f"{LABEL}:{slug}")), None)
 
     for name in (LABEL, f"{LABEL}:{slug}"):
         ensure_label(api, repo, name)
@@ -122,7 +148,9 @@ def record(api, repo, slug, summary, ref=None):
         "title": f"纠正：{slug} — {summary[:40]}", "body": event_body(slug, summary, ref),
         "labels": [LABEL, f"{LABEL}:{slug}"]}) or {}
     result = {"status": "created", "number": created.get("number"), "url": created.get("html_url"),
-              "count": len(events) + 1, "candidate": None, "ask": None}
+              "count": len(events) + 1, "candidate": None, "ask": None, "visible": True}
+    if created.get("number") is not None:
+        result["visible"] = wait_visible(api, repo, created["number"], sleep or time.sleep)
 
     if result["count"] >= PROMOTE_AT:
         listed = sorted(events + [created], key=lambda i: i.get("number") or 0)
@@ -144,7 +172,9 @@ def classes(api, repo):
     """[{class, count}] sorted by count desc then name; candidate issues are not events."""
     validate(repo, "x")
     counts = {}
-    for i in api(f"repos/{repo}/issues?labels={LABEL}&state=all&per_page=100") or []:
+    for i in all_issues(api, repo):
+        if not labelled(i, LABEL):
+            continue
         if not is_event(i):
             continue
         for name in label_names(i):
