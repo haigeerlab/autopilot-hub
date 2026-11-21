@@ -92,6 +92,39 @@ class FileTierTest(unittest.TestCase):
         self.assertEqual(res["tier"], "T4")
 
 
+class ConfigKeysTest(unittest.TestCase):
+    """Old `T4_paths` style keys still count; unknown keys are reported, never silently dropped."""
+
+    def test_paths_suffix_keys_count_like_tier_keys(self):
+        cfg = {"extends": "plugin", "T4_paths": ["bridge/**"], "T1_paths": ["fixtures/**"]}
+        res = tier_of([f("bridge/src/version.ts")], cfg)
+        self.assertEqual(res["tier"], "T4")
+        self.assertEqual(self.one_tier("fixtures/a.json", cfg), "T1")
+        self.assertTrue(any("T4_paths" in n for n in res["notes"]), res["notes"])
+
+    def test_both_spellings_are_merged(self):
+        cfg = {"extends": "plugin", "T4": ["a/**"], "T4_paths": ["b/**"]}
+        self.assertEqual(self.one_tier("a/x.py", cfg), "T4")
+        self.assertEqual(self.one_tier("b/x.py", cfg), "T4")
+
+    def test_unknown_key_is_reported(self):
+        res = tier_of([f("docs/a.md")], {"extends": "plugin", "T5": ["x/**"], "tier4": ["y/**"]})
+        self.assertTrue(any("T5" in n for n in res["notes"]), res["notes"])
+        self.assertTrue(any("tier4" in n for n in res["notes"]), res["notes"])
+
+    def test_known_meta_keys_are_quiet(self):
+        res = tier_of([f("docs/a.md")], {"extends": "plugin", "version": 1, "$comment": "x", "T4": []})
+        self.assertEqual(res["notes"], [])
+
+    def test_risk_paths_also_reads_old_keys(self):
+        out = r.risk_paths(T, {"extends": "plugin", "T4_paths": ["bridge/**"]})
+        self.assertIn("bridge/**", out["T4"])
+
+    @staticmethod
+    def one_tier(name, cfg):
+        return tier_of([f(name)], cfg)["tier"]
+
+
 class BumpTest(unittest.TestCase):
     cfg = {"extends": "plugin"}
 
