@@ -17,6 +17,11 @@ TAKEOVER_AUTO = '<!-- autopilot-takeover:v1 {"module": "m", "merge": "auto"} -->
 BOT_TAKEOVER_AUTO = {"id": 1, "body": TAKEOVER_AUTO, "app": "haigeerlab-autopilot",
                      "user": {"login": "haigeerlab-autopilot[bot]", "id": 359574582, "type": "Bot"},
                      "created_at": "2026-11-22T01:00:00Z", "updated_at": "2026-11-22T01:00:00Z"}
+HEAD = "a" * 40
+BOT_EVIDENCE = dict(BOT_TAKEOVER_AUTO, body="<!-- autopilot-evidence:v1 " + json.dumps({
+    "head_sha": HEAD, "checks": [{"cmd": "make test", "exit": 0, "output_sha256": "c" * 64}],
+    "review": {"backend": "codex", "status": "completed", "fingerprint": "f" * 16, "blocking": 0, "rounds": 1},
+    "acceptance": {"marker": "codex-approved", "sha": HEAD}}) + " -->")
 
 
 class CliTest(unittest.TestCase):
@@ -67,12 +72,23 @@ class CliTest(unittest.TestCase):
         files = self.write("files.json", [FILE_DOC])
         comments = self.write("c.json", [BOT_TAKEOVER_AUTO])
         cfg = self.write("r.yml", "extends: plugin\n", raw=True)
-        proc, result, md = self.run_cli(files, ["--comments", comments, "--risk-config-yml", cfg])
+        proc, result, md = self.run_cli(files, ["--comments", comments, "--risk-config-yml", cfg, "--head-sha", HEAD])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(result["auto_merge"])
         self.assertEqual(result["headline"], "不会自动合并（硬卡：还没有证据）")
         self.assertRegex(md, r"\| risk \| ✅ \|")
         self.assertRegex(md, r"\| takeover \| ✅ \|")
+
+    def test_bot_evidence_makes_it_auto_merge(self):
+        files = self.write("files.json", [FILE_DOC])
+        comments = self.write("c.json", [BOT_TAKEOVER_AUTO, BOT_EVIDENCE])
+        cfg = self.write("r.yml", "extends: plugin\n", raw=True)
+        proc, result, md = self.run_cli(files, ["--comments", comments, "--risk-config-yml", cfg, "--head-sha", HEAD])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(result["auto_merge"], result["items"])
+        self.assertIn("### autopilot/admission：可以自动合并", md)
+        _, result, _ = self.run_cli(files, ["--comments", comments, "--risk-config-yml", cfg, "--head-sha", "b" * 40])
+        self.assertFalse(result["auto_merge"])
 
     def test_without_bot_identity_takeover_is_not_trusted(self):
         files = self.write("files.json", [FILE_DOC])
@@ -182,7 +198,8 @@ class WorkflowLabelTest(unittest.TestCase):
         self.assertIn("labels/autopilot:risk-${tier}", self.text)
 
     def test_reads_base_branch_yml_and_json_and_comments(self):
-        for part in ("risk-tiers.yml", "risk-tiers.json", "--comments", "--risk-config-yml", "--risk-config-json"):
+        for part in ("risk-tiers.yml", "risk-tiers.json", "--comments", "--risk-config-yml", "--risk-config-json",
+                     '--head-sha "${HEAD_SHA}"'):
             self.assertIn(part, self.text)
 
     def test_comments_carry_author_fields(self):

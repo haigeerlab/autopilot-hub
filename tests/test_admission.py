@@ -48,9 +48,20 @@ def degrade_issue(number, repo=REPO, level="L2"):
     return {"number": number, "body": "降级\n<!-- autopilot-degrade:v1 " + block + " -->\n"}
 
 
-def run(risk=None, comments=(), issues=(), bot_identity=BOT):
+HEAD = "a" * 40
+
+
+def evidence_body(sha=HEAD, exit_code=0):
+    p = {"head_sha": sha, "runner": "autopilot-orchestrator",
+         "checks": [{"cmd": "make test", "exit": exit_code, "output_sha256": "c" * 64}],
+         "review": {"backend": "codex", "status": "completed", "fingerprint": "f" * 16, "blocking": 0, "rounds": 1},
+         "acceptance": {"marker": "codex-approved", "sha": sha}}
+    return "<!-- autopilot-evidence:v1 " + json.dumps(p) + " -->"
+
+
+def run(risk=None, comments=(), issues=(), bot_identity=BOT, head=HEAD):
     return d.decide(risk=risk or risk_of(), comments=list(comments), degrade_issues=list(issues), repo=REPO,
-                    bot=bot_identity)
+                    bot=bot_identity, head_sha=head)
 
 
 def item(result, item_id):
@@ -153,8 +164,7 @@ class BotIdentityTest(unittest.TestCase):
         self.assertIn("合并 'human'", item(res, "takeover")["detail"])
 
     def test_no_bot_identity_never_auto_merges(self):
-        gate = {"id": "gate", "ok": True, "detail": "有证据"}
-        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=None)
+        res = run(comments=[takeover("auto"), bot(evidence_body())], bot_identity=None)
         self.assertFalse(res["auto_merge"])
         self.assertIn("没配机器人身份", item(res, "takeover")["detail"])
         self.assertIn("没配机器人身份", res["headline"])
@@ -175,10 +185,20 @@ class BotIdentityTest(unittest.TestCase):
 
 
 class GateItemTest(unittest.TestCase):
-    def test_gate_is_never_ok_yet(self):
+    def test_no_evidence_is_not_ok(self):
         res = run(comments=[takeover("auto")])
         self.assertFalse(item(res, "gate")["ok"])
-        self.assertIn("第二批", item(res, "gate")["detail"])
+        self.assertIn("还没有", item(res, "gate")["detail"])
+
+    def test_bot_evidence_on_head_is_ok(self):
+        self.assertTrue(item(run(comments=[takeover("auto"), bot(evidence_body())]), "gate")["ok"])
+
+    def test_takeover_module_requires_acceptance(self):
+        no_acc = bot(evidence_body().replace('"acceptance": {"marker": "codex-approved", "sha": "' + HEAD + '"}',
+                                             '"acceptance": null'))
+        self.assertFalse(item(run(comments=[takeover("auto"), no_acc]), "gate")["ok"])
+        plain = bot(takeover_body("auto").replace('"module": "m"', '"module": null'))
+        self.assertTrue(item(run(comments=[plain, no_acc]), "gate")["ok"])
 
 
 class DegradeItemTest(unittest.TestCase):
@@ -211,32 +231,30 @@ class HeadlineTest(unittest.TestCase):
     def test_four_items_in_order(self):
         self.assertEqual([i["id"] for i in run()["items"]], ["risk", "takeover", "gate", "degrade"])
 
-    def test_headline_never_says_ok_while_gate_is_missing(self):
-        # Every other item satisfied; the gate evidence does not exist until batch 2.
+    def test_headline_without_evidence(self):
         res = run(comments=[takeover("auto")])
         self.assertFalse(res["auto_merge"])
         self.assertEqual(res["headline"], "不会自动合并（硬卡：还没有证据）")
 
     def test_headline_ok_only_when_all_four_ok(self):
-        gate = {"id": "gate", "ok": True, "detail": "有证据"}
-        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=BOT)
+        good = [takeover("auto"), bot(evidence_body())]
+        res = run(comments=good)
         self.assertTrue(res["auto_merge"])
         self.assertEqual(res["headline"], "可以自动合并")
         # Dropping any single item flips it.
         cases = {
             "risk": dict(risk=risk_of(".github/workflows/x.yml")),
-            "takeover": dict(comments=[takeover("human")]),
-            "degrade": dict(degrade_issues=[degrade_issue(3)]),
+            "takeover": dict(comments=[takeover("human"), bot(evidence_body())]),
+            "gate": dict(comments=[takeover("auto"), bot(evidence_body(exit_code=1))]),
+            "stale": dict(comments=good, head="b" * 40),
+            "degrade": dict(issues=[degrade_issue(3)]),
         }
         for name, change in cases.items():
-            args = dict(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate, bot=BOT)
+            args = dict(comments=good)
             args.update(change)
-            res = d.decide(**args)
+            res = run(**args)
             self.assertFalse(res["auto_merge"], name)
             self.assertTrue(res["headline"].startswith("不会自动合并（"), name)
-        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO,
-                       gate={"id": "gate", "ok": False, "detail": "x"}, bot=BOT)
-        self.assertFalse(res["auto_merge"])
 
     def test_reasons_are_listed(self):
         res = run(risk_of(".github/workflows/x.yml"), issues=[degrade_issue(5)])

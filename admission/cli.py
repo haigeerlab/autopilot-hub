@@ -88,6 +88,7 @@ def main(argv=None):
     p.add_argument("--risk-config", help="risk-tiers config from the BASE branch; .yml/.yaml or .json by suffix")
     p.add_argument("--risk-config-yml", help="risk-tiers.yml from the BASE branch (wins over the .json)")
     p.add_argument("--risk-config-json", help="risk-tiers.json from the BASE branch")
+    p.add_argument("--head-sha", help="PR head commit; hard-gate evidence must be bound to it")
     p.add_argument("--repo", required=True)
     p.add_argument("--default-branch", help="accepted for compatibility; not used")
     p.add_argument("--out-json", required=True)
@@ -121,7 +122,7 @@ def main(argv=None):
     risk = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
     risk["notes"] = config_notes + risk["notes"]
     result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=a.repo,
-                      bot=d.load_bot_identity(a.bot_identity))
+                      bot=d.load_bot_identity(a.bot_identity), head_sha=a.head_sha)
     result["risk"] = risk
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
