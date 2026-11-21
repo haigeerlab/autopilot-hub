@@ -1,13 +1,11 @@
-"""Command-line entry for slice-1 admission. Reads local files, writes a JSON decision and a Markdown summary.
+"""Command-line entry for slice-7 admission. Reads local files, writes a JSON decision and a Markdown summary.
 
-GitHub I/O (fetching the conclusion from the base branch, listing degrade issues, posting the check run,
-label and comment) is done by the reusable workflow with `gh`, so this module stays pure and testable.
+GitHub I/O (fetching risk config from the base branch, listing comments and degrade issues, posting the
+check run, label and comment) is done by the reusable workflow with `gh`, so this module stays pure.
 
-Exit codes: 0 = a decision was written (any cap, including L0); 2 = bad invocation or unreadable config.
+Exit codes: 0 = a decision was written; 2 = bad invocation or unreadable required input.
 """
 import argparse
-import datetime as dt
-import hashlib
 import json
 import os
 import sys
@@ -18,9 +16,8 @@ if __package__ in (None, ""):
 from admission import decide as d  # noqa: E402
 from risk import tiers as risk_tiers  # noqa: E402
 
-HUB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 MARKER = "<!-- autopilot-admission -->"
+MISMATCH_NOTE = "risk-tiers.yml 和 .json 不一致，以 .yml 为准"
 
 
 def read_json(path, *, optional):
@@ -32,117 +29,100 @@ def read_json(path, *, optional):
         try:
             return json.load(f)
         except ValueError:
-            # A file that exists but is not JSON is a broken input, not a missing one: fail closed downstream.
-            return "unparseable"
+            return None
 
 
-def sha256_of(path):
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+def load_risk_config(yml_path, json_path, notes):
+    """.yml wins over .json; both present and different -> note. Unreadable config -> None (generic rules)."""
+    yml_exists = bool(yml_path) and os.path.exists(yml_path)
+    json_exists = bool(json_path) and os.path.exists(json_path)
+    yml = js = None
+    if yml_exists:
+        try:
+            yml = risk_tiers.read_repo_config_yml(yml_path)
+        except (OSError, ValueError):
+            notes.append("risk-tiers.yml 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
+            return None
+    if json_exists:
+        try:
+            js = risk_tiers.read_repo_config(json_path)
+        except (OSError, ValueError):
+            if not yml_exists:
+                notes.append("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
+                return None
+    if yml_exists:
+        if json_exists and js is not None and js != yml:
+            notes.append(MISMATCH_NOTE)
+        return yml
+    return js
 
 
-def render_markdown(result, conclusion_sha):
-    lines = [MARKER, f"### autopilot/admission：{result['reason']}", ""]
-    lines.append("| 步骤 | 结果 | 说明 |")
-    lines.append("| --- | --- | --- |")
-    for step in result["steps"]:
-        lines.append(f"| {step['id']} | {'✅' if step['ok'] else '❌'} | {step['detail']} |")
-    risk = result.get("risk")
-    if risk:
-        verdict = "停下交你" if risk["stop"] else ("可自动合" if risk["auto_merge_eligible"] else "要你合")
-        lines.append(f"| risk | {'⛔' if risk['stop'] else '✅'} | 风险档 {risk['tier']}，{verdict}：{'；'.join(risk['reasons'])} |")
+def render_markdown(result):
+    lines = [MARKER, f"### autopilot/admission：{result['headline']}", "", "| 项 | 结果 | 说明 |", "| --- | --- | --- |"]
+    for item in result["items"]:
+        if item["ok"]:
+            mark = "✅"
+        elif item["id"] == "risk" and result["risk"]["stop"]:
+            mark = "⛔"
+        else:
+            mark = "—"
+        lines.append(f"| {item['id']} | {mark} | {item['detail']} |")
     lines.append("")
-    if conclusion_sha:
-        lines.append(f"接入结论文件 sha256：`{conclusion_sha}`")
     for note in result["notes"]:
         lines.append(f"- 注意：{note}")
     lines.append("")
-    lines.append("本检查只报告信任上限，不拦截、不合并（切片 1，见 autopilot-hub `docs/spec/slice-1.md`）。")
+    lines.append("本检查只报告，不拦截、不合并（切片 7，见 autopilot-hub `docs/spec/slice-7.md`）。")
     return "\n".join(lines) + "\n"
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="autopilot slice-1 admission (report-only)")
-    p.add_argument("--conclusion", required=True, help="path to readiness-conclusion.json from the BASE branch (may be absent)")
-    p.add_argument("--schema", required=True)
-    p.add_argument("--allowed-tools", required=True)
-    p.add_argument("--tier-map", default=os.path.join(HUB_ROOT, "tier-map.json"),
-                   help="plugin tier -> level map (default: the hub's tier-map.json)")
-    p.add_argument("--levels-comments", help="optional JSON array of PR comment bodies, oldest first")
-    p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({body: ...})")
-    p.add_argument("--changed-files", help="optional file with one changed path per line")
-    p.add_argument("--pr-files", help="optional JSON array of PR files ({filename, status, additions, deletions, patch}); "
-                                      "also supplies the changed paths")
-    p.add_argument("--risk-config", help="optional .github/autopr/risk-tiers.json from the BASE branch")
+    p = argparse.ArgumentParser(description="autopilot slice-7 admission (report-only)")
+    p.add_argument("--pr-files", required=True,
+                   help="JSON array of PR files ({filename, status, additions, deletions, patch})")
+    p.add_argument("--comments", help="optional JSON array of PR comment bodies, oldest first")
+    p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({number, body})")
+    p.add_argument("--risk-config", help="risk-tiers config from the BASE branch; .yml/.yaml or .json by suffix")
+    p.add_argument("--risk-config-yml", help="risk-tiers.yml from the BASE branch (wins over the .json)")
+    p.add_argument("--risk-config-json", help="risk-tiers.json from the BASE branch")
     p.add_argument("--repo", required=True)
-    p.add_argument("--default-branch", required=True)
-    p.add_argument("--now", help="RFC 3339 time for tests; defaults to current UTC time")
+    p.add_argument("--default-branch", help="accepted for compatibility; not used")
     p.add_argument("--out-json", required=True)
     p.add_argument("--out-md", required=True)
     a = p.parse_args(argv)
 
     try:
-        schema = read_json(a.schema, optional=False)
+        pr_files = read_json(a.pr_files, optional=False)
     except FileNotFoundError as e:
-        print(f"admission: schema not found: {e}", file=sys.stderr)
+        print(f"admission: pr files not found: {e}", file=sys.stderr)
         return 2
-    if not isinstance(schema, dict):
-        print("admission: schema is not valid JSON", file=sys.stderr)
+    if not isinstance(pr_files, list):
+        print("admission: --pr-files is not a JSON array", file=sys.stderr)
         return 2
+    pr_files = [x for x in pr_files if isinstance(x, dict) and "filename" in x]
 
-    conclusion = read_json(a.conclusion, optional=True)
-    if conclusion == "unparseable":
-        conclusion = {"__unparseable__": True}  # fails schema validation -> L0 with a format reason
-    allowed = read_json(a.allowed_tools, optional=True)
-    allowed = allowed if isinstance(allowed, dict) else None
-    try:
-        tier_map = read_json(a.tier_map, optional=False)
-    except FileNotFoundError as e:
-        print(f"admission: tier map not found: {e}", file=sys.stderr)
-        return 2
-    if not d.valid_tier_map(tier_map):
-        print("admission: tier map is not a valid {tiers: {name: level}} object", file=sys.stderr)
-        return 2
-    comments = read_json(a.levels_comments, optional=True)
+    comments = read_json(a.comments, optional=True)
     comments = [c for c in comments if isinstance(c, str)] if isinstance(comments, list) else []
     issues = read_json(a.degrade_issues, optional=True)
-    issues = issues if isinstance(issues, list) else []
-    changed = []
-    if a.changed_files and os.path.exists(a.changed_files):
-        with open(a.changed_files, encoding="utf-8") as f:
-            changed = [line.strip() for line in f if line.strip()]
-    pr_files = read_json(a.pr_files, optional=True)
-    pr_files = [x for x in pr_files if isinstance(x, dict) and "filename" in x] if isinstance(pr_files, list) else None
-    if pr_files is not None:
-        changed = [x["filename"] for x in pr_files]
+    issues = [i for i in issues if isinstance(i, dict)] if isinstance(issues, list) else []
 
-    now = d.parse_time(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
-    if now is None:
-        print("admission: --now is not an RFC 3339 time with a time zone", file=sys.stderr)
-        return 2
+    yml_path, json_path = a.risk_config_yml, a.risk_config_json
+    if a.risk_config:
+        if a.risk_config.endswith((".yml", ".yaml")):
+            yml_path = yml_path or a.risk_config
+        else:
+            json_path = json_path or a.risk_config
+    config_notes = []
+    risk_config = load_risk_config(yml_path, json_path, config_notes)
 
-    result = d.decide(
-        conclusion=conclusion, schema=schema, repo=a.repo, default_branch=a.default_branch, now=now,
-        allowed_tools=allowed, changed_files=changed, plugin_limits=d.plugin_limits(comments, tier_map),
-        degrade_levels=d.degrade_levels(issues, a.repo),
-    )
-    result["notes"].append("等级评论的作者暂不校验（agent 身份尚未建立，设计 Q2）；本检查只报告")
-    if pr_files is not None:
-        try:
-            risk_config = risk_tiers.read_repo_config(a.risk_config)
-        except (OSError, ValueError):
-            risk_config = None
-            result["notes"].append("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
-        result["risk"] = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
-        result["notes"] += result["risk"]["notes"]
-    result["conclusion_sha256"] = sha256_of(a.conclusion)
+    risk = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
+    risk["notes"] = config_notes + risk["notes"]
+    result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=a.repo)
+    result["risk"] = risk
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
     with open(a.out_md, "w", encoding="utf-8") as f:
-        f.write(render_markdown(result, result["conclusion_sha256"]))
-    print(f"admission: cap={result['cap']} report_only=true")
+        f.write(render_markdown(result))
+    print(f"admission: auto_merge={str(result['auto_merge']).lower()} report_only=true")
     return 0
 
 

@@ -1,10 +1,8 @@
-"""Unit tests for slice-1 admission (report-only trust cap from a readiness conclusion).
+"""Unit tests for slice-7 admission: can the PR be merged automatically? (report-only)
 
 Run: python3 -B -m unittest discover -s tests -v
 Stdlib only; must pass on macOS /usr/bin/python3 (3.9) and ubuntu python3.
 """
-import copy
-import datetime as dt
 import json
 import os
 import sys
@@ -14,231 +12,164 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from admission import decide as d  # noqa: E402
+from risk import tiers  # noqa: E402
 
-FIX = os.path.join(ROOT, "tests", "fixtures")
-UTC = dt.timezone.utc
-NOW = dt.datetime(2026, 11, 20, 12, 0, 0, tzinfo=UTC)
-
-
-def load(name):
-    with open(os.path.join(FIX, name), encoding="utf-8") as f:
-        return json.load(f)
+REPO = "haigeerlab/agent-relay"
+TEMPLATES = tiers.load_templates()
 
 
-TIER_MAP = json.load(open(os.path.join(ROOT, "tier-map.json"), encoding="utf-8"))
+def risk_of(name="docs/a.md", patch="@@ -1 +1 @@\n+x\n", config=None):
+    f = {"filename": name, "status": "modified", "additions": 1, "deletions": 0, "patch": patch}
+    return tiers.classify([f], TEMPLATES, config or {"extends": "plugin"})
 
 
-def levels_comment(payload):
-    return "编排写入的等级\n<!-- autopilot-levels:v1 " + json.dumps(payload) + " -->\n"
+def takeover(merge, extra=None):
+    payload = {"module": "m", "spec": "human", "plan": "human", "merge": merge, "release": "human"}
+    payload.update(extra or {})
+    return "编排写入的接管档位\n<!-- autopilot-takeover:v1 " + json.dumps(payload) + " -->\n"
 
 
-# Both plugin tiers at the loosest value, so conclusion-only tests see the conclusion cap unchanged.
-PERMISSIVE = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}, "module_crew": {"effective": "relaxed"}})
-
-SCHEMA = json.load(open(os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "conclusion.v1.json"), encoding="utf-8"))
-
-
-def run(conclusion="default", **kw):
-    if conclusion == "default":
-        conclusion = load("conclusion.basic.json")
-    args = dict(
-        conclusion=conclusion,
-        schema=SCHEMA,
-        repo="haigeerlab/agent-relay",
-        default_branch="main",
-        now=NOW,
-        allowed_tools=load("allowed-tools.json"),
-        changed_files=["README.md"],
-        plugin_limits=d.plugin_limits([PERMISSIVE], TIER_MAP),
-        degrade_levels=[],
-    )
-    args.update(kw)
-    return d.decide(**args)
+def degrade_issue(number, repo=REPO, level="L2"):
+    block = json.dumps({"scope": {"repo": repo, "tier": "*"}, "level": level, "reason": "revert"})
+    return {"number": number, "body": "降级\n<!-- autopilot-degrade:v1 " + block + " -->\n"}
 
 
-class CapTest(unittest.TestCase):
-    def assertCap(self, result, cap, reason_part=None):
-        self.assertEqual(result["cap"], cap, json.dumps(result, ensure_ascii=False, indent=1))
-        self.assertTrue(result["report_only"])
-        if reason_part:
-            self.assertIn(reason_part, result["reason"])
+def run(risk=None, comments=(), issues=()):
+    return d.decide(risk=risk or risk_of(), comments=list(comments), degrade_issues=list(issues), repo=REPO)
 
-    # --- acceptance §8.1 ---
-    def test_valid_basic_conclusion_gives_L2(self):
-        self.assertCap(run(), "L2")
 
-    def test_missing_conclusion_is_L0(self):
-        self.assertCap(run(conclusion=None), "L0", "没有接入结论")
+def item(result, item_id):
+    return next(i for i in result["items"] if i["id"] == item_id)
 
-    def test_failure_reason_states_the_cap(self):
-        self.assertTrue(run(conclusion=None)["reason"].startswith("信任上限 L0（只报告）："))
 
-    def test_expired_conclusion_is_L0(self):
-        later = dt.datetime(2026, 12, 3, 0, 0, 0, tzinfo=UTC)  # == valid_until: expired
-        self.assertCap(run(now=later), "L0", "过期")
+class RiskItemTest(unittest.TestCase):
+    def test_low_tier_is_ok(self):
+        res = run(risk_of("docs/a.md"))
+        self.assertTrue(item(res, "risk")["ok"])
+        self.assertIn("可自动合", item(res, "risk")["detail"])
 
-    def test_tool_not_in_allowed_list_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["basis"]["tool"]["commit"] = "3" * 40
-        self.assertCap(run(conclusion=c), "L0", "允许列表")
+    def test_mid_tier_is_not_ok_and_says_human_merges(self):
+        res = run(risk_of("src/app.py", config={"extends": "plugin", "T3": ["src/**"]}))
+        self.assertFalse(item(res, "risk")["ok"])
+        self.assertIn("要你合", item(res, "risk")["detail"])
 
-    def test_tool_version_and_commit_must_match_together(self):
-        c = load("conclusion.basic.json")
-        c["basis"]["tool"]["version"] = "0.2.0"  # same commit, different version
-        self.assertCap(run(conclusion=c), "L0", "允许列表")
+    def test_stop_tier_is_not_ok(self):
+        res = run(risk_of(".github/workflows/x.yml"))
+        self.assertFalse(item(res, "risk")["ok"])
+        self.assertIn("停下交你", item(res, "risk")["detail"])
+        self.assertIn("风险档 T4", res["headline"])
 
-    def test_missing_allowed_list_is_L0(self):
-        self.assertCap(run(allowed_tools=None), "L0", "允许列表")
 
-    def test_schema_invalid_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["tier"] = "basic"  # v1 requires an object
-        self.assertCap(run(conclusion=c), "L0", "格式")
+class TakeoverItemTest(unittest.TestCase):
+    def test_auto_is_ok(self):
+        self.assertTrue(item(run(comments=[takeover("auto")]), "takeover")["ok"])
 
-    def test_unknown_field_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["extra"] = 1  # additionalProperties: false
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_human_is_not_ok(self):
+        res = run(comments=[takeover("human")])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertIn("合并由人", res["headline"])
 
-    def test_bad_head_sha_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["head"] = "abc"  # $ref sha pattern
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_missing_comment_means_human_merges(self):
+        res = run(comments=["随便一条评论"])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertIn("没有接管评论，合并按“人合”处理", item(res, "takeover")["detail"])
 
-    def test_wrong_schema_const_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["schema"] = "repo-readiness.conclusion/v2"
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_unparseable_block_is_not_ok_with_reason(self):
+        res = run(comments=["<!-- autopilot-takeover:v1 {not json} -->"])
+        self.assertFalse(item(res, "takeover")["ok"])
+        self.assertIn("读不懂", item(res, "takeover")["detail"])
 
-    def test_empty_rulesets_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["basis"]["rulesets"] = []  # minItems 1
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_non_object_block_is_not_ok(self):
+        self.assertFalse(item(run(comments=["<!-- autopilot-takeover:v1 [1] -->"]), "takeover")["ok"])
 
-    def test_bad_date_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["declarations_expire_at"] = "soon"  # format: date
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_latest_block_wins(self):
+        self.assertTrue(item(run(comments=[takeover("human"), "x", takeover("auto")]), "takeover")["ok"])
+        self.assertFalse(item(run(comments=[takeover("auto"), takeover("human")]), "takeover")["ok"])
 
-    def test_null_declarations_expiry_is_valid(self):
-        c = load("conclusion.basic.json")
-        c["declarations_expire_at"] = None
-        self.assertCap(run(conclusion=c), "L2")
+    def test_old_levels_comment_is_not_read(self):
+        old = '<!-- autopilot-' + 'levels:v1 {"spec_guard":{"tier":"relaxed"}} -->'
+        self.assertFalse(item(run(comments=[old]), "takeover")["ok"])
 
-    def test_null_repo_cap_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["tier"], c["trust_cap"] = {"id": None, "name": "未达标"}, None
-        self.assertCap(run(conclusion=c), "L0")
 
-    def test_non_level_repo_cap_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["trust_cap"] = "L9"  # any string passes the schema; admission fails closed
-        self.assertCap(run(conclusion=c), "L0")
+class GateItemTest(unittest.TestCase):
+    def test_gate_is_never_ok_yet(self):
+        res = run(comments=[takeover("auto")])
+        self.assertFalse(item(res, "gate")["ok"])
+        self.assertIn("第二批", item(res, "gate")["detail"])
 
-    def test_null_app_cap_is_L0_for_that_app(self):
-        c = load("conclusion.basic.json")
-        c["apps"][0]["trust_cap"] = None
-        self.assertCap(run(conclusion=c, changed_files=["src/core/a.py"]), "L0")
-        self.assertCap(run(conclusion=c, changed_files=["src/cli/x.py"]), "L2")
 
-    def test_file_in_two_apps_takes_lowest(self):
-        c = load("conclusion.basic.json")
-        c["apps"][0]["paths"].append("shared/**")
-        c["apps"][1]["paths"].append("shared/**")
-        self.assertCap(run(conclusion=c, changed_files=["src/core/a.py", "shared/x.py"]), "L2")
+class DegradeItemTest(unittest.TestCase):
+    def test_no_issue_is_ok(self):
+        self.assertTrue(item(run(), "degrade")["ok"])
 
-    def test_schema_missing_required_field_is_L0(self):
-        c = load("conclusion.basic.json")
-        del c["basis"]
-        self.assertCap(run(conclusion=c), "L0", "格式")
+    def test_open_issue_blocks_and_is_listed(self):
+        res = run(issues=[degrade_issue(186), degrade_issue(190)])
+        self.assertFalse(item(res, "degrade")["ok"])
+        self.assertIn("#186", item(res, "degrade")["detail"])
+        self.assertIn("#190", item(res, "degrade")["detail"])
 
-    def test_repo_mismatch_is_L0(self):
-        self.assertCap(run(repo="haigeerlab/tier-guard"), "L0", "仓库")
+    def test_level_is_ignored(self):
+        self.assertFalse(item(run(issues=[degrade_issue(1, level="L5")]), "degrade")["ok"])
+        self.assertFalse(item(run(issues=[degrade_issue(1, level="bogus")]), "degrade")["ok"])
 
-    def test_default_branch_mismatch_is_L0(self):
-        self.assertCap(run(default_branch="master"), "L0", "默认分支")
+    def test_other_repo_is_ignored(self):
+        self.assertTrue(item(run(issues=[degrade_issue(1, repo="haigeerlab/tier-guard")]), "degrade")["ok"])
 
-    def test_single_app_uses_app_cap(self):
-        self.assertCap(run(changed_files=["src/core/a.py", "src/core/sub/b.py"]), "L3")
+    def test_unparseable_block_blocks(self):
+        res = run(issues=[{"number": 7, "body": "<!-- autopilot-degrade:v1 {not json} -->"}])
+        self.assertFalse(item(res, "degrade")["ok"])
+        self.assertIn("#7", item(res, "degrade")["detail"])
 
-    def test_cross_app_takes_lowest(self):
-        self.assertCap(run(changed_files=["src/core/a.py", "src/cli/x.py"]), "L2")
+    def test_issue_without_block_is_ignored(self):
+        self.assertTrue(item(run(issues=[{"number": 2, "body": "随便写的"}]), "degrade")["ok"])
 
-    def test_root_path_uses_repo_cap(self):
-        self.assertCap(run(changed_files=["src/core/a.py", ".github/workflows/ci.yml"]), "L2")
 
-    def test_no_changed_files_uses_repo_cap(self):
-        self.assertCap(run(changed_files=[]), "L2")
+class HeadlineTest(unittest.TestCase):
+    def test_four_items_in_order(self):
+        self.assertEqual([i["id"] for i in run()["items"]], ["risk", "takeover", "gate", "degrade"])
 
-    def limits(self, *comments):
-        return d.plugin_limits(list(comments), TIER_MAP)
+    def test_headline_never_says_ok_while_gate_is_missing(self):
+        # Every other item satisfied; the gate evidence does not exist until batch 2.
+        res = run(comments=[takeover("auto")])
+        self.assertFalse(res["auto_merge"])
+        self.assertEqual(res["headline"], "不会自动合并（硬卡：还没有证据）")
 
-    def test_no_levels_comment_defaults_both_plugins_to_L2(self):
-        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits())
-        self.assertCap(r, "L2")
-        self.assertIn("缺少", " ".join(s["detail"] for s in r["steps"]))
+    def test_headline_ok_only_when_all_four_ok(self):
+        gate = {"id": "gate", "ok": True, "detail": "有证据"}
+        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate)
+        self.assertTrue(res["auto_merge"])
+        self.assertEqual(res["headline"], "可以自动合并")
+        # Dropping any single item flips it.
+        cases = {
+            "risk": dict(risk=risk_of(".github/workflows/x.yml")),
+            "takeover": dict(comments=[takeover("human")]),
+            "degrade": dict(degrade_issues=[degrade_issue(3)]),
+        }
+        for name, change in cases.items():
+            args = dict(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO, gate=gate)
+            args.update(change)
+            res = d.decide(**args)
+            self.assertFalse(res["auto_merge"], name)
+            self.assertTrue(res["headline"].startswith("不会自动合并（"), name)
+        res = d.decide(risk=risk_of(), comments=[takeover("auto")], degrade_issues=[], repo=REPO,
+                       gate={"id": "gate", "ok": False, "detail": "x"})
+        self.assertFalse(res["auto_merge"])
 
-    def test_spec_guard_strict_lowers_app_cap(self):
-        c = levels_comment({"spec_guard": {"module": "m", "tier": "strict"}, "module_crew": {"effective": "relaxed"}})
-        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "spec-guard")
+    def test_reasons_are_listed(self):
+        res = run(risk_of(".github/workflows/x.yml"), issues=[degrade_issue(5)])
+        self.assertTrue(res["headline"].startswith("不会自动合并（"))
+        for part in ("风险档 T4", "没有接管评论", "硬卡", "#5"):
+            self.assertIn(part, res["headline"])
 
-    def test_module_crew_effective_lowers_app_cap(self):
-        c = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}, "module_crew": {"effective": "strict"}})
-        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "module-crew")
+    def test_author_note_and_risk_notes_present(self):
+        res = run()
+        self.assertIn(d.AUTHOR_NOTE, res["notes"])
 
-    def test_plugin_tier_cannot_raise_above_conclusion(self):
-        self.assertCap(run(changed_files=["README.md"]), "L2")  # relaxed=L4 but repo cap is L2
-
-    def test_standard_maps_to_L3(self):
-        c = levels_comment({"spec_guard": {"module": "m", "tier": "standard"}, "module_crew": {"effective": "standard"}})
-        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L3")
-
-    def test_unknown_tier_is_L0(self):
-        c = levels_comment({"spec_guard": {"module": "m", "tier": "yolo"}, "module_crew": {"effective": "relaxed"}})
-        self.assertCap(run(plugin_limits=self.limits(c)), "L0")
-
-    def test_missing_one_source_defaults_that_source_to_L2(self):
-        c = levels_comment({"spec_guard": {"module": "m", "tier": "relaxed"}})
-        self.assertCap(run(changed_files=["src/core/a.py"], plugin_limits=self.limits(c)), "L2", "module-crew")
-
-    def test_unparseable_levels_block_is_L0(self):
-        self.assertCap(run(plugin_limits=self.limits("<!-- autopilot-levels:v1 {oops} -->")), "L0")
-
-    def test_latest_levels_comment_wins(self):
-        old = levels_comment({"spec_guard": {"module": "m", "tier": "strict"}, "module_crew": {"effective": "strict"}})
-        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits(old, PERMISSIVE))
-        self.assertCap(r, "L3")
-
-    def test_unrelated_comments_are_ignored(self):
-        r = run(changed_files=["src/core/a.py"], plugin_limits=self.limits("looks good", PERMISSIVE, "<!-- other -->"))
-        self.assertCap(r, "L3")
-
-    def test_open_degrade_issue_lowers_cap(self):
-        self.assertCap(run(degrade_levels=["L0"]), "L0", "降级")
-
-    def test_unmet_conclusion_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["tier"], c["trust_cap"] = {"id": None, "name": "未达标"}, "L0"
-        c["apps"] = []
-        self.assertCap(run(conclusion=c), "L0")
-
-    def test_bad_timestamp_is_L0(self):
-        c = load("conclusion.basic.json")
-        c["valid_until"] = "next week"
-        self.assertCap(run(conclusion=c), "L0", "格式")
-
-    def test_steps_are_reported_in_order(self):
-        steps = [s["id"] for s in run()["steps"]]
-        self.assertEqual(steps, ["exists", "schema", "repo", "valid_until", "tool", "app_cap", "limits"])
-
-    def test_attestation_not_verified_is_flagged(self):
-        self.assertIn("发布证明未校验", " ".join(run()["notes"]))
-
-    def test_input_is_not_mutated(self):
-        c = load("conclusion.basic.json")
-        before = copy.deepcopy(c)
-        run(conclusion=c)
-        self.assertEqual(c, before)
+    def test_inputs_not_mutated(self):
+        risk = risk_of()
+        before = json.dumps(risk, sort_keys=True)
+        run(risk)
+        self.assertEqual(json.dumps(risk, sort_keys=True), before)
 
 
 class GlobTest(unittest.TestCase):
@@ -253,58 +184,5 @@ class GlobTest(unittest.TestCase):
         self.assertFalse(d.glob_match("src/core/**", "src/core-extra/a.py"))
 
 
-class DegradeParseTest(unittest.TestCase):
-    def issue(self, payload):
-        return {"body": "降级说明\n<!-- autopilot-degrade:v1 " + json.dumps(payload) + " -->\n"}
-
-    def test_parses_level_for_this_repo(self):
-        iss = [self.issue({"scope": {"repo": "haigeerlab/agent-relay", "tier": "*"}, "level": "L0", "reason": "revert"})]
-        self.assertEqual(d.degrade_levels(iss, "haigeerlab/agent-relay"), ["L0"])
-
-    def test_ignores_other_repo(self):
-        iss = [self.issue({"scope": {"repo": "haigeerlab/tier-guard", "tier": "*"}, "level": "L0"})]
-        self.assertEqual(d.degrade_levels(iss, "haigeerlab/agent-relay"), [])
-
-    def test_unparseable_block_fails_closed(self):
-        iss = [{"body": "<!-- autopilot-degrade:v1 {not json} -->"}]
-        self.assertEqual(d.degrade_levels(iss, "haigeerlab/agent-relay"), ["L0"])
-
-    def test_issue_without_block_is_ignored(self):
-        self.assertEqual(d.degrade_levels([{"body": "随便写的"}], "haigeerlab/agent-relay"), [])
-
-
-class SchemaValidatorTest(unittest.TestCase):
-    def test_reports_path_of_error(self):
-        c = load("conclusion.basic.json")
-        c["apps"][0]["trust_cap"] = 3  # must be string or null
-        errors = d.validate(c, SCHEMA)
-        self.assertTrue(any("apps[0].trust_cap" in e for e in errors), errors)
-
-
 if __name__ == "__main__":
     unittest.main()
-
-
-class VendoredSchemaTest(unittest.TestCase):
-    def test_vendored_schema_matches_recorded_sha256(self):
-        import hashlib
-        base = os.path.join(ROOT, "schemas", "vendor", "repo-readiness")
-        source = json.load(open(os.path.join(base, "SOURCE.json"), encoding="utf-8"))
-        data = open(os.path.join(base, "conclusion.v1.json"), "rb").read()
-        self.assertEqual(hashlib.sha256(data).hexdigest(), source["sha256"])
-        self.assertRegex(source["commit"], r"^[0-9a-f]{40}$")
-
-    def test_allowed_list_pins_the_vendored_release(self):
-        source = json.load(open(os.path.join(ROOT, "schemas", "vendor", "repo-readiness", "SOURCE.json"), encoding="utf-8"))
-        allowed = json.load(open(os.path.join(ROOT, "allowed-tools.json"), encoding="utf-8"))
-        self.assertIn({"name": "repo-readiness", "version": source["tag"].lstrip("v"), "commit": source["commit"]},
-                      allowed["tools"])
-
-
-class AllowedListTest(unittest.TestCase):
-    def test_released_versions_are_pinned(self):
-        allowed = json.load(open(os.path.join(ROOT, "allowed-tools.json"), encoding="utf-8"))
-        pairs = {(t["version"], t["commit"]) for t in allowed["tools"] if t["name"] == "repo-readiness"}
-        self.assertIn(("0.2.0", "c77aabad9351e78e27e2415df776bce6c8306fd5"), pairs)  # signed the M1 conclusion
-        self.assertIn(("0.3.1", "c5194789a0cb338436865f29e40f32a6be2833f6"), pairs)
-        self.assertNotIn("0.3.0", {v for v, _ in pairs})
