@@ -170,6 +170,58 @@ class LocalIO:
             json.dump(data, fh, ensure_ascii=False)
 
     @staticmethod
+    def write_check_evidence(repo, data):
+        """~/.autopilot/evidence/<owner>__<repo>/<head sha>.json, read by spec-guard's final acceptance."""
+        path = os.path.join(STATE, "evidence", repo.replace("/", "__"), "%s.json" % data["head_sha"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def spec_guard_module(repo, pr):
+        """The spec-guard module this PR belongs to. spec-guard 0.91's `/map --json` is not released yet, so
+        no repo is treated as a spec-guard module for now (takeover comes from takeover.yml only)."""
+        return None
+
+    @staticmethod
+    def checkout_of(repo):
+        """The user's own checkout of `repo`, from ~/.autopilot/config.json {"checkouts": {"owner/name": path}}."""
+        try:
+            with open(os.path.join(STATE, "config.json"), encoding="utf-8") as fh:
+                path = (json.load(fh).get("checkouts") or {}).get(repo)
+        except (OSError, ValueError, AttributeError):
+            return None
+        return os.path.expanduser(path) if isinstance(path, str) and path else None
+
+    def acceptance(self, repo, module):
+        """{"record", "report_text"} from `git rev-parse --git-path spec-guard/acceptance/<module>.json` in the
+        user's checkout, or None when there is no record (or no checkout configured)."""
+        root = self.checkout_of(repo)
+        if not root or not re.fullmatch(r"[\w.-]+", module or ""):
+            return None
+        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-path", "spec-guard/acceptance/%s.json" % module],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        if r.returncode != 0:
+            return None
+        rec_path = r.stdout.strip()
+        rec_path = rec_path if os.path.isabs(rec_path) else os.path.join(root, rec_path)
+        try:
+            with open(rec_path, encoding="utf-8") as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        text = None
+        if isinstance(record, dict) and isinstance(record.get("report"), str):
+            try:
+                with open(os.path.expanduser(record["report"]), encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError:
+                text = None
+        return {"record": record if isinstance(record, dict) else {}, "report_text": text}
+
+    @staticmethod
     def ledger(event):
         os.makedirs(STATE, exist_ok=True)
         with open(os.path.join(STATE, "ledger.jsonl"), "a", encoding="utf-8") as fh:

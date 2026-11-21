@@ -42,3 +42,25 @@ python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 2 --
 - 私钥、JWT、令牌都不写日志、不写文件、不进评论。git 认证用 `GIT_CONFIG_*` 环境变量传给 git，不进命令行参数。
 - 检查命令和 delegate 运行时，环境里没有 `GH_TOKEN`、`GITHUB_TOKEN`。
 - 准入四项和机器人身份都由 autopilot 自己的代码判定，不依赖仓库里的流程配置。
+
+## 增补：本机检查证据与 spec-guard 最终验收（2026-11-22）
+
+和 sg-coord 商定（信箱 #21980–#21982），对应合并方案 Q2：
+
+- **本机检查证据**：检查通过后，编排写 `~/.autopilot/evidence/<owner>__<repo>/<完整 head sha>.json`，`--dry-run` 也写。spec-guard 的最终验收读它，不进仓库。格式 `autopilot.check-evidence/v1`：
+  `{schema, repo, head_sha, runner: "autopilot-orchestrator", non_author: true, clone: "throwaway", ran_at, checks: [{cmd, exit, output_sha256, tail}]}`。
+  "非作者"由 autopilot 判定，写在 `non_author` 里：检查是编排在一次性克隆里重新跑的，命令取自基础分支，运行环境里没有令牌。
+- **spec-guard 模块的验收**：PR 属于某个 spec-guard 模块时，编排去读你本机检出里的 `git rev-parse --git-path spec-guard/acceptance/<模块>.json`。这份记录不进提交。本机检出的路径写在 `~/.autopilot/config.json` 的 `{"checkouts": {"owner/name": "/路径"}}` 里。要同时满足下面几条：
+  - 模块名对得上；
+  - 标记是 `codex-approved` 或 `approved`；
+  - `sha` 等于当前 head；
+  - 验收审查报告的 sha256 和记录一致；
+  - 报告有结论；
+  - 报告审的提交（`scope.baseline.to`）是当前 head；
+  - 所有文件都审到，有补丁指纹，没有 blocking。
+
+  满足后，**直接用这份验收审查报告，不再另审**，同一提交不用花两次 Codex 额度。证据评论的 `acceptance` 写成 `{marker, sha}`。
+- **还没有验收时**：编排写完本机证据就停在「acceptance」。spec-guard 读到证据、完成验收后，再运行一次编排；同一提交上的检查会重跑，但审查不会再花额度。
+- **限制**：
+  - PR 属于哪个模块要从 spec-guard 0.91 的 `/map --json` 读，0.91 发布前 `spec_guard_module()` 一律返回"不是模块"，这一路只在测试里跑过；
+  - 只有人批、没有审查报告的 `approved` 记录，现在按"报告读不到"停下。
