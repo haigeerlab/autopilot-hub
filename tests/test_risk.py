@@ -37,6 +37,17 @@ class FileTierTest(unittest.TestCase):
         self.assertEqual(self.one("tests/test_a.py", cfg), "T1")
         self.assertEqual(self.one("docs/guide.md", cfg), "T0")
 
+    def test_plugin_template_covers_subdirectory_layout(self):
+        # agent-relay#188: plugins/<name>/ layout (agent-relay, spec-guard, delegate) and root layout (module-crew)
+        cfg = {"extends": "plugin"}
+        for path in ["plugins/agent-relay/.claude-plugin/plugin.json", "plugins/spec-guard/.codex-plugin/plugin.json",
+                     "plugins/delegate/interface.json", "interface.json", ".claude-plugin/marketplace.json",
+                     "RELEASING.md", "scripts/validate.sh", "plugins/x/scripts/validate.sh",
+                     "plugins/agent-relay/bridge/LICENSE"]:
+            self.assertEqual(self.one(path, cfg), "T4", path)
+        self.assertEqual(self.one("plugins/agent-relay/skills/x/SKILL.md", cfg), "T2")
+        self.assertEqual(self.one("plugins/delegate/scripts/review.py", cfg), "T3")
+
     def test_contract_is_all_T4(self):
         self.assertEqual(self.one("spec/messages.md", {"extends": "contract"}), "T4")
         self.assertEqual(self.one("anything.txt", {"extends": "contract"}), "T4")
