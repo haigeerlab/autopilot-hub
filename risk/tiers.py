@@ -52,6 +52,28 @@ def any_match(patterns, path):
     return next((p for p in patterns if glob_match(p, path)), None)
 
 
+META_KEYS = ("extends", "version")
+
+
+def repo_rules(config, notes):
+    """{tier: [globs]} from the repo config. `T4_paths` is read as `T4` (older spelling); any other
+    key that is not a tier, `extends`, `version` or `$...` is reported, so a typo never silently
+    drops a repo's protective paths."""
+    rules = {}
+    for key, value in config.items():
+        tier = key[:-len("_paths")] if key.endswith("_paths") else key
+        if tier in TIERS:
+            if key != tier:
+                notes.append(f"旧键名 {key} 按 {tier} 处理，建议改名")
+            if isinstance(value, list):
+                rules.setdefault(tier, []).extend(value)
+            else:
+                notes.append(f"{key} 不是列表，已忽略")
+        elif key not in META_KEYS and not key.startswith("$"):
+            notes.append(f"不认识的键名 {key}，已忽略（风险配置只认 extends 和 T0–T4）")
+    return rules
+
+
 def layers(templates, config, notes):
     """[(label, {tier: [globs]})] and the default tier for unmatched files."""
     out = [("共用规则", templates["common"])]
@@ -65,7 +87,7 @@ def layers(templates, config, notes):
             out.append((f"{name} 模板", {t: cat.get(t, []) for t in TIERS}))
         else:
             notes.append(f"未知类别 {name!r}，按通用处理")
-        repo = {t: config.get(t, []) for t in TIERS if isinstance(config.get(t), list)}
+        repo = repo_rules(config, notes)
         if repo:
             out.append(("本仓库", repo))
     return out, category, default
