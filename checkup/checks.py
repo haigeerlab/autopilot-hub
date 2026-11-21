@@ -1,0 +1,229 @@
+"""The C1-C12 checklist. Each check returns a finding dict; nothing here changes the repository.
+
+Finding: id, title, scope (仓库/增量), status (ok / missing / unknown), detail (what was seen),
+impact (plain-Chinese "缺了会怎样"), fix ({can_generate, how} or None), evidence (extra lines),
+skipped (True only for C2 without --run-check).
+"""
+import os
+import re
+
+from checkup import entry, ghprobe, workflow
+from checkup.ecosystem import manifest_names, lockfile_installed
+from checkup.proc import run
+
+RISK_CONFIG = ".github/autopr/risk-tiers.json"
+_AUTOPILOT_HEADING = re.compile(r"^#{1,6}\s+.*autopilot", re.I | re.M)
+
+TITLES = {
+    "C1": "有能跑的检查命令", "C2": "检查真的能跑", "C3": "分支保护生效", "C4": "主干 CI 是绿的",
+    "C5": "PR 会跑检查", "C6": "密钥扫描与推送保护", "C7": "workflow 默认权限只读",
+    "C8": "action 固定到 40 位提交", "C9": "没有危险触发写法", "C10": "依赖按锁文件装",
+    "C11": "风险分级配置", "C12": "指令文件里的 autopilot 例外",
+}
+SCOPES = {"C8": "增量", "C9": "增量", "C10": "增量"}
+IMPACTS = {
+    "C1": "没有它，不能开自动合并（硬卡）：自动合并没有可依赖的检查。",
+    "C2": "命令写了但跑不起来，自动合并的证据就是假的。",
+    "C3": "有人或 AI 能绕过检查直接改 main。",
+    "C4": "在本来就红的基线上开 PR，失败说不清是谁的。",
+    "C5": "只在本机跑过，CI 上没人复核。",
+    "C6": "AI 提交时可能把密钥带进仓库。",
+    "C7": "外部 PR 借 workflow 拿到写权限。",
+    "C8": "第三方 action 被篡改时，CI 跟着变。",
+    "C9": "外部 PR 能拿到高权限去执行代码。",
+    "C10": "同一提交两次装出不同依赖，检查结论不可信。",
+    "C11": "没有时按通用规则，很多路径会被当成 T3。",
+    "C12": "开「接管到合并」前没有它，AI 在 autopilot/* 分支上提交、推送会被你自己的规则拦住。",
+}
+# how a non-ok finding can be fixed: (can_generate, text)
+FIX_HOW = {
+    "C1": (False, "不能代劳，要你说用哪条命令（可写进 .github/autopr/interface.yml 的 entries.check.run）"),
+    "C2": (False, "不能代劳，先让这条命令在干净克隆里跑通"),
+    "C3": (True, "生成分支规则集 JSON 和 gh api 命令（只生成，不执行）"),
+    "C4": (False, "不能代劳，先把主干修绿"),
+    "C5": (False, "不能代劳（第二批会生成准入调用文件）；先让某个 pull_request 的 workflow 运行检查命令"),
+    "C6": (False, "只给开启步骤：仓库 Settings → Code security，开启 Secret scanning 和 Push protection"),
+    "C7": (False, "只给开启步骤：仓库 Settings → Actions → General → Workflow permissions，选 Read repository contents"),
+    "C8": (False, "不能代劳，已列出要改的引用：把 @版本号 换成 40 位提交 SHA"),
+    "C9": (False, "不能代劳，已列出位置：不要在 pull_request_target / workflow_run 里检出或执行 PR 代码"),
+    "C10": (False, "不能代劳，已列出问题：补锁文件，CI 里用锁定安装命令"),
+    "C11": (True, "生成一行 .github/autopr/risk-tiers.json（类别按目录特征猜，猜不出就问你）"),
+    "C12": (True, "生成 CLAUDE.md / AGENTS.md 里的 autopilot 说明草稿（补丁）"),
+}
+
+
+def finding(cid, status, detail, evidence=None, skipped=False):
+    fix = None
+    if status != "ok" and not skipped:
+        can, how = FIX_HOW[cid]
+        fix = {"can_generate": can, "how": how}
+    return {"id": cid, "title": TITLES[cid], "scope": SCOPES.get(cid, "仓库"), "status": status,
+            "detail": detail, "impact": IMPACTS[cid], "fix": fix, "evidence": evidence or [], "skipped": skipped}
+
+
+# --------------------------------------------------------------------------- git helpers
+
+def git_out(root, *args):
+    r = run(["git", "-C", root] + list(args), cwd=root, timeout_s=60)
+    return r.stdout if r.code == 0 else None
+
+
+def resolve_base(root, base):
+    for cand in (base, "origin/" + base):
+        if git_out(root, "rev-parse", "--verify", "--quiet", cand + "^{commit}"):
+            return cand
+    return None
+
+
+def changed_files(root, base):
+    """(set of repo-relative paths changed against base plus uncommitted/untracked, problem)."""
+    ref = resolve_base(root, base)
+    if not ref:
+        return None, "找不到基线分支 %s（也没有 origin/%s）" % (base, base)
+    committed = git_out(root, "diff", "--name-only", "-z", "--diff-filter=d", "%s...HEAD" % ref)
+    if committed is None:
+        return None, "算不出 %s 到 HEAD 的改动（没有共同祖先？）" % ref
+    out = set(p for p in committed.split("\0") if p)
+    for args in (("diff", "--name-only", "-z", "--diff-filter=d", "HEAD"),
+                 ("ls-files", "-z", "--others", "--exclude-standard")):
+        more = git_out(root, *args)
+        if more:
+            out.update(p for p in more.split("\0") if p)
+    return out, None
+
+
+def tracked_files(root):
+    out = git_out(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    return set(p for p in (out or "").split("\0") if p)
+
+
+def is_workflow(path):
+    return path.startswith(".github/workflows/") and path.endswith((".yml", ".yaml")) and path.count("/") == 2
+
+
+# --------------------------------------------------------------------------- the checklist
+
+def run_checks(root, base, gh, repo_name, run_check=False, runner=entry.run_check):
+    """Return (findings, ctx). gh may be None (no GitHub remote); ctx feeds fixes and the conclusion."""
+    findings = []
+    ctx = {"repo": repo_name, "default_branch": None, "check_command": None}
+
+    # C1 / C2
+    c1 = workflow.find_check(root)
+    ctx["check_command"] = c1["command"]
+    if c1["command"]:
+        src = "interface.yml 登记的 check" if c1["source"] == "interface.yml" \
+            else "从 %s（会被 PR 触发）里推断，请确认" % c1["source"]
+        findings.append(finding("C1", "ok", "「%s」（%s）" % (c1["command"], src)))
+    elif c1["problem"]:
+        findings.append(finding("C1", "unknown", c1["problem"]))
+    else:
+        findings.append(finding("C1", "missing", "interface.yml 没有登记 check，会被 PR 触发的 workflow 里也没找到像测试或构建的步骤"))
+    if not run_check:
+        findings.append(finding("C2", "unknown", "没有加 --run-check，没有实际运行", skipped=True))
+    elif not c1["command"]:
+        findings.append(finding("C2", "unknown", "没有可运行的检查命令（见 C1）"))
+    else:
+        st, detail, lines = runner(root, c1["command"])
+        findings.append(finding("C2", st, detail, lines))
+
+    # repository-level GitHub checks
+    if gh is not None:
+        r = gh.get("repos/%s" % repo_name)
+        if r.ok and isinstance(r.data, dict):
+            ctx["default_branch"] = r.data.get("default_branch") or "main"
+
+    def need_github(cid, fn):
+        if gh is None:
+            findings.append(finding(cid, "unknown", "没找到 GitHub 远端，读不了仓库设置"))
+        elif ctx["default_branch"] is None:
+            findings.append(finding(cid, "unknown", "GitHub 上读不到这个仓库（不存在，或当前登录账号看不到）"))
+        else:
+            st, detail, ev = fn()
+            findings.append(finding(cid, st, detail, ev))
+
+    branch = ctx["default_branch"]
+    need_github("C3", lambda: ghprobe.effective_branch_rules(gh, repo_name, branch))
+    need_github("C4", lambda: ghprobe.main_ci_green(gh, repo_name, branch))
+
+    st, detail = workflow.pr_runs_check(root, c1["command"])
+    findings.append(finding("C5", st, detail))
+
+    need_github("C6", lambda: ghprobe.secret_scanning(gh, repo_name, bool(workflow.workflow_paths(root))))
+    need_github("C7", lambda: ghprobe.workflow_permissions(gh, repo_name))
+
+    # C8-C10 (incremental)
+    changed, problem = changed_files(root, base)
+    if problem:
+        for cid in ("C8", "C9", "C10"):
+            findings.append(finding(cid, "unknown", problem))
+    else:
+        names = {os.path.basename(p) for p in changed if is_workflow(p)}
+        if not names:
+            for cid in ("C8", "C9"):
+                findings.append(finding(cid, "ok", "相对 %s 没有改过 workflow 文件，不需要评" % base))
+        else:
+            wfs, errors = workflow.load_workflows(root, names)
+            if errors:
+                for cid in ("C8", "C9"):
+                    findings.append(finding(cid, "unknown", "改过的 workflow 读不了：%s" % "；".join(errors)))
+            else:
+                bad = workflow.unpinned_actions(wfs)
+                findings.append(finding("C8", "missing", "没有固定到 40 位提交：%s" % "、".join(bad)) if bad
+                                else finding("C8", "ok", "改过的 %d 个 workflow 里的 action 都已固定" % len(wfs)))
+                bad = workflow.dangerous_triggers(wfs)
+                findings.append(finding("C9", "missing", "；".join(bad)) if bad
+                                else finding("C9", "ok", "改过的 %d 个 workflow 里没有危险触发写法" % len(wfs)))
+        manifests = sorted(p for p in changed if os.path.basename(p) in manifest_names())
+        if not manifests:
+            findings.append(finding("C10", "ok", "相对 %s 没有改过依赖清单，不需要评" % base))
+        else:
+            st, detail = lockfile_installed(root, manifests, tracked_files(root))
+            findings.append(finding("C10", st, detail))
+
+    # C11
+    cfg = os.path.join(root, RISK_CONFIG)
+    if os.path.isfile(cfg):
+        try:
+            from risk import tiers
+            tiers.read_repo_config(cfg)
+            findings.append(finding("C11", "ok", "%s 存在且读得通" % RISK_CONFIG))
+        except (OSError, ValueError) as e:
+            findings.append(finding("C11", "unknown", "%s 存在但读不了：%s" % (RISK_CONFIG, e)))
+    else:
+        findings.append(finding("C11", "missing", "没有 %s" % RISK_CONFIG))
+
+    # C12
+    hit = None
+    for f in ("CLAUDE.md", "AGENTS.md"):
+        p = os.path.join(root, f)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    if _AUTOPILOT_HEADING.search(fh.read()):
+                        hit = f
+                        break
+            except (OSError, UnicodeDecodeError):
+                pass
+    findings.append(finding("C12", "ok", "%s 里有 autopilot 一节" % hit) if hit
+                    else finding("C12", "missing", "CLAUDE.md / AGENTS.md 里没有标题含 autopilot 的一节（或没有这两个文件）"))
+    return findings, ctx
+
+
+def conclusion(findings, ran_check):
+    """{level, missing, reminders, text}: the highest takeover level that can be enabled now."""
+    by = {f["id"]: f for f in findings}
+    need = ["C1"] + (["C2"] if ran_check else [])
+    blockers = [c for c in need if by[c]["status"] != "ok"]
+    reminders = [f["id"] for f in findings if f["status"] != "ok" and not f["skipped"] and f["id"] not in blockers]
+    if not blockers:
+        level = "接管到合并"
+        text = "结论：现在可以开到「接管到合并」。"
+    else:
+        level = "只接管 Plan"
+        why = "、".join("%s（%s）" % (c, {"missing": "没找到" if c == "C1" else "没跑通", "unknown": "判不了"}[by[c]["status"]])
+                       for c in blockers)
+        text = "结论：现在只能开到「只接管 Plan」；开「接管到合并」还差 %s。" % why
+    if reminders:
+        text += "其余提醒（不卡接入）：%s。" % "、".join(reminders)
+    return {"level": level, "missing": blockers, "reminders": reminders, "text": text}
