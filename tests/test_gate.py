@@ -10,8 +10,8 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from admission import gate as g  # noqa: E402
-from tests.test_admission import BOT, bot  # noqa: E402
+from admission import gate as g
+from tests.test_admission import BOT, bot
 
 HEAD = "a" * 40
 OTHER = "b" * 40
