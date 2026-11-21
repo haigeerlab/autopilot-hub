@@ -64,7 +64,9 @@ jobs:
           }
           fetch .github/autopr/readiness-conclusion.json .admission/conclusion.json
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '[.[].body]' | python3 -c 'import json,sys;print(json.dumps([b for page in sys.stdin.read().split("\n") if page.strip() for b in json.loads(page)]))' > .admission/comments.json || echo '[]' > .admission/comments.json
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > .admission/changed.txt
+          fetch .github/autopr/risk-tiers.json .admission/risk-tiers.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '[.[] | {filename, status, additions, deletions, patch}]' \
+            | python3 -c 'import json,sys;print(json.dumps([f for page in sys.stdin.read().split("\n") if page.strip() for f in json.loads(page)]))' > .admission/files.json
           gh issue list -R "${REPO}" --label autopilot:degrade --state open --limit 200 --json body > .admission/degrade.json || echo '[]' > .admission/degrade.json
 
       - name: Decide
@@ -76,7 +78,8 @@ jobs:
             --tier-map .hub/tier-map.json \
             --levels-comments .admission/comments.json \
             --degrade-issues .admission/degrade.json \
-            --changed-files .admission/changed.txt \
+            --pr-files .admission/files.json \
+            --risk-config .admission/risk-tiers.json \
             --repo "${REPO}" --default-branch "${DEFAULT_BRANCH}" \
             --out-json .admission/result.json --out-md .admission/summary.md
           cat .admission/summary.md >> "${GITHUB_STEP_SUMMARY}"
