@@ -53,7 +53,7 @@ class FakeWork:
 class FakeIO:
     def __init__(self, *, merge="auto", files=("docs/a.md",), author=None, fork=False, degrade=(), takeover=True,
                  reports=None, check_exit=0, check_command="make test", stored=None, merged_ok=True, bot=BOT,
-                 module=None, acceptance=None):
+                 module=None, acceptance=None, sg_config=None):
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
         self.evidence_files = []
         self.module, self.acceptance_record = module, acceptance
@@ -71,6 +71,10 @@ class FakeIO:
         self.contents = {".github/autopr/risk-tiers.yml": "extends: plugin\n"}
         if takeover:
             self.contents[".github/autopr/takeover.yml"] = f"merge: {merge}\n"
+        if module:  # a spec-guard project: capability map + takeover config on the base branch
+            self.contents["spec/CAPABILITY-MAP.md"] = "# 能力图\n"
+            cfg = sg_config if sg_config is not None else {"takeover": "plan", "moduleTakeover": {module: "merge"}}
+            self.contents[".agent/config.json"] = json.dumps(cfg)
         self.degrade = [{"number": n, "body": '<!-- autopilot-degrade:v1 {"scope": {"repo": "%s"}} -->' % REPO}
                         for n in degrade]
 
@@ -126,8 +130,10 @@ class FakeIO:
     def write_check_evidence(self, repo, data):
         self.evidence_files.append(data)
 
-    def spec_guard_module(self, repo, pr):
-        return self.module
+    def find_modules(self, repo, head):
+        rec = (self.acceptance_record or {}).get("record") or {}
+        extra = getattr(self, "extra_modules", [])
+        return ([rec["module"]] if rec.get("sha") == head and rec.get("module") else []) + extra
 
     def acceptance(self, repo, module):
         return self.acceptance_record
@@ -352,9 +358,38 @@ class AcceptanceTest(unittest.TestCase):
         run(io)
         self.assertIn('"module": "m"', io.comments[0]["body"])
 
+    def test_spec_guard_project_without_any_auto_stops_before_checks(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], sg_config={"takeover": "plan"})
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
+        self.assertEqual(io.ran, [])
+
+    def test_module_merge_from_base_config(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[],
+                    sg_config={"takeover": "merge", "moduleTakeover": {"m": "plan", "other": "merge"}})
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
+        self.assertIn("模块 m", res["reason"])
+
+    def test_project_takeover_applies_to_module_without_entry(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], sg_config={"takeover": {"merge": "auto"}})
+        self.assertEqual(run(io)["result"], "merged")
+
+    def test_several_records_for_head_stop(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[])
+        io.extra_modules = ["n"]
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
+        self.assertIn("多条", res["reason"])
+
+    def test_stale_record_means_no_module_and_stops(self):
+        io = FakeIO(module="m", acceptance=accepted(sha="b" * 40), reports=[])
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
+        self.assertEqual(io.reviews, [])
+
     def test_bad_acceptance_records(self):
         cases = {
-            "旧提交": accepted(sha="b" * 40),
             "标记": accepted(marker="pending"),
             "模块": accepted(module="other"),
             "sha256": accepted(tamper=True),
@@ -366,11 +401,29 @@ class AcceptanceTest(unittest.TestCase):
             io = FakeIO(module="m", acceptance=acc, reports=[])
             res = run(io)
             self.assertEqual(res["result"], "stopped", name)
-            self.assertIn(res["step"], ("acceptance", "review"), name)
+            self.assertIn(res["step"], ("acceptance", "review", "takeover"), name)
             self.assertEqual(io.merge_calls(), [], name)
 
     def test_human_approved_acceptance_counts(self):
         self.assertEqual(run(FakeIO(module="m", acceptance=accepted(marker="approved"), reports=[]))["result"], "merged")
+
+
+class TakeoverConfigTest(unittest.TestCase):
+    def test_presets_and_objects(self):
+        self.assertEqual(flow.module_merge({}, "m"), "human")
+        self.assertEqual(flow.module_merge({"takeover": "merge"}, "m"), "auto")
+        self.assertEqual(flow.module_merge({"takeover": "plan"}, "m"), "human")
+        self.assertEqual(flow.module_merge({"takeover": {"plan": "codex"}}, "m"), "human")
+        self.assertEqual(flow.module_merge({"takeover": {"merge": "auto", "release": "prepare"}}, "m"), "auto")
+
+    def test_module_entry_wins_and_bad_entries_fall_back(self):
+        cfg = {"takeover": "none", "moduleTakeover": {"m": "merge"}}
+        self.assertEqual(flow.module_merge(cfg, "m"), "auto")
+        self.assertEqual(flow.module_merge(cfg, "n"), "human")
+        bad = {"takeover": "none", "moduleTakeover": {"m": "merge", "x": {"merge": "yes"}}}
+        self.assertEqual(flow.module_merge(bad, "m"), "human")
+        self.assertEqual(flow.module_merge({"takeover": "bogus"}, "m"), "human")
+        self.assertEqual(flow.module_merge({"takeover": {"merge": "auto", "colour": "red"}}, "m"), "human")
 
 
 class LocalIOTest(unittest.TestCase):

@@ -179,11 +179,34 @@ class LocalIO:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, path)
 
-    @staticmethod
-    def spec_guard_module(repo, pr):
-        """The spec-guard module this PR belongs to. spec-guard 0.91's `/map --json` is not released yet, so
-        no repo is treated as a spec-guard module for now (takeover comes from takeover.yml only)."""
-        return None
+    def find_modules(self, repo, head):
+        """Modules whose final-acceptance record (outside the commit) is bound to `head`, read from the user's
+        checkout: `git rev-parse --git-path spec-guard/acceptance`/*.json with sha == head."""
+        root = self.checkout_of(repo)
+        if not root:
+            return []
+        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-path", "spec-guard/acceptance"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        if r.returncode != 0:
+            return []
+        folder = r.stdout.strip()
+        folder = folder if os.path.isabs(folder) else os.path.join(root, folder)
+        found = []
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            return []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("sha") == head and isinstance(rec.get("module"), str):
+                found.append(rec["module"])
+        return found
 
     @staticmethod
     def checkout_of(repo):
