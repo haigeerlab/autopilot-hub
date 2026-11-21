@@ -12,7 +12,7 @@ on:
     types: [completed]
     branches: [main]
   issues:
-    types: [labeled]
+    types: [labeled, closed]  # closed: slice 11, only an admin's close lifts a degrade issue
 
 permissions:
   contents: read

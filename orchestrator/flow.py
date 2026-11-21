@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -87,6 +88,72 @@ def verify_artifacts(view, module, changed):
         return []
     own = [p for p in changed if p == f"spec/{module}.md" or p.startswith(f"tasks/{module}/")]
     return sorted(own)
+
+
+NARROW_REASONS = {"revert": "main 上撤回了 autopilot 自动合并的 PR", "main-red": "autopilot 合并后 main 的主 CI 变红",
+                  "regression": "有 issue 被标为回归"}
+NARROWED = re.compile(r"<!--\s*autopilot-narrowed:v1\s")
+PR_URL = re.compile(r"/pull/(\d+)$")
+
+
+def degrade_payload(issue):
+    for raw in d.DEGRADE_BLOCK.findall(issue.get("body") or ""):
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def pr_module(io, repo, pr_url, bot):
+    """spec-guard module named in the latest trusted takeover comment of the PR behind a degrade issue."""
+    m = PR_URL.search(pr_url or "")
+    if not m:
+        return None
+    comments = [rest_comment(c) for c in io.api(f"repos/{repo}/issues/{m.group(1)}/comments?per_page=100") or []]
+    blocks = [b for c in comments if d.trusted(c, bot) for b in d.TAKEOVER_BLOCK.findall(c["body"])]
+    try:
+        module = json.loads(blocks[-1]).get("module") if blocks else None
+    except (ValueError, AttributeError):
+        return None
+    return module if isinstance(module, str) and module else None
+
+
+def narrow_pending(io, repo, base_ref, issues, sg_project, bot, notes, dry_run):
+    """B10, the persistent layer: each open degrade issue from a revert, red main or regression narrows the
+    takeover one step, once. spec-guard projects get a bot PR running spec-guard's `narrow` (T4: the user
+    merges it); other repos get a comment pointing at takeover.yml. The open issue already stops auto-merge."""
+    for issue in issues:
+        payload = degrade_payload(issue)
+        if not payload or payload.get("reason") not in NARROW_REASONS or (payload.get("scope") or {}).get("repo") != repo:
+            continue
+        number = issue.get("number")
+        comments = [rest_comment(c) for c in io.api(f"repos/{repo}/issues/{number}/comments?per_page=100") or []]
+        if any(d.trusted(c, bot) and NARROWED.search(c["body"]) for c in comments):
+            continue
+        if dry_run:
+            notes.append(f"降级 issue #{number} 还没收窄（预演不动）")
+            continue
+        why = NARROW_REASONS[payload["reason"]]
+        if not sg_project:
+            body = (f"本仓库不是 spec-guard 项目，接管档位在 `.github/autopr/takeover.yml`。这个降级 issue 已经让本仓库不会自动合并；"
+                    f"如要长期收窄，请把 `merge` 改为 `human`（T4，由你提交）。\n\n" + block("autopilot-narrowed", {"pr": None}))
+            io.api(f"repos/{repo}/issues/{number}/comments", "POST", {"body": body})
+            continue
+        evidence = payload.get("evidence") or []
+        module = pr_module(io, repo, evidence[0] if evidence else None, bot)
+        reason = f"降级 #{number}：{why}"[:200]
+        url = io.open_narrow_pr(repo, base_ref, module, number, reason)
+        target = f"模块 {module}" if module else "整个项目"
+        if url:
+            body = f"已为{target}开收窄 PR：{url}（按 spec-guard 规则降一格：合并 → Plan → 不接管）。它是 T4，合并后生效；在那之前本 issue 已阻止自动合并。"
+        else:
+            body = f"{target}的接管档位已是最严，不需要收窄。"
+        io.api(f"repos/{repo}/issues/{number}/comments", "POST",
+               {"body": body + "\n\n" + block("autopilot-narrowed", {"pr": url, "module": module})})
+        notes.append(f"降级 #{number}：{body}")
 
 
 def say_takeover(say, module, merge, source):
@@ -322,10 +389,13 @@ def run(io, repo, number, *, dry_run=False):
         if (pr.get("user") or {}).get("login") not in allowed:
             raise Stop("pr", f"PR 作者 {pr['user']['login']} 不是 autopilot 机器人或仓库所有者，不在本机跑它的代码")
 
-        degrade = d.degrade_item([{"number": i.get("number"), "body": i.get("body")} for i in
-                                  io.api(f"repos/{repo}/issues?labels=autopilot:degrade&state=open&per_page=100") or []
-                                  if "pull_request" not in i], repo)[0]
+        open_degrade = [{"number": i.get("number"), "body": i.get("body")} for i in
+                        io.api(f"repos/{repo}/issues?labels=autopilot:degrade&state=open&per_page=100") or []
+                        if "pull_request" not in i]
+        degrade = d.degrade_item(open_degrade, repo)[0]
         if not degrade["ok"]:
+            sg_project = base_file(io, repo, SG_CAPABILITY_MAP, pr["base"]["ref"]) is not None
+            narrow_pending(io, repo, pr["base"]["ref"], open_degrade, sg_project, bot, notes, dry_run)
             raise Stop("degrade", degrade["detail"])
 
         base_ref = pr["base"]["ref"]
@@ -402,6 +472,47 @@ def run(io, repo, number, *, dry_run=False):
             say(f"{RUN_MARKER}\nautopilot 停在「{s.step}」：{s.reason}")
         return {"result": "stopped", "step": s.step, "reason": s.reason, "notes": notes,
                 "head_sha": (pr or {}).get("head", {}).get("sha")}
+
+
+REWORK_DAYS = 14
+
+
+def _ts(text):
+    import datetime
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def stats(io, repo):
+    """B12: auto-merged PRs; how many of them were reverted (label autopilot:reverted) or reworked (an
+    autopilot:regression issue referencing the PR within 14 days of the merge); stops because Codex was
+    unavailable (count and total minutes, from the local ledger)."""
+    merged = [i for i in io.api(f"repos/{repo}/issues?labels={AUTO_MERGED}&state=all&per_page=100") or []
+              if "pull_request" in i]
+    regressions = [i for i in io.api(f"repos/{repo}/issues?labels=autopilot:regression&state=all&per_page=100") or []
+                   if "pull_request" not in i]
+    reverted, reworked = set(), set()
+    for pr in merged:
+        n = pr.get("number")
+        if any(lb.get("name") == "autopilot:reverted" for lb in pr.get("labels") or []):
+            reverted.add(n)
+        done = _ts(pr.get("closed_at"))
+        refs = re.compile(r"(?:#|/pull/)%d\b" % n)
+        for issue in regressions:
+            opened = _ts(issue.get("created_at"))
+            if refs.search(issue.get("body") or "") and done and opened and 0 <= (opened - done).days <= REWORK_DAYS:
+                reworked.add(n)
+    events = [e for e in io.ledger_events() if e.get("event") == "codex_unavailable" and e.get("repo") == repo]
+    minutes = 0.0
+    for e in events:
+        a, b = _ts(e.get("started_at")), _ts(e.get("stopped_at"))
+        if a and b:
+            minutes += (b - a).total_seconds() / 60
+    return {"repo": repo, "auto_merged": len(merged), "reverted": len(reverted), "reworked": len(reworked - reverted),
+            "reverted_or_reworked": len(reverted | reworked), "codex_unavailable_stops": len(events),
+            "codex_unavailable_minutes": round(minutes, 1)}
 
 
 def check_result(exit_code, output):

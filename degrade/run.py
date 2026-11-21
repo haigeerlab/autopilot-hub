@@ -11,6 +11,10 @@ Triggers (all scoped to the whole repo, tier "*"):
 - issues labelled `autopilot:freeze`                                 -> L0, reason "freeze"
 
 The same (reason, ref) never opens a second issue while one is open; it gets a comment instead.
+
+Slice 11: closing a degrade issue lifts it only when a repo admin's own account closed it; a bot or anyone
+without admin is undone (reopened with a comment). A reverted autopilot PR gets the `autopilot:reverted` label
+for the counts in `orchestrator/cli.py stats`.
 Any API failure raises ApiError before anything is written, so the run turns red instead of guessing.
 """
 import argparse
@@ -26,6 +30,7 @@ if __package__ in (None, ""):
 from admission.decide import DEGRADE_BLOCK  # noqa: E402
 
 AUTHORED = "autopilot:authored"
+REVERTED_LABEL = "autopilot:reverted"
 DEGRADE_LABEL = "autopilot:degrade"
 LABEL_TRIGGERS = {"autopilot:regression": ("regression", "L2"), "autopilot:freeze": ("freeze", "L0")}
 REVERT_TITLE = re.compile(r'\ARevert "')
@@ -124,7 +129,7 @@ def candidates(event_name, event, api, repo, default_branch, notes):
             if pr is None:
                 notes.append(f"{commit['id'][:12]} 撤回了 {reverted[:12]}，它不属于带 {AUTHORED} 的 PR，不降级")
                 continue
-            found.append({"reason": "revert", "level": "L2", "ref": commit["id"],
+            found.append({"reason": "revert", "level": "L2", "ref": commit["id"], "pr": pr.get("number"),
                           "evidence": [pr.get("html_url"), f"https://github.com/{repo}/commit/{commit['id']}"]})
     elif event_name == "workflow_run":
         run = event.get("workflow_run") or {}
@@ -169,12 +174,36 @@ def issue_body(repo, c):
     return "\n".join(lines) + "\n"
 
 
+def check_close(event, api, repo, result):
+    """B11: a closed degrade issue stays closed only when a repo admin's own (User) account closed it."""
+    issue = event.get("issue") or {}
+    if not any(lb.get("name") == DEGRADE_LABEL for lb in issue.get("labels") or []):
+        return
+    sender = event.get("sender") or {}
+    login = sender.get("login") or ""
+    if sender.get("type") == "User" and login:
+        perm = (api(f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission")
+        if perm == "admin":
+            result["notes"].append(f"{login}（admin）关闭了降级 issue #{issue.get('number')}，降级解除")
+            return
+    number = issue.get("number")
+    api(f"repos/{repo}/issues/{number}", "PATCH", {"state": "open"})
+    api(f"repos/{repo}/issues/{number}/comments", "POST", {"body": (
+        f"已重新打开：降级 issue 只有仓库管理员本人关闭才算解除（这次是 {login or '未知账号'} 关闭的）。"
+        "确认问题已处理后，请用管理员账号关闭。")})
+    result["reopened"] += 1
+    result["notes"].append(f"{login or '未知账号'} 没有管理员权限或不是真人账号，已重新打开 #{number}")
+
+
 def run(event_name, event, api):
     repo = event["repository"]["full_name"]
     default_branch = event["repository"]["default_branch"]
     notes = []
+    result = {"opened": 0, "commented": 0, "reopened": 0, "notes": notes, "actions": []}
+    if event_name == "issues" and event.get("action") == "closed":
+        check_close(event, api, repo, result)
+        return result
     found = candidates(event_name, event, api, repo, default_branch, notes)
-    result = {"opened": 0, "commented": 0, "notes": notes, "actions": []}
     if not found:
         return result
     existing = open_degrade_keys(api, repo)  # read everything before the first write
@@ -192,6 +221,8 @@ def run(event_name, event, api):
         result["opened"] += 1
         result["actions"].append({"opened": (created or {}).get("html_url"), **c})
         if c["reason"] == "revert":
+            if c.get("pr") is not None:
+                api(f"repos/{repo}/issues/{c['pr']}/labels", "POST", {"labels": [REVERTED_LABEL]})
             record_revert_correction(api, repo, c, notes)
     return result
 
@@ -228,7 +259,8 @@ def main(argv=None):
     except ApiError as e:
         print(f"degrade: {e}", file=sys.stderr)
         return 1
-    lines = [f"### autopilot-degrade：新开 {result['opened']} 个、追加评论 {result['commented']} 个", ""]
+    lines = [f"### autopilot-degrade：新开 {result['opened']} 个、追加评论 {result['commented']} 个、"
+             f"重新打开 {result['reopened']} 个", ""]
     lines += [f"- {a.get('opened') or ('#' + str(a.get('comment')))}：{a['reason']} → {a['level']}（{a['ref']}）"
               for a in result["actions"]]
     lines += [f"- 说明：{n}" for n in result["notes"]]

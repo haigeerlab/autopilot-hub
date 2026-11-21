@@ -51,6 +51,11 @@ def find_delegate():
     return os.environ.get("AUTOPILOT_DELEGATE") or _newest(DELEGATE_CACHE, (0, 10, 0), "scripts/delegate-exec.sh")
 
 
+def find_project_config():
+    """spec-guard 0.91+ `hooks/project_config.py` (slice 11 runs its `narrow`)."""
+    return os.environ.get("AUTOPILOT_SPEC_GUARD_CONFIG") or _newest(SPEC_GUARD_CACHE, (0, 91, 0), "hooks/project_config.py")
+
+
 def find_map_view():
     """spec-guard 0.91+ `hooks/map_view.py` (slice 12 reads each module's review state on the head commit)."""
     return os.environ.get("AUTOPILOT_SPEC_GUARD_MAP") or _newest(SPEC_GUARD_CACHE, (0, 91, 0), "hooks/map_view.py")
@@ -192,6 +197,49 @@ class LocalIO:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False)
 
+    def open_narrow_pr(self, repo, base_ref, module, issue_number, reason):
+        """Slice 11: in a throwaway clone of the base branch run spec-guard's `narrow`, commit as the bot, push
+        `autopilot/narrow-<issue>` and open a PR. Returns its URL, or None when already the strictest.
+        Raises flow.Stop when spec-guard 0.91+ is not installed or a step fails."""
+        script = find_project_config()
+        if not script or not os.path.exists(script):
+            raise flow.Stop("narrow", "找不到 spec-guard 0.91 以上的 project_config.py，没法收窄")
+        bot = self.bot_identity()
+        branch = "autopilot/narrow-%d" % issue_number
+        pr = {"head": {"sha": None}, "base": {"ref": base_ref}}
+        with tempfile.TemporaryDirectory(prefix="autopilot-narrow-") as tmp:
+            work = Work.__new__(Work)
+            work.root = tmp
+            auth = base64.b64encode(("x-access-token:%s" % self.token).encode()).decode()
+            work.git_env = dict(_clean_env(), GIT_CONFIG_COUNT="1", GIT_TERMINAL_PROMPT="0",
+                                GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                                GIT_CONFIG_VALUE_0="AUTHORIZATION: basic %s" % auth,
+                                GIT_AUTHOR_NAME=bot["login"], GIT_COMMITTER_NAME=bot["login"],
+                                GIT_AUTHOR_EMAIL="%d+%s@users.noreply.github.com" % (bot["id"], bot["login"]),
+                                GIT_COMMITTER_EMAIL="%d+%s@users.noreply.github.com" % (bot["id"], bot["login"]))
+            url = "https://github.com/%s" % repo
+            work.git("init", "-q")
+            work.git("fetch", "-q", "--no-tags", url, "+refs/heads/%s:refs/remotes/base" % base_ref)
+            work.git("checkout", "-q", "-b", branch, "refs/remotes/base")
+            args = ["python3", "-B", script, "narrow", "--project", tmp, "--source", "autopilot", "--reason", reason,
+                    "--confirm"] + (["--module", module] if module else [])
+            r = subprocess.run(args, cwd=tmp, env=_clean_env(), capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=120)
+            if r.returncode != 0:
+                raise flow.Stop("narrow", "spec-guard 收窄失败：%s" % (r.stdout + r.stderr).strip()[:300])
+            if not work.git("status", "--porcelain").strip():
+                return None
+            target = "模块 %s" % module if module else "整个项目"
+            work.git("add", "-A")
+            work.git("commit", "-q", "-m", "chore: 收窄%s的接管档位（降级 #%d）\n\n%s" % (target, issue_number, reason))
+            work.git("push", "-q", "--force", url, "HEAD:refs/heads/%s" % branch)
+        created = self.api("repos/%s/pulls" % repo, "POST", {
+            "title": "autopilot 收窄接管档位：%s（降级 #%d）" % (target, issue_number), "head": branch, "base": base_ref,
+            "body": ("%s。\n\n按 spec-guard 的收窄规则降一格（合并 → Plan → 不接管），由 `project_config.py narrow --source "
+                     "autopilot` 生成。改的是 `.agent/config.json`，属于 T4，请你审后合并；在那之前降级 issue #%d 已阻止自动合并。"
+                     % (reason, issue_number))})
+        return (created or {}).get("html_url")
+
     @staticmethod
     def write_check_evidence(repo, data):
         """~/.autopilot/evidence/<owner>__<repo>/<head sha>.json, read by spec-guard's final acceptance."""
@@ -274,6 +322,14 @@ class LocalIO:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     @staticmethod
+    def ledger_events():
+        try:
+            with open(os.path.join(STATE, "ledger.jsonl"), encoding="utf-8") as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except (OSError, ValueError):
+            return []
+
+    @staticmethod
     def now():
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -286,10 +342,34 @@ def main(argv=None):
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
+    st = sub.add_parser("stats", help="the three counts: auto-merged, reverted or reworked, Codex-unavailable stops")
+    st.add_argument("--repo", required=True, help="owner/name")
+    st.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", a.repo):
         print("autopilot: --repo 要写成 owner/name", file=sys.stderr)
         return 2
+    if a.cmd == "stats":
+        try:
+            token = tokens.mint(a.repo, READ)
+        except tokens.TokenError as e:
+            print("autopilot: 换不出机器人令牌：%s" % e, file=sys.stderr)
+            return 2
+        try:
+            out = flow.stats(LocalIO(token, None), a.repo)
+        except ApiError as e:
+            print("autopilot: GitHub 接口失败：%s" % e, file=sys.stderr)
+            return 2
+        finally:
+            tokens.revoke(token)
+        if a.json:
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+        else:
+            print("autopilot stats %s：自动合并 %d 次，其中被撤回或返修 %d 次（撤回 %d、返修 %d）；"
+                  "因 Codex 不可用停下 %d 次，共 %.1f 分钟" % (
+                      a.repo, out["auto_merged"], out["reverted_or_reworked"], out["reverted"], out["reworked"],
+                      out["codex_unavailable_stops"], out["codex_unavailable_minutes"]))
+        return 0
     delegate = find_delegate()
     if not delegate or not os.path.exists(delegate):
         print("autopilot: 找不到 delegate 0.10.0 以上的 delegate-exec.sh（可设 AUTOPILOT_DELEGATE）", file=sys.stderr)
