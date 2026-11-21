@@ -112,6 +112,53 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result["cap"], "L0")
         self.assertTrue(all(s["ok"] for s in result["steps"]), result["steps"])
 
+    def write(self, name, data):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return path
+
+    def test_risk_tier_reported(self):
+        files = self.write("files.json", [{"filename": ".github/workflows/ci.yml", "status": "modified",
+                                           "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}])
+        cfg = self.write("risk.json", {"extends": "plugin"})
+        proc, result, md = self.run_cli(os.path.join(FIX, "conclusion.basic.json"),
+                                        ["--pr-files", files, "--risk-config", cfg])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["risk"]["tier"], "T4")
+        self.assertTrue(result["risk"]["stop"])
+        self.assertIn("| risk |", md)
+        self.assertIn("T4", md)
+
+    def test_risk_reported_even_without_conclusion(self):
+        files = self.write("files.json", [{"filename": "docs/a.md", "status": "modified",
+                                           "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}])
+        proc, result, md = self.run_cli(os.path.join(self.tmp, "missing.json"), ["--pr-files", files])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["cap"], "L0")
+        self.assertEqual(result["risk"]["tier"], "T3")  # no risk config -> generic, unmatched -> T3
+        self.assertIn("| risk |", md)
+
+    def test_unreadable_risk_config_is_generic_with_note(self):
+        files = self.write("files.json", [{"filename": "docs/a.md", "status": "modified",
+                                           "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}])
+        bad = os.path.join(self.tmp, "risk.json")
+        with open(bad, "w") as fh:
+            fh.write("extends: plugin")
+        proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"),
+                                       ["--pr-files", files, "--risk-config", bad])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["risk"]["tier"], "T3")
+        self.assertTrue(any("risk-tiers" in n for n in result["notes"]), result["notes"])
+
+    def test_pr_files_feed_changed_files(self):
+        files = self.write("files.json", [{"filename": "src/core/a.py", "status": "modified",
+                                           "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}])
+        comments = self.write("c.json", ['<!-- autopilot-levels:v1 {"spec_guard":{"module":"m","tier":"relaxed"},"module_crew":{"effective":"relaxed"}} -->'])
+        proc, result, _ = self.run_cli(os.path.join(FIX, "conclusion.basic.json"),
+                                       ["--pr-files", files, "--levels-comments", comments])
+        self.assertEqual(result["cap"], "L3")  # src/core/** app cap, so changed files came from --pr-files
+
     def test_bad_tier_map_exits_2(self):
         bad = os.path.join(self.tmp, "map.json")
         with open(bad, "w") as f:

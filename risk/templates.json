@@ -1,0 +1,64 @@
+{
+  "schema": "autopilot.risk-templates/v1",
+  "$comment": "Slice 4 (docs/spec/slice-4.md). Common rules apply to every repo; a repo picks one category with .github/autopr/risk-tiers.json {\"extends\": \"<category>\"} and may add paths. All matching rules count and the highest tier wins, so a repo can only add or tighten, never lower. Unmatched files get the category default (T3 when no category). Editing this file is a T4 change.",
+  "common": {
+    "T4": [".github/**", "LICENSE", ".agent/**"],
+    "T3": ["CLAUDE.md", "AGENTS.md", "**/CLAUDE.md", "**/AGENTS.md"],
+    "T0": ["README*.md", "**/README*.md", "CHANGELOG.md", "**/CHANGELOG.md"]
+  },
+  "dependency_files": [
+    "package.json", "**/package.json",
+    "pnpm-lock.yaml", "**/pnpm-lock.yaml",
+    "package-lock.json", "**/package-lock.json",
+    "yarn.lock", "**/yarn.lock",
+    "requirements*.txt", "**/requirements*.txt",
+    "pyproject.toml", "**/pyproject.toml",
+    "uv.lock", "**/uv.lock",
+    "poetry.lock", "**/poetry.lock",
+    "Cargo.toml", "**/Cargo.toml", "Cargo.lock", "**/Cargo.lock",
+    "go.mod", "**/go.mod", "go.sum", "**/go.sum"
+  ],
+  "test_files": [
+    "test/**", "tests/**", "**/test/**", "**/tests/**",
+    "**/test_*.py", "**/*_test.py", "test_*.py", "*_test.py",
+    "**/test-*.sh", "test-*.sh",
+    "**/*.test.*", "**/*.spec.*", "*.test.*", "*.spec.*"
+  ],
+  "spec_guard": {
+    "spec": ["spec/**"],
+    "tasks": ["tasks/**"]
+  },
+  "categories": {
+    "plugin": {
+      "default": "T3",
+      "T4": [".claude-plugin/**", ".codex-plugin/**", "**/plugin.json", "plugin.json"],
+      "T2": ["commands/**", "skills/**", "**/commands/**", "**/skills/**"],
+      "T1": ["test/**", "tests/**", "**/test-*.sh", "**/test_*.py", "docs/research/**"],
+      "T0": ["docs/**"]
+    },
+    "contract": {
+      "default": "T4"
+    },
+    "frontend": {
+      "default": "T3",
+      "T4": ["**/auth/**", "**/session/**", "**/token*/**", "**/migrations/**", "wrangler.*", "**/wrangler.*", ".env*", "**/.env*"],
+      "T3": ["packages/*/src/index.*", "**/sw.*", "**/service-worker*", "**/middleware.*", "tsconfig*.json", "**/tsconfig*.json", "**/browserslist*", ".browserslistrc"],
+      "T2": ["src/**", "packages/**", "apps/**"],
+      "T1": ["test/**", "tests/**", "**/*.test.*", "**/*.spec.*"],
+      "T0": ["docs/**", "apps/docs/**"]
+    },
+    "content": {
+      "default": "T3",
+      "T4": ["REQUIREMENTS.md", "REVIEW_BRIEF.md", "_meta/**"],
+      "T3": ["maps/**", "site/**", "scripts/**"],
+      "T2": ["nodes/**", "part*/**", "appendix/**"],
+      "T1": ["research/**"]
+    }
+  },
+  "assertion_markers": ["assert", "expect(", "assertEqual", "assertTrue", "assertFalse", "assertIn", "assertRaises", ".should", "t.is(", "t.deepEqual(", "toBe(", "toEqual("],
+  "suppression_markers": ["# noqa", "eslint-disable", "@ts-ignore", "@ts-expect-error", "# type: ignore", "shellcheck disable", "pylint: disable", "//nolint", "autopilot-allow"],
+  "bumps": {
+    "non_test_lines_over": 200,
+    "files_over": 8
+  }
+}

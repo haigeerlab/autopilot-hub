@@ -16,6 +16,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from admission import decide as d  # noqa: E402
+from risk import tiers as risk_tiers  # noqa: E402
 
 HUB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,6 +49,10 @@ def render_markdown(result, conclusion_sha):
     lines.append("| --- | --- | --- |")
     for step in result["steps"]:
         lines.append(f"| {step['id']} | {'✅' if step['ok'] else '❌'} | {step['detail']} |")
+    risk = result.get("risk")
+    if risk:
+        verdict = "停下交你" if risk["stop"] else ("可自动合" if risk["auto_merge_eligible"] else "要你合")
+        lines.append(f"| risk | {'⛔' if risk['stop'] else '✅'} | 风险档 {risk['tier']}，{verdict}：{'；'.join(risk['reasons'])} |")
     lines.append("")
     if conclusion_sha:
         lines.append(f"接入结论文件 sha256：`{conclusion_sha}`")
@@ -68,6 +73,9 @@ def main(argv=None):
     p.add_argument("--levels-comments", help="optional JSON array of PR comment bodies, oldest first")
     p.add_argument("--degrade-issues", help="optional JSON array of open autopilot:degrade issues ({body: ...})")
     p.add_argument("--changed-files", help="optional file with one changed path per line")
+    p.add_argument("--pr-files", help="optional JSON array of PR files ({filename, status, additions, deletions, patch}); "
+                                      "also supplies the changed paths")
+    p.add_argument("--risk-config", help="optional .github/autopr/risk-tiers.json from the BASE branch")
     p.add_argument("--repo", required=True)
     p.add_argument("--default-branch", required=True)
     p.add_argument("--now", help="RFC 3339 time for tests; defaults to current UTC time")
@@ -105,6 +113,10 @@ def main(argv=None):
     if a.changed_files and os.path.exists(a.changed_files):
         with open(a.changed_files, encoding="utf-8") as f:
             changed = [line.strip() for line in f if line.strip()]
+    pr_files = read_json(a.pr_files, optional=True)
+    pr_files = [x for x in pr_files if isinstance(x, dict) and "filename" in x] if isinstance(pr_files, list) else None
+    if pr_files is not None:
+        changed = [x["filename"] for x in pr_files]
 
     now = d.parse_time(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
     if now is None:
@@ -117,6 +129,14 @@ def main(argv=None):
         degrade_levels=d.degrade_levels(issues, a.repo),
     )
     result["notes"].append("等级评论的作者暂不校验（agent 身份尚未建立，设计 Q2）；本检查只报告")
+    if pr_files is not None:
+        try:
+            risk_config = risk_tiers.read_repo_config(a.risk_config)
+        except (OSError, ValueError):
+            risk_config = None
+            result["notes"].append("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
+        result["risk"] = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
+        result["notes"] += result["risk"]["notes"]
     result["conclusion_sha256"] = sha256_of(a.conclusion)
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
