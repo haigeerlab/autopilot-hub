@@ -94,6 +94,18 @@ def takeover_item(comments, bot, notes):
             "接管档位：合并由人", payload)
 
 
+def verified_artifacts(comments, bot, head_sha):
+    """spec/** and tasks/** paths the latest trusted evidence on `head_sha` lists as verified (slice 12)."""
+    from admission.gate import current_evidence  # local: gate imports helpers from this module
+    if bot is None or not isinstance(head_sha, str) or len(head_sha) != 40:
+        return set()
+    current = current_evidence(comments, bot, head_sha)
+    if not current:
+        return set()
+    paths = ((current[-1].get("artifacts") or {}).get("verified")) or []
+    return {p for p in paths if isinstance(p, str) and (p.startswith("spec/") or p.startswith("tasks/"))}
+
+
 def degrade_item(issues, repo):
     """Open `autopilot:degrade` issues scoped to this repo block auto-merge; the block's level is ignored.
     A block that cannot be read counts as blocking (its scope is unknown)."""

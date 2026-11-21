@@ -27,6 +27,7 @@ from orchestrator import flow, token as tokens
 HUB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.expanduser("~/.autopilot")
 DELEGATE_CACHE = os.path.expanduser("~/.claude/plugins/cache/delegate-marketplace/delegate")
+SPEC_GUARD_CACHE = os.path.expanduser("~/.claude/plugins/cache/spec-guard-marketplace/spec-guard")
 SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL", "TERM")
 CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
@@ -34,19 +35,25 @@ WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
 
-def find_delegate():
-    path = os.environ.get("AUTOPILOT_DELEGATE")
-    if path:
-        return path
+def _newest(cache, minimum, rel):
     try:
-        versions = [v for v in os.listdir(DELEGATE_CACHE) if re.fullmatch(r"\d+\.\d+\.\d+", v)]
+        versions = [v for v in os.listdir(cache) if re.fullmatch(r"\d+\.\d+\.\d+", v)]
     except OSError:
         return None
-    versions = [v for v in versions if tuple(map(int, v.split("."))) >= (0, 10, 0)]
+    versions = [v for v in versions if tuple(map(int, v.split("."))) >= minimum]
     if not versions:
         return None
     best = max(versions, key=lambda v: tuple(map(int, v.split("."))))
-    return os.path.join(DELEGATE_CACHE, best, "scripts", "delegate-exec.sh")
+    return os.path.join(cache, best, rel)
+
+
+def find_delegate():
+    return os.environ.get("AUTOPILOT_DELEGATE") or _newest(DELEGATE_CACHE, (0, 10, 0), "scripts/delegate-exec.sh")
+
+
+def find_map_view():
+    """spec-guard 0.91+ `hooks/map_view.py` (slice 12 reads each module's review state on the head commit)."""
+    return os.environ.get("AUTOPILOT_SPEC_GUARD_MAP") or _newest(SPEC_GUARD_CACHE, (0, 91, 0), "hooks/map_view.py")
 
 
 def _clean_env():
@@ -90,6 +97,22 @@ class Work:
         except subprocess.TimeoutExpired:
             raise flow.Stop("check", "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60))
         return flow.check_result(r.returncode, r.stdout + "\n" + r.stderr)
+
+    def module_view(self):
+        """spec-guard's map view of the head commit (the clone is on head after run_check); None if unavailable."""
+        script = find_map_view()
+        if not script or not os.path.exists(script):
+            return None
+        self.git("checkout", "-q", "--detach", self.head)
+        try:
+            r = subprocess.run(["python3", "-B", script, "--json", "--project", self.root], cwd=self.root,
+                               env=_clean_env(), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+        except subprocess.TimeoutExpired:
+            return None
+        try:
+            return json.loads(r.stdout) if r.returncode == 0 else None
+        except ValueError:
+            return None
 
     def review(self, previous):
         args = ["bash", self.delegate, "review", "--repo", self.root, "--base", self.merge_base, "--head", self.head]

@@ -119,10 +119,12 @@ def main(argv=None):
     config_notes = []
     risk_config = load_risk_config(yml_path, json_path, config_notes)
 
-    risk = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config)
+    bot = d.load_bot_identity(a.bot_identity)
+    verified = d.verified_artifacts(comments, bot, a.head_sha)
+    risk = risk_tiers.classify(pr_files, risk_tiers.load_templates(), risk_config, verified)
     risk["notes"] = config_notes + risk["notes"]
     result = d.decide(risk=risk, comments=comments, degrade_issues=issues, repo=a.repo,
-                      bot=d.load_bot_identity(a.bot_identity), head_sha=a.head_sha)
+                      bot=bot, head_sha=a.head_sha)
     result["risk"] = risk
     with open(a.out_json, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)

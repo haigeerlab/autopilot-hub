@@ -184,6 +184,19 @@ class BotIdentityTest(unittest.TestCase):
                 os.unlink(fh.name)
 
 
+class VerifiedArtifactsFromEvidenceTest(unittest.TestCase):
+    def test_current_evidence_lists_verified_artifacts(self):
+        body = evidence_body().replace('"acceptance":', '"artifacts": {"module": "m", "verified": ["spec/m.md"]}, "acceptance":')
+        self.assertEqual(d.verified_artifacts([bot(body)], BOT, HEAD), {"spec/m.md"})
+
+    def test_untrusted_or_stale_evidence_verifies_nothing(self):
+        body = evidence_body().replace('"acceptance":', '"artifacts": {"module": "m", "verified": ["spec/m.md"]}, "acceptance":')
+        human = {"login": "haigeerlab", "id": 1, "type": "User"}
+        self.assertEqual(d.verified_artifacts([bot(body, user=human, app=None)], BOT, HEAD), set())
+        self.assertEqual(d.verified_artifacts([bot(body)], BOT, "b" * 40), set())
+        self.assertEqual(d.verified_artifacts([bot(body)], None, HEAD), set())
+
+
 class GateItemTest(unittest.TestCase):
     def test_no_evidence_is_not_ok(self):
         res = run(comments=[takeover("auto")])

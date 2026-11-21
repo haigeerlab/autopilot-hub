@@ -45,6 +45,9 @@ class FakeWork:
         self.io.ran.append(command)
         return flow.check_result(self.io.check_exit, "ok\n")
 
+    def module_view(self):
+        return self.io.view
+
     def review(self, previous):
         self.io.reviews.append(previous)
         return self.io.reports.pop(0)
@@ -56,6 +59,8 @@ class FakeIO:
                  module=None, acceptance=None, sg_config=None):
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
         self.evidence_files = []
+        self.view = {"modules": [{"id": module, "review": {"spec": "codex-approved", "plan": "approved"},
+                                  "reviewApprovedBy": {"spec": "codex", "plan": "user"}}]} if module else None
         self.module, self.acceptance_record = module, acceptance
         self.bot = bot
         self.check_command, self.check_exit = check_command, check_exit
@@ -406,6 +411,62 @@ class AcceptanceTest(unittest.TestCase):
 
     def test_human_approved_acceptance_counts(self):
         self.assertEqual(run(FakeIO(module="m", acceptance=accepted(marker="approved"), reports=[]))["result"], "merged")
+
+
+SPEC_PATCH = "@@ -9 +9 @@\n-- must do A\n+- must do B\n"
+
+
+class ModuleArtifactsTest(unittest.TestCase):
+    """Slice 12: a module PR that also changes its own approved spec/tasks can still merge automatically."""
+
+    def io(self, files=("spec/m.md", "tasks/m/plan.md", "docs/a.md"), **kw):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], **kw)
+        io.files = [{"filename": f, "status": "modified", "additions": 1, "deletions": 1,
+                     "patch": SPEC_PATCH if f.startswith(("spec/", "tasks/")) else "@@ -1 +1 @@\n+x\n"} for f in files]
+        return io
+
+    def evidence(self, io):
+        return json.loads(flow_block([c["body"] for c in io.comments if "autopilot-evidence" in c["body"]][0],
+                                     "autopilot-evidence"))
+
+    def test_own_approved_artifacts_are_verified_and_merge(self):
+        io = self.io()
+        res = run(io)
+        self.assertEqual(res["result"], "merged", res)
+        self.assertEqual(self.evidence(io)["artifacts"], {"module": "m", "verified": ["spec/m.md", "tasks/m/plan.md"]})
+
+    def test_revised_spec_is_not_verified_and_stops_at_admission(self):
+        io = self.io()
+        io.view["modules"][0]["review"]["spec"] = "revised"
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "admission"))
+        self.assertIn("T4", res["reason"])
+        self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
+
+    def test_codex_approval_not_counted_by_takeover_is_not_verified(self):
+        io = self.io()
+        io.view["modules"][0]["reviewApprovedBy"]["spec"] = None
+        self.assertEqual(run(io)["step"], "admission")
+
+    def test_other_modules_artifacts_and_capability_map_stay_T4(self):
+        for f in ("spec/other.md", "spec/CAPABILITY-MAP.md", "tasks/other/plan.md"):
+            io = self.io(files=("spec/m.md", f))
+            res = run(io)
+            self.assertEqual(res["result"], "stopped", f)
+            self.assertIn(res["step"], ("risk", "admission"), f)  # the capability map never gets past the pre-check
+            self.assertEqual(io.merge_calls(), [], f)
+
+    def test_no_map_view_verifies_nothing(self):
+        io = self.io()
+        io.view = None
+        self.assertEqual(run(io)["step"], "admission")
+
+    def test_verify_artifacts_unit(self):
+        view = {"modules": [{"id": "m", "review": {"spec": "approved", "plan": "codex-approved"},
+                             "reviewApprovedBy": {"spec": "user", "plan": "codex"}}]}
+        self.assertEqual(flow.verify_artifacts(view, "m", ["spec/m.md", "tasks/m/todo.md", "spec/mm.md", "src/x.py"]),
+                         ["spec/m.md", "tasks/m/todo.md"])
+        self.assertEqual(flow.verify_artifacts(view, "n", ["spec/n.md"]), [])
 
 
 class TakeoverConfigTest(unittest.TestCase):

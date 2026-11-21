@@ -214,6 +214,36 @@ class SpecGuardArtifactTest(unittest.TestCase):
         self.assertTrue(res["stop"])
 
 
+class VerifiedArtifactTest(unittest.TestCase):
+    """Slice 12: spec-guard artifacts the orchestrator verified (approval still in effect) drop from T4 to T2."""
+    cfg = {"extends": "plugin"}
+    patch = "@@ -9 +9 @@\n-- must do A\n+- must do B\n"
+
+    def test_verified_spec_and_tasks_are_T2(self):
+        files = [f("spec/m.md", patch=self.patch), f("tasks/m/plan.md", patch=self.patch)]
+        res = r.classify(files, T, self.cfg, verified={"spec/m.md", "tasks/m/plan.md"})
+        self.assertEqual(res["tier"], "T2", res["reasons"])
+        self.assertFalse(res["stop"])
+        self.assertTrue(any("已核对" in x["rule"] for x in res["files"]), res["files"])
+
+    def test_unverified_stays_T4(self):
+        files = [f("spec/m.md", patch=self.patch), f("tasks/m/plan.md", patch=self.patch)]
+        self.assertEqual(r.classify(files, T, self.cfg, verified={"spec/m.md"})["tier"], "T4")
+
+    def test_agent_config_is_always_T4(self):
+        res = r.classify([f(".agent/config.json")], T, self.cfg, verified={".agent/config.json"})
+        self.assertEqual(res["tier"], "T4")
+
+    def test_capability_map_never_verified(self):
+        res = r.classify([f("spec/CAPABILITY-MAP.md", patch=self.patch)], T, self.cfg,
+                         verified={"spec/CAPABILITY-MAP.md"})
+        self.assertEqual(res["tier"], "T4")
+
+    def test_verified_does_not_lower_other_protective_rules(self):
+        res = r.classify([f(".github/workflows/ci.yml")], T, self.cfg, verified={".github/workflows/ci.yml"})
+        self.assertEqual(res["tier"], "T4")
+
+
 class OutputTest(unittest.TestCase):
     def test_eligibility(self):
         low = tier_of([f("docs/a.md")], {"extends": "plugin"})
