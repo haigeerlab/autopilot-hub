@@ -28,8 +28,10 @@
 `python3 -B orchestrator/cli.py stats --repo <owner/name> [--json]`：
 - **自动合并次数**：带 `autopilot:auto-merged` 标签的 PR 数。
 - **其中被撤回或返修的次数**，两种情况各计一次，同一个 PR 只算一次：
-  - 撤回：降级 workflow 在撤回时给原 PR 打 `autopilot:reverted` 标签；
+  - 撤回：从 reason 为 revert 的降级 issue 证据里的 PR 链接统计；
   - 返修：合并后 14 天内，有 `autopilot:regression` issue 在正文里提到这个 PR（`#n` 或 PR 链接）。
 - **因 Codex 不可用而停下的次数和总时长**：读本机 `~/.autopilot/ledger.jsonl` 里的 `codex_unavailable` 记录。
 
 用只读的机器人令牌读 GitHub，用完作废。
+
+2026-11-22 演练 3 发现：降级 workflow 的令牌对 PR 只读，打标签会 403，因此改为从降级 issue 统计

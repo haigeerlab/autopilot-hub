@@ -560,10 +560,23 @@ class StatsTest(unittest.TestCase):
             def api(self, path, method="GET", body=None):
                 if "labels=autopilot:auto-merged" in path:
                     return [{"number": 2, "pull_request": {}, "closed_at": "2026-11-20T00:00:00Z", "labels": []},
-                            {"number": 4, "pull_request": {}, "closed_at": "2026-11-20T00:00:00Z",
-                             "labels": [{"name": "autopilot:reverted"}]},
-                            {"number": 6, "pull_request": {}, "closed_at": "2026-11-01T00:00:00Z", "labels": []},
+                            {"number": 4, "pull_request": {}, "closed_at": "2026-11-20T00:00:00Z", "labels": []},
+                            {"number": 6, "pull_request": {}, "closed_at": "2026-11-01T00:00:00Z",
+                             "labels": [{"name": "autopilot:reverted"}]},  # legacy labels do not count
                             {"number": 9, "labels": []}]  # an issue, not a PR
+                if path == f"repos/{REPO}/issues?labels=autopilot:degrade&state=all&per_page=100":
+                    payload = {"scope": {"repo": REPO}, "reason": "revert",
+                               "evidence": [f"https://github.com/{REPO}/commit/abc",
+                                            f"https://github.com/{REPO}/pull/4",
+                                            f"https://github.com/{REPO}/pull/6"]}
+                    wrong_scope = dict(payload, scope={"repo": "other/repo"},
+                                       evidence=[f"https://github.com/{REPO}/pull/6"])
+                    return [{"number": 20, "state": "closed", "body": flow.block("autopilot-degrade", payload)},
+                            degrade_block(21, pr_url=f"https://github.com/{REPO}/pull/4"),  # duplicate
+                            degrade_block(22, reason="main-red", pr_url=f"https://github.com/{REPO}/pull/6"),
+                            {"number": 23, "body": flow.block("autopilot-degrade", wrong_scope)},
+                            dict(degrade_block(24, pr_url=f"https://github.com/{REPO}/pull/6"), pull_request={}),
+                            {"number": 25, "body": "<!-- autopilot-degrade:v1 not-json -->"}]
                 if "labels=autopilot:regression" in path:
                     return [{"number": 10, "body": "回归，见 #2", "created_at": "2026-11-21T00:00:00Z"},
                             {"number": 11, "body": "见 #6", "created_at": "2026-11-21T00:00:00Z"},  # > 14 days
@@ -578,6 +591,26 @@ class StatsTest(unittest.TestCase):
         out = flow.stats(StatsIO(), REPO)
         self.assertEqual((out["auto_merged"], out["reverted"], out["reworked"], out["reverted_or_reworked"]), (3, 1, 1, 2))
         self.assertEqual((out["codex_unavailable_stops"], out["codex_unavailable_minutes"]), (1, 30.0))
+
+    def test_revert_of_pr_not_auto_merged_is_not_counted(self):
+        class StatsIO:
+            def api(self, path, method="GET", body=None):
+                if "labels=autopilot:auto-merged" in path:
+                    return [{"number": 2, "pull_request": {}}]
+                if path == f"repos/{REPO}/issues?labels=autopilot:degrade&state=all&per_page=100":
+                    payload = {"scope": {"repo": REPO}, "reason": "revert",
+                               "evidence": [f"https://github.com/{REPO}/pull/99",
+                                            f"https://github.com/{REPO}/pull/2"]}
+                    return [{"number": 20, "body": flow.block("autopilot-degrade", payload)}]
+                if "labels=autopilot:regression" in path:
+                    return []
+                raise AssertionError(path)
+
+            def ledger_events(self):
+                return []
+
+        out = flow.stats(StatsIO(), REPO)
+        self.assertEqual((out["auto_merged"], out["reverted"], out["reverted_or_reworked"]), (1, 0, 0))
 
 
 class TakeoverConfigTest(unittest.TestCase):

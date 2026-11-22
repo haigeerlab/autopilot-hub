@@ -148,7 +148,7 @@ def narrow_pending(io, repo, base_ref, issues, sg_project, bot, notes, dry_run):
         url = io.open_narrow_pr(repo, base_ref, module, number, reason)
         target = f"模块 {module}" if module else "整个项目"
         if url:
-            body = f"已为{target}开收窄 PR：{url}（按 spec-guard 规则降一格：合并 → Plan → 不接管）。它是 T4，合并后生效；在那之前本 issue 已阻止自动合并。"
+            body = f"已为{target} 开收窄 PR：{url}（按 spec-guard 规则降一格：合并 → Plan → 不接管）。它是 T4，合并后生效；在那之前本 issue 已阻止自动合并。"
         else:
             body = f"{target}的接管档位已是最严，不需要收窄。"
         io.api(f"repos/{repo}/issues/{number}/comments", "POST",
@@ -486,7 +486,7 @@ def _ts(text):
 
 
 def stats(io, repo):
-    """B12: auto-merged PRs; how many of them were reverted (label autopilot:reverted) or reworked (an
+    """B12: auto-merged PRs; how many of them were reverted (PR evidence in revert degrade issues) or reworked (an
     autopilot:regression issue referencing the PR within 14 days of the merge); stops because Codex was
     unavailable (count and total minutes, from the local ledger)."""
     merged = [i for i in io.api(f"repos/{repo}/issues?labels={AUTO_MERGED}&state=all&per_page=100") or []
@@ -494,10 +494,29 @@ def stats(io, repo):
     regressions = [i for i in io.api(f"repos/{repo}/issues?labels=autopilot:regression&state=all&per_page=100") or []
                    if "pull_request" not in i]
     reverted, reworked = set(), set()
+    merged_numbers = {pr.get("number") for pr in merged}
+    for issue in io.api(f"repos/{repo}/issues?labels=autopilot:degrade&state=all&per_page=100") or []:
+        if "pull_request" in issue:
+            continue
+        for raw in d.DEGRADE_BLOCK.findall(issue.get("body") or ""):
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict) or payload.get("reason") != "revert":
+                continue
+            scope = payload.get("scope") or {}
+            if not isinstance(scope, dict) or scope.get("repo") != repo:
+                continue
+            for evidence in payload.get("evidence") or []:
+                match = PR_URL.search(evidence) if isinstance(evidence, str) else None
+                if match:
+                    n = int(match.group(1))
+                    if n in merged_numbers:
+                        reverted.add(n)
+                    break
     for pr in merged:
         n = pr.get("number")
-        if any(lb.get("name") == "autopilot:reverted" for lb in pr.get("labels") or []):
-            reverted.add(n)
         done = _ts(pr.get("closed_at"))
         refs = re.compile(r"(?:#|/pull/)%d\b" % n)
         for issue in regressions:
