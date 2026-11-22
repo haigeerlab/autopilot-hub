@@ -1,28 +1,35 @@
 """`autopilot run`: drive one PR with the local orchestrator (slice 10). See orchestrator/flow.py.
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
+    python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
+    python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --resume 9 [--confirm "..."]
 
 Exit codes: 0 merged (or dry run passed); 1 stopped (the reason is on the PR and printed); 2 bad
-invocation or environment (no token, no delegate).
+invocation or environment (no token, no delegate). Release also uses 0 for completed and 1 for waiting.
 """
 import argparse
 import base64
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from admission import decide as d
 from checkup import workflow
+from checkup import yamlsub
 from degrade.run import ApiError, NotFound, parse_pages
 from orchestrator import flow, token as tokens
+from pipeline import engine, model as pipeline_model
+from risk.tiers import REPO_CONFIGS
 
 HUB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.expanduser("~/.autopilot")
@@ -31,6 +38,7 @@ SPEC_GUARD_CACHE = os.path.expanduser("~/.claude/plugins/cache/spec-guard-market
 SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL", "TERM")
 CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
+RELEASE_TIMEOUT = 30 * 60
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
@@ -102,6 +110,39 @@ class Work:
         except subprocess.TimeoutExpired:
             raise flow.Stop("check", "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60))
         return flow.check_result(r.returncode, r.stdout + "\n" + r.stderr)
+
+    def run_release(self, command, version, repo, issue):
+        """Run at the pinned release commit with combined output and no GitHub tokens."""
+        env = dict(_clean_env(), AUTOPILOT_VERSION=version, AUTOPILOT_REPO=repo,
+                   AUTOPILOT_RELEASE_ISSUE=str(issue))
+        try:
+            result = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    errors="replace", stdin=subprocess.DEVNULL, timeout=RELEASE_TIMEOUT)
+        except subprocess.TimeoutExpired as error:
+            output = error.output or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            return {"exit": 124, "output": output + "\n命令超过 30 分钟，已停止"}
+        except OSError as error:
+            raise flow.Stop("release", "发布命令无法启动：%s" % error) from error
+        return {"exit": result.returncode, "output": result.stdout}
+
+    def file_evidence(self, path):
+        """Hash an existing file only when its resolved path stays inside the clone."""
+        root = Path(self.root).resolve()
+        try:
+            artifact = (root / path).resolve()
+            relative = artifact.relative_to(root)
+            if not artifact.is_file():
+                return None
+            digest = hashlib.sha256()
+            with artifact.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return {"path": relative.as_posix(), "sha256": digest.hexdigest()}
 
     def module_view(self):
         """spec-guard's map view of the head commit (the clone is on head after run_check); None if unavailable."""
@@ -179,6 +220,56 @@ class LocalIO:
     def checkout(self, repo, pr):
         with tempfile.TemporaryDirectory(prefix="autopilot-run-") as tmp:
             yield Work(tmp, repo, pr, self.token, self.delegate)
+
+    @contextlib.contextmanager
+    def release_checkout(self, repo, base_ref, commit):
+        pr = {"head": {"sha": commit}, "base": {"ref": base_ref}}
+        with tempfile.TemporaryDirectory(prefix="autopilot-release-") as tmp:
+            work = Work(tmp, repo, pr, self.token, None)
+            work.git("checkout", "-q", "--detach", commit)
+            yield work
+
+    def resolve_pipeline(self, repo, ref, notes):
+        """Resolve base-branch configuration with the hub's installed templates."""
+        text = flow.base_file(self, repo, ".github/autopr/pipeline.yml", ref)
+        if text is not None:
+            try:
+                config = yamlsub.loads(text)
+            except yamlsub.YamlSubsetError as error:
+                raise pipeline_model.PipelineError([
+                    ".github/autopr/pipeline.yml 第 %d 行 YAML 格式错误，请检查语法" % error.line]) from error
+        else:
+            config = None
+            for path in REPO_CONFIGS:
+                text = flow.base_file(self, repo, path, ref)
+                if text is not None:
+                    config = yamlsub.loads(text) if path.endswith(".yml") else json.loads(text)
+                    if not isinstance(config, dict):
+                        raise ValueError("风险配置必须是映射")
+                    break
+            category = config.get("extends") if isinstance(config, dict) else None
+            template = "plugin" if category == "plugin" else "site" if category == "frontend" else None
+            if template is None:
+                raise pipeline_model.PipelineError(["没有 pipeline.yml，无法从风险配置识别流程类别，请声明 extends"])
+            notes.append("没有 pipeline.yml，按类别 %s 套模板 %s" % (category, template))
+            config = {"extends": template}
+        return pipeline_model.resolve(config)
+
+    def release_issue(self, repo, number):
+        issue = self.api("repos/%s/issues/%d" % (repo, number))
+        # REST updated_at also changes on comments and labels. GraphQL distinguishes body edits.
+        if issue.get("updated_at") != issue.get("created_at"):
+            owner, name = repo.split("/", 1)
+            query = ("query($owner:String!,$name:String!,$number:Int!){"
+                     "repository(owner:$owner,name:$name){issue(number:$number){lastEditedAt}}}")
+            result = self.api("graphql", "POST", {"query": query, "variables": {
+                "owner": owner, "name": name, "number": number}})
+            try:
+                edited_at = result["data"]["repository"]["issue"]["lastEditedAt"]
+            except (KeyError, TypeError) as error:
+                raise ApiError("读不到发布 issue 的正文编辑时间，无法验证开始块") from error
+            issue = dict(issue, updated_at=edited_at or issue.get("created_at"))
+        return issue
 
     @staticmethod
     def _review_path(repo, number):
@@ -334,6 +425,45 @@ class LocalIO:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def release(args):
+    if ((args.confirm is not None and args.resume is None) or (args.dry_run and args.resume is not None)
+            or (args.resume is not None and args.resume < 1)
+            or (args.version is not None and not args.version.strip())
+            or (args.confirm is not None and not args.confirm.strip())):
+        print("autopilot: --confirm 只用于续跑且不能为空，--resume 必须为正数，"
+              "--dry-run 只用于新发布，版本不能为空", file=sys.stderr)
+        return 2
+    permissions = {"contents": "read", "issues": "read" if args.dry_run else "write"}
+    try:
+        token = tokens.mint(args.repo, permissions)
+    except tokens.TokenError as error:
+        print("autopilot: 换不出机器人令牌：%s" % error, file=sys.stderr)
+        return 2
+    try:
+        result = engine.run(LocalIO(token, None), args.repo, args.version,
+                            resume=args.resume, confirm=args.confirm, dry_run=args.dry_run)
+    except (ApiError, OSError, ValueError) as error:
+        print("autopilot: 发布环境或流程校验失败：%s" % error, file=sys.stderr)
+        return 2
+    finally:
+        tokens.revoke(token)
+    stream = sys.stderr if result["code"] == 2 else sys.stdout
+    print("autopilot release %s：%s" % (args.repo, result["reason"]), file=stream)
+    for note in result["notes"]:
+        print("  说明：" + note, file=stream)
+    if result["result"] == "dry-run":
+        print("发布档位：" + result["level"])
+        for step in result["plan"]:
+            action = "会执行" if step["status"] == "execute" else "会停下等人（%s）" % step["reason"]
+            print("  %s：%s" % (step["id"], action))
+    if result["url"]:
+        print("跟踪 issue：" + result["url"], file=stream)
+    if result["code"] == 1:
+        suffix = ' --confirm "用户原话"' if result["result"] == "waiting" else ""
+        print("续跑示例：" + result["resume_command"] + suffix, file=stream)
+    return result["code"]
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot local orchestrator (slice 10)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -345,10 +475,19 @@ def main(argv=None):
     st = sub.add_parser("stats", help="the three counts: auto-merged, reverted or reworked, Codex-unavailable stops")
     st.add_argument("--repo", required=True, help="owner/name")
     st.add_argument("--json", action="store_true")
+    rel = sub.add_parser("release", help="按流程发布，用跟踪 issue 留证据并支持续跑")
+    rel.add_argument("--repo", required=True, help="owner/name")
+    target = rel.add_mutually_exclusive_group(required=True)
+    target.add_argument("--version", help="本次发布版本")
+    target.add_argument("--resume", type=int, help="续跑的跟踪 issue 号")
+    rel.add_argument("--confirm", help="人工确认原话，原样记录")
+    rel.add_argument("--dry-run", action="store_true", help="只读预演，不开 issue、不执行命令")
     a = p.parse_args(argv)
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", a.repo):
         print("autopilot: --repo 要写成 owner/name", file=sys.stderr)
         return 2
+    if a.cmd == "release":
+        return release(a)
     if a.cmd == "stats":
         try:
             token = tokens.mint(a.repo, READ)
