@@ -101,6 +101,13 @@ class Work:
         self.git("checkout", "-q", "--detach", self.base_tip)
         return workflow.find_check(self.root)["command"]
 
+    def read_pipeline(self):
+        """Read the fetched base commit without changing the PR checkout or its artifacts."""
+        path = ".github/autopr/pipeline.yml"
+        if not self.git("ls-tree", "--name-only", self.base_tip, "--", path).strip():
+            return None
+        return self.git("show", self.base_tip + ":" + path)
+
     def run_check(self, command):
         self.git("checkout", "-q", "--detach", self.head)
         env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
@@ -114,7 +121,7 @@ class Work:
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
         env = dict(_clean_env(), AUTOPILOT_VERSION=version, AUTOPILOT_REPO=repo,
-                   AUTOPILOT_RELEASE_ISSUE=str(issue))
+                   AUTOPILOT_RELEASE_ISSUE=str(issue), AUTOPILOT_HUB=HUB)
         try:
             result = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

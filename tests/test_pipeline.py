@@ -40,7 +40,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in result["steps"]],
                          ["impact", "prepare", "confirm", "publish", "verify", "rollback-check", "rollback"])
         self.assertEqual(result["steps"][0]["evidence"], ["stdout"])
-        self.assertIsNone(result["steps"][0]["auto_when"])
+        self.assertEqual(result["steps"][0]["auto_when"], "release: human")
         self.assertIsNone(result["steps"][0]["stop_if"])
         self.assertEqual(result["steps"][-1], dict(step("rollback", at="after-live", run="echo 回滚演练"),
                                                   auto_when="release: auto", stop_if=None, evidence=["stdout"]))
@@ -266,8 +266,8 @@ class PipelineCliTest(unittest.TestCase):
         self.assertEqual(self.cli().returncode, 1)
         (self.config_dir / "risk-tiers.yml").write_text("extends: plugin", encoding="utf-8")
         result = self.cli()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("plugin", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("没有 pipeline.yml，按类别 plugin 套模板", result.stdout)
 
     def test_empty_or_nonmapping_config_is_not_absence(self):
         for content in ("", "null", "[]"):

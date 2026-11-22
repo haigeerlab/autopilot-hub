@@ -24,6 +24,8 @@ if __package__ in (None, ""):
 
 from admission import cli as admission_cli
 from admission import decide as d
+from checkup import yamlsub
+from pipeline import model as pipeline_model
 from risk import tiers as risk_tiers
 
 RUN_MARKER = "<!-- autopilot-run:v1 -->"
@@ -341,18 +343,20 @@ def gate_review(report):
     return fp
 
 
-def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None):
+def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None, extra_checks=()):
+    checks = [dict(check, cmd=command)] + list(extra_checks)
     payload = {"head_sha": head, "runner": "autopilot-orchestrator",
-               "checks": [{"cmd": command, "exit": check["exit"], "output_sha256": check["output_sha256"]}],
+               "checks": [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in checks],
                "review": {"backend": report.get("backend"), "status": report.get("execution_status"),
                           "outcome": report.get("review_outcome"), "fingerprint": fp,
                           "blocking": blocking_of(report), "rounds": rounds},
                "acceptance": acceptance}
     if artifacts is not None:
         payload["artifacts"] = artifacts
-    tail = "\n".join(check["tail"])
+    check_lines = "\n".join(f"- 检查：`{c['cmd']}`，退出码 {c['exit']}（在一次性克隆里由本机编排重新运行）" for c in checks)
+    tail = "\n\n".join(c["cmd"] + "\n" + "\n".join(c["tail"]) for c in checks)
     return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`）\n\n"
-            f"- 检查：`{command}`，退出码 {check['exit']}（在一次性克隆里由本机编排重新运行）\n"
+            f"{check_lines}\n"
             f"- 审查：delegate／{report.get('backend')}，第 {rounds} 轮，{report.get('review_outcome')}，"
             f"blocking 0，补丁指纹 `{fp[:16]}`\n\n"
             f"<details><summary>检查输出最后 {TAIL} 行</summary>\n\n```\n{tail}\n```\n</details>\n\n"
@@ -426,7 +430,27 @@ def run(io, repo, number, *, dry_run=False):
             check = work.run_check(command)
             if check["exit"] != 0:
                 raise Stop("check", f"检查 `{command}` 退出码 {check['exit']}，交作者修")
-            io.write_check_evidence(repo, check_evidence(repo, head, command, check, io.now()))
+            evidence = check_evidence(repo, head, command, check, io.now())
+            io.write_check_evidence(repo, evidence)
+            try:
+                pipeline_text = work.read_pipeline()
+                steps = pipeline_model.resolve(yamlsub.loads(pipeline_text))["steps"] if pipeline_text is not None else []
+            except (OSError, ValueError) as error:
+                raise Stop("pre-merge", "基础分支 pipeline.yml 读不了或校验失败：%s" % error) from error
+            for step in steps:
+                if step["at"] != "pre-merge":
+                    continue
+                identifier, cmd = step["id"], step["run"]
+                if step["by"] != "ai" or cmd.startswith("ask:"):
+                    raise Stop("pre-merge", "合并前追加步骤 %s 要人做：%s" % (identifier, cmd))
+                try:
+                    result = work.run_check(cmd)
+                except Stop as error:
+                    raise Stop("pre-merge", "合并前追加步骤 %s：%s" % (identifier, error.reason)) from error
+                evidence["checks"].append(dict(result, cmd=cmd))
+                io.write_check_evidence(repo, evidence)
+                if result["exit"] != 0:
+                    raise Stop("pre-merge", "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"]))
             acceptance = artifacts = None
             if sg_config is not None:
                 modules = io.find_modules(repo, head)
@@ -452,7 +476,8 @@ def run(io, repo, number, *, dry_run=False):
         if dry_run:
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
                     "notes": notes, "head_sha": head}
-        say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts))
+        say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts,
+                          extra_checks=evidence["checks"][1:]))
 
         decision = evaluate(io, repo, pr, bot)
         if not decision["auto_merge"]:

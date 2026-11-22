@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -41,9 +42,12 @@ class FakeWork:
     def find_check(self):
         return self.io.check_command
 
+    def read_pipeline(self):
+        return self.io.contents.get(".github/autopr/pipeline.yml")
+
     def run_check(self, command):
         self.io.ran.append(command)
-        return flow.check_result(self.io.check_exit, "ok\n")
+        return self.io.check_results.get(command, flow.check_result(self.io.check_exit, "ok\n"))
 
     def module_view(self):
         return self.io.view
@@ -65,6 +69,7 @@ class FakeIO:
         self.module, self.acceptance_record = module, acceptance
         self.bot = bot
         self.check_command, self.check_exit = check_command, check_exit
+        self.check_results = {}
         self.reports = list(reports if reports is not None else [report()])
         self.stored = stored
         self.merged_ok = merged_ok
@@ -344,6 +349,104 @@ class CheckEvidenceFileTest(unittest.TestCase):
         io = FakeIO(check_exit=1)
         run(io)
         self.assertEqual(io.evidence_files, [])
+
+
+class PreMergeTest(unittest.TestCase):
+    def pipeline(self, io, *steps):
+        lines = ["extends: plugin", "add:"]
+        for identifier, command, by in steps:
+            lines.extend(["  - id: " + identifier, "    at: pre-merge",
+                          "    run: " + json.dumps(command), "    by: " + by])
+        io.contents[".github/autopr/pipeline.yml"] = "\n".join(lines)
+
+    def test_ai_steps_run_in_order_before_review_and_join_both_evidence_records(self):
+        io = FakeIO()
+        self.pipeline(io, ("extra-one", "echo first", "ai"), ("extra-two", "echo second", "ai"))
+        io.check_results = {"echo first": flow.check_result(0, "first output\n"),
+                            "echo second": flow.check_result(0, "second output\n")}
+        commands = ["make test", "echo first", "echo second"]
+
+        def review_after_checks(work, previous):
+            self.assertEqual(io.ran, commands)
+            return report()
+
+        with mock.patch.object(FakeWork, "review", autospec=True, side_effect=review_after_checks):
+            result = run(io)
+        self.assertEqual(result["result"], "merged", result)
+        evidence = next(c["body"] for c in io.comments if "autopilot-evidence:v1" in c["body"])
+        checks = json.loads(flow_block(evidence, "autopilot-evidence"))["checks"]
+        self.assertEqual([c["cmd"] for c in checks], commands)
+        local = io.evidence_files[-1]
+        self.assertEqual([{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in local["checks"]], checks)
+        self.assertEqual(checks[1]["output_sha256"], io.check_results["echo first"]["output_sha256"])
+        self.assertEqual(local["checks"][2]["tail"], ["second output"])
+        self.assertIn("echo first", evidence)
+        self.assertIn("second output", evidence)
+
+    def test_nonzero_stops_before_later_steps_and_review_and_saves_local_failure(self):
+        io = FakeIO()
+        self.pipeline(io, ("extra-one", "echo first", "ai"), ("extra-two", "echo second", "ai"))
+        io.check_results["echo first"] = flow.check_result(9, "failed output\n")
+        result = run(io)
+        self.assertEqual((result["result"], result["step"]), ("stopped", "pre-merge"), result)
+        self.assertIn("extra-one", result["reason"])
+        self.assertIn("退出码 9", result["reason"])
+        self.assertEqual(io.ran, ["make test", "echo first"])
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.merge_calls(), [])
+        self.assertEqual(io.evidence_files[-1]["checks"][-1]["exit"], 9)
+        self.assertEqual(io.evidence_files[-1]["checks"][-1]["tail"], ["failed output"])
+
+    def test_human_external_and_ask_steps_stop_without_running_the_command(self):
+        for by, command in (("human", "人工核对"), ("external", "等部署"), ("human", "ask: 你")):
+            with self.subTest(by=by, command=command):
+                io = FakeIO()
+                self.pipeline(io, ("signoff", command, by))
+                result = run(io)
+                self.assertEqual((result["result"], result["step"]), ("stopped", "pre-merge"), result)
+                self.assertIn("合并前追加步骤 signoff 要人做：" + command, result["reason"])
+                self.assertEqual(io.ran, ["make test"])
+                self.assertEqual(io.reviews, [])
+                self.assertEqual(io.merge_calls(), [])
+
+    def test_invalid_pipeline_stops_before_review(self):
+        for content in ("extends: [", "extends: absent", "extends: plugin\nwrong: true", "", "[]"):
+            with self.subTest(content=content):
+                io = FakeIO()
+                io.contents[".github/autopr/pipeline.yml"] = content
+                result = run(io)
+                self.assertEqual((result["result"], result["step"]), ("stopped", "pre-merge"), result)
+                self.assertIn("pipeline.yml", result["reason"])
+                self.assertEqual(io.reviews, [])
+                self.assertEqual(io.ran, ["make test"])
+
+    def test_absent_or_release_only_pipeline_adds_no_checks(self):
+        for content in (None, "extends: plugin"):
+            io = FakeIO()
+            if content is not None:
+                io.contents[".github/autopr/pipeline.yml"] = content
+            result = run(io)
+            self.assertEqual(result["result"], "merged", result)
+            self.assertEqual(io.ran, ["make test"])
+
+    def test_core_check_cannot_be_replaced_or_skipped(self):
+        io = FakeIO(check_exit=1)
+        self.pipeline(io, ("extra", "true", "ai"))
+        with mock.patch.object(FakeWork, "read_pipeline", side_effect=AssertionError("must check first")):
+            result = run(io)
+        self.assertEqual(result["step"], "check")
+        self.assertEqual(io.ran, ["make test"])
+
+    def test_additional_check_timeout_is_reported_as_pre_merge(self):
+        io = FakeIO()
+        self.pipeline(io, ("extra", "slow command", "ai"))
+        with mock.patch.object(FakeWork, "run_check",
+                               side_effect=[flow.check_result(0, "ok"), flow.Stop("check", "检查超过 15 分钟")]):
+            result = run(io)
+        self.assertEqual(result["step"], "pre-merge", result)
+        self.assertIn("extra", result["reason"])
+        self.assertIn("15 分钟", result["reason"])
+        self.assertEqual(io.reviews, [])
 
 
 class AcceptanceTest(unittest.TestCase):
@@ -673,6 +776,53 @@ class LocalIOTest(unittest.TestCase):
         self.assertEqual(found["report_text"], "{}")
         self.assertIsNone(self.io.acceptance(REPO, "../m"))
         self.assertIsNone(self.io.acceptance("other/repo", "m"))
+
+
+class LocalWorkPipelineTest(unittest.TestCase):
+    def test_pipeline_is_read_from_base_while_commands_share_the_head_checkout(self):
+        import subprocess
+        from _checkup_util import commit_on_branch, make_repo
+        from orchestrator import cli
+        base_pipeline = "extends: plugin\nadd:\n  - id: extra\n    at: pre-merge\n    run: test -f artifact\n    by: ai\n"
+        root = make_repo(self, {".github/autopr/pipeline.yml": base_pipeline, "source": "base"})
+        base = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        commit_on_branch(root, {".github/autopr/pipeline.yml": "extends: npm\n", "source": "head"})
+        head = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.base_tip, work.head, work.git_env = root, base, head, dict(os.environ)
+        self.assertEqual(work.run_check("test $(cat source) = head && echo checked > artifact")["exit"], 0)
+        self.assertEqual(work.read_pipeline(), base_pipeline)
+        self.assertEqual(work.git("rev-parse", "HEAD").strip(), head)
+        self.assertEqual(work.run_check("test $(cat source) = head && test $(cat artifact) = checked")["exit"], 0)
+
+    def test_pr_cannot_add_its_own_pre_merge_pipeline(self):
+        import subprocess
+        from _checkup_util import commit_on_branch, make_repo
+        from orchestrator import cli
+        root = make_repo(self, {"source": "base"})
+        base = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        commit_on_branch(root, {".github/autopr/pipeline.yml": "extends: plugin\n"})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.base_tip, work.git_env = root, base, dict(os.environ)
+        self.assertIsNone(work.read_pipeline())
+
+    def test_pre_merge_uses_the_core_check_timeout_environment_and_closed_stdin(self):
+        import subprocess
+        from orchestrator import cli
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.head = "/fake/clone", HEAD
+        environment = {"PATH": "/bin", "HOME": "/home/test", "GH_TOKEN": "secret", "UNSAFE": "secret"}
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(work, "git") as git_call, \
+                mock.patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as process:
+            result = work.run_check("extra command")
+        self.assertEqual(result["exit"], 0)
+        git_call.assert_called_once_with("checkout", "-q", "--detach", HEAD)
+        args, options = process.call_args
+        self.assertEqual(args[0], ["/bin/sh", "-c", "extra command"])
+        self.assertEqual(options["cwd"], work.root)
+        self.assertEqual(options["env"], {"PATH": "/bin", "HOME": "/home/test"})
+        self.assertEqual(options["stdin"], subprocess.DEVNULL)
+        self.assertEqual(options["timeout"], cli.CHECK_TIMEOUT)
 
 
 class AdmissionAgreesTest(unittest.TestCase):

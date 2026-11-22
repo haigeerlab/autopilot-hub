@@ -1,4 +1,4 @@
-"""The C1-C13 checklist. Each check returns a finding dict; nothing here changes the repository.
+"""The C1-C14 checklist. Each check returns a finding dict; nothing here changes the repository.
 
 Finding: id, title, scope (仓库/增量), status (ok / missing / unknown), detail (what was seen),
 impact (plain-Chinese "缺了会怎样"), fix ({can_generate, how} or None), evidence (extra lines),
@@ -20,6 +20,7 @@ TITLES = {
     "C5": "PR 会跑检查", "C6": "密钥扫描与推送保护", "C7": "workflow 默认权限只读",
     "C8": "action 固定到 40 位提交", "C9": "没有危险触发写法", "C10": "依赖按锁文件装",
     "C11": "风险分级配置", "C12": "指令文件里的 autopilot 例外", "C13": "风险路径清单（给 spec-guard）",
+    "C14": "流程文件",
 }
 SCOPES = {"C8": "增量", "C9": "增量", "C10": "增量"}
 IMPACTS = {
@@ -36,6 +37,7 @@ IMPACTS = {
     "C11": "没有时按通用规则，很多路径会被当成 T3。",
     "C12": "开「接管到合并」前没有它，AI 在 autopilot/* 分支上提交、推送会被你自己的规则拦住。",
     "C13": "spec-guard 靠它判断重要需求：没有或读不了时，交 Codex 批 Spec 的模块一律按重要处理、Spec 交你批；过期时按旧清单判断。",
+    "C14": "没有或读不懂流程文件时，无法按仓库约定执行发布和合并前追加步骤；只提醒，不卡接入。",
 }
 # how a non-ok finding can be fixed: (can_generate, text)
 FIX_HOW = {
@@ -52,6 +54,7 @@ FIX_HOW = {
     "C11": (True, "生成一行 .github/autopr/risk-tiers.yml（类别按目录特征猜，猜不出就问你）"),
     "C12": (True, "生成 CLAUDE.md / AGENTS.md 里的 autopilot 说明草稿（补丁）"),
     "C13": (True, "生成 .github/autopr/risk-paths.json 的补丁（内容 = risk/cli.py paths --json）；改它算 T4，由你审后提交"),
+    "C14": (True, "缺少时按类别生成只含 extends 的 pipeline.patch；改这个文件算 T4，由人审后合并"),
 }
 
 
@@ -215,7 +218,24 @@ def run_checks(root, base, gh, repo_name, run_check=False, runner=entry.run_chec
 
     # C13
     findings.append(risk_paths_finding(root))
+    # C14
+    findings.append(pipeline_finding(root))
     return findings, ctx
+
+
+def pipeline_finding(root):
+    from pipeline import model
+    path = ".github/autopr/pipeline.yml"
+    try:
+        config = model.read_repo_pipeline(root)
+        if config is None:
+            return finding("C14", "missing", "没有 %s" % path)
+        model.resolve(config)
+    except model.PipelineError as error:
+        return finding("C14", "unknown", "%s 校验失败：%s" % (path, "；".join(error.problems[:5])))
+    except (OSError, ValueError) as error:
+        return finding("C14", "unknown", "%s 读不了：%s" % (path, error))
+    return finding("C14", "ok", "%s 存在且流程校验通过" % path)
 
 
 def expected_risk_paths(root):

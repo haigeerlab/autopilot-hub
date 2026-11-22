@@ -1,0 +1,36 @@
+name: site
+class: site
+rollback: true
+steps:
+  - id: build
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" build'
+    by: ai
+    auto_when: "release: prepare"
+  - id: ci-green
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" ci_check'
+    by: ai
+    auto_when: "release: prepare"
+  - id: rollback-ready
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" rollback_ready'
+    by: ai
+    auto_when: "release: prepare"
+    evidence: [stdout]
+  - id: deploy-preview
+    at: release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" deploy_preview'
+    by: ai
+    auto_when: "release: auto-confirm"
+    evidence: [stdout, url]
+  - id: promote
+    at: release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" promote'
+    by: ai
+    auto_when: "release: auto"
+  - id: verify-live
+    at: after-live
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" verify_live'
+    by: ai
+    auto_when: "release: auto"

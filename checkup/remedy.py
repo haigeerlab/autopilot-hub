@@ -74,6 +74,23 @@ def autopilot_section(command):
     ) % check
 
 
+def pipeline_template(root):
+    """Prefer the risk category; a non-private package is the npm fallback."""
+    from pipeline.model import default_template_for
+    try:
+        template = default_template_for(root)
+    except (OSError, ValueError):
+        template = None
+    if template is not None:
+        return template
+    try:
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as stream:
+            package = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    return "npm" if isinstance(package, dict) and package.get("private") is not True else None
+
+
 def instructions_patch(root, command):
     """(target file name, unified diff) adding the autopilot section to CLAUDE.md / AGENTS.md."""
     target = next((f for f in ("CLAUDE.md", "AGENTS.md") if os.path.isfile(os.path.join(root, f))), "CLAUDE.md")
@@ -146,4 +163,14 @@ def build_fixes(root, name, branch, findings, command, out_dir):
         add("F3", "C12", "指令文件里的 autopilot 例外说明", [rel],
             ["git apply %s   # 在仓库的新分支上应用，提交后开 PR" % (rel or "<补丁>")],
             "改的是 agent 指令里的“先问”边界，须经你同意")
+    if status.get("C14") == "missing":
+        template = pipeline_template(root)
+        if template is None:
+            add("F5", "C14", "流程文件", [], [], "看不出类别（plugin / npm / site），请告诉我")
+        else:
+            content = "# 改这个文件算 T4，由人审后合并\nextends: %s\n" % template
+            rel = write("pipeline.patch", unified_patch(".github/autopr/pipeline.yml", None, content))
+            add("F5", "C14", "流程文件", [rel],
+                ["git apply %s   # 在仓库的新分支上应用，提交后开 PR" % (rel or "<补丁>")],
+                "改这个文件算 T4，由人审后合并")
     return fixes

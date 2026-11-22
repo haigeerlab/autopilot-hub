@@ -6,6 +6,7 @@ steps:
     at: post-merge
     run: "echo 影响面：沙盒演练"
     by: ai
+    auto_when: "release: human"
   - id: prepare
     at: before-release
     run: "echo 备好版本 ${AUTOPILOT_VERSION}"
