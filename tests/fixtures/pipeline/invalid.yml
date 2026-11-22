@@ -1,0 +1,10 @@
+name: invalid
+rollback: yes
+steps:
+  - id: bad
+    at: pre-merge
+    run: "ask: 你"
+    by: ai
+    auto_when: "release: unknown"
+    stop_if: "missing: other"
+    evidence: [other]

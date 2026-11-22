@@ -1,0 +1,5 @@
+name: duplicate
+rollback: false
+steps:
+  - {id: duplicate, at: release, run: echo one, by: ai}
+  - {id: duplicate, at: release, run: echo two, by: ai}

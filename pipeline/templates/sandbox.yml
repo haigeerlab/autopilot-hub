@@ -1,0 +1,33 @@
+name: sandbox
+rollback: true
+steps:
+  - id: impact
+    at: post-merge
+    run: "echo 影响面：沙盒演练"
+    by: ai
+  - id: prepare
+    at: before-release
+    run: "echo 备好版本 ${AUTOPILOT_VERSION}"
+    by: ai
+    auto_when: "release: prepare"
+  - id: confirm
+    at: before-release
+    run: "ask: 你"
+    by: human
+  - id: publish
+    at: release
+    run: "echo 发布 ${AUTOPILOT_VERSION}"
+    by: ai
+    auto_when: "release: auto-confirm"
+    stop_if: "exit != 0"
+    evidence: [stdout]
+  - id: verify
+    at: after-release
+    run: "echo 核验通过"
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: rollback-check
+    at: after-live
+    run: "echo 回滚预案就绪"
+    by: ai
+    auto_when: "release: auto"
