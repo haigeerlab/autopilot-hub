@@ -1,4 +1,5 @@
 name: invalid
+class: sandbox
 rollback: yes
 steps:
   - id: bad

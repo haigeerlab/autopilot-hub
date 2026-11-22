@@ -7,6 +7,7 @@ from risk.tiers import read_repo_config_at
 
 SEGMENTS = ("pre-merge", "post-merge", "before-release", "release", "after-release", "after-live")
 LEVELS = ("human", "prepare", "auto-confirm", "auto")
+CLASSES = ("plugin", "npm", "site", "sandbox")
 BY = ("ai", "human", "external")
 EVIDENCE = ("stdout", "url", "file")
 DEFAULT = Path(__file__).resolve().parent / "templates"
@@ -81,7 +82,7 @@ def _step(data, label, problems, inherited_at=None, placement=False):
 
 
 def _template(name, templates_dir, problems):
-    empty = {"name": name, "rollback": False, "steps": []}
+    empty = {"name": name, "class": None, "rollback": False, "steps": []}
     if (not isinstance(name, str) or not name or name in (".", "..")
             or "/" in name or "\\" in name):
         problems.append("extends 必须是模板文件名（不含路径和 .yml 后缀）")
@@ -98,9 +99,11 @@ def _template(name, templates_dir, problems):
     if not isinstance(data, dict):
         problems.append(f"模板 {name} 必须是映射")
         return empty
-    _unknown(data, ("name", "rollback", "steps"), f"模板 {name}", problems)
+    _unknown(data, ("name", "class", "rollback", "steps"), f"模板 {name}", problems)
     if data.get("name") != name:
         problems.append(f"模板 {name} 的 name 必须与文件名一致")
+    if data.get("class") not in CLASSES:
+        problems.append(f"模板 {name} 的 class 必填且必须是 plugin / npm / site / sandbox")
     if not isinstance(data.get("rollback"), bool):
         problems.append(f"模板 {name} 的 rollback 必须是布尔值")
     if "steps" not in data:
@@ -117,7 +120,7 @@ def _template(name, templates_dir, problems):
         if item["at"] == "pre-merge":
             problems.append(f"{label} 不允许位于 pre-merge，合并前步骤只能由仓库 add")
         steps.append(item)
-    return {"name": name, "rollback": data.get("rollback"), "steps": steps}
+    return {"name": name, "class": data.get("class"), "rollback": data.get("rollback"), "steps": steps}
 
 
 def load_template(name, templates_dir=DEFAULT):
@@ -191,7 +194,7 @@ def resolve(repo_config, templates_dir=DEFAULT):
             steps.insert(position, item)
     if problems:
         raise PipelineError(problems)
-    return {"template": name, "rollback": template["rollback"],
+    return {"template": name, "class": template["class"], "rollback": template["rollback"],
             "steps": [item for segment in SEGMENTS for item in steps if item["at"] == segment]}
 
 

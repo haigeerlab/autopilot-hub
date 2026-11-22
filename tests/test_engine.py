@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,7 +54,8 @@ class FakeWork:
 
 class FakeIO:
     def __init__(self, steps=None):
-        self.pipeline = {"template": "sandbox", "rollback": True,
+        self.repo = REPO
+        self.pipeline = {"template": "sandbox", "class": "sandbox", "rollback": True,
                          "steps": steps if steps is not None else [step()]}
         self.contents = {".github/autopr/takeover.yml": "release: auto\n"}
         self.calls, self.comments, self.ran, self.clones, self.events = [], [], [], [], []
@@ -77,7 +79,7 @@ class FakeIO:
     def api(self, path, method="GET", body=None):
         self.calls.append((method, path, body))
         if method == "GET":
-            if path == "repos/" + REPO:
+            if path == "repos/" + self.repo:
                 return {"default_branch": "main"}
             if "/commits/" in path:
                 return {"sha": self.commit}
@@ -88,7 +90,7 @@ class FakeIO:
             return body
         if method == "POST" and path.endswith("/issues"):
             self.issue = authored(body["body"], number=9, state="open",
-                                  html_url="https://github.com/" + REPO + "/issues/9")
+                                  html_url="https://github.com/" + self.repo + "/issues/9")
             return copy.deepcopy(self.issue)
         if method == "POST" and path.endswith("/comments"):
             self.comments.append(authored(body["body"], id=len(self.comments) + 1))
@@ -127,7 +129,7 @@ class FakeIO:
 def run(io, **kwargs):
     if "resume" not in kwargs:
         kwargs.setdefault("version", "1.2.3")
-    return engine.run(io, REPO, **kwargs)
+    return engine.run(io, io.repo, **kwargs)
 
 
 class ReleaseLevelTest(unittest.TestCase):
@@ -213,7 +215,8 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(record["evidence"]["file"], {"path": "dist/a.zip", "sha256": hashlib.sha256(b"artifact").hexdigest()})
         self.assertIn("<details>", io.comments[0]["body"])
         start = engine.payload(io.issue["body"], "autopilot-release")
-        self.assertEqual(start, {"version": "1.2.3", "commit": COMMIT, "template": "sandbox", "level": "auto",
+        self.assertEqual(start, {"version": "1.2.3", "commit": COMMIT, "template": "sandbox", "level": "auto-confirm",
+                                 "level_raw": "auto", "level_cap_reason": result["level_cap_reason"],
                                  "pipeline_sha256": hashlib.sha256(json.dumps(io.pipeline, sort_keys=True).encode()).hexdigest(),
                                  "steps": ["publish"]})
         opened = next(c[2] for c in io.writes() if c[1].endswith("/issues"))
@@ -282,8 +285,74 @@ class ExecutionTest(unittest.TestCase):
         result = run(io, dry_run=True)
         self.assertEqual((result["code"], result["result"]), (0, "dry-run"))
         self.assertEqual([p["status"] for p in result["plan"]], ["execute", "waiting", "execute"])
-        self.assertEqual(result["level"], "auto")
+        self.assertEqual(result["level"], "auto-confirm")
         self.assertEqual((io.writes(), io.ran, io.clones, io.events), ([], [], [], []))
+
+
+class ReleaseCapIntegrationTest(unittest.TestCase):
+    def test_own_plugin_uses_cap_for_every_decision_and_start_block(self):
+        for raw in ("auto-confirm", "auto"):
+            with self.subTest(raw=raw):
+                io = FakeIO()
+                io.repo = "haigeerlab/delegate-plugin"
+                io.contents[".github/autopr/takeover.yml"] = "release: " + raw
+                io.pipeline = model.resolve({"extends": "sandbox", "remove": ["impact", "confirm"]})
+                result = run(io)
+                self.assertEqual((result["level_raw"], result["level"]), (raw, "prepare"))
+                self.assertEqual(result["result"], "waiting")
+                self.assertIn("当前发布档位 prepare", result["reason"])
+                self.assertEqual([record["id"] for record in io.records()], ["prepare", "publish"])
+                self.assertEqual(len(io.ran), 1)
+                start = engine.payload(io.issue["body"], engine.START)
+                self.assertEqual(start["level_raw"], raw)
+                self.assertEqual(start["level"], "prepare")
+                self.assertEqual(start["level_cap_reason"], result["level_cap_reason"])
+                self.assertIn(result["level_cap_reason"], io.issue["body"])
+                self.assertIn(result["level_cap_reason"], result["notes"])
+
+    def test_eligible_auto_start_records_no_cap_reason(self):
+        io = FakeIO([step(), step("rollback", auto_when="release: auto")])
+        result = run(io)
+        self.assertEqual((result["code"], result["level_raw"], result["level"]), (0, "auto", "auto"))
+        start = engine.payload(io.issue["body"], engine.START)
+        self.assertEqual(start["level_raw"], "auto")
+        self.assertIsNone(start["level_cap_reason"])
+        self.assertEqual(result["notes"], [])
+        self.assertEqual(len(io.ran), 2)
+
+    def test_resume_reloads_current_limits_and_current_raw_level(self):
+        io = FakeIO([step("confirm", run="ask: 你", by="human"), step()])
+        self.assertEqual(run(io)["result"], "waiting")
+        policy = {"schema": "autopilot.release-limits/v1", "pipeline_own": [REPO],
+                  "repo_caps": {}, "sandbox_repos": [REPO]}
+        io.contents[".github/autopr/takeover.yml"] = "release: auto-confirm"
+        with mock.patch.object(engine, "load_limits", return_value=policy):
+            result = run(io, resume=9, confirm="确认完成")
+        self.assertEqual((result["level_raw"], result["level"]), ("auto-confirm", "prepare"))
+        self.assertEqual(result["result"], "waiting")
+        self.assertIn("当前发布档位 prepare", result["reason"])
+        self.assertIn(result["level_cap_reason"], result["notes"])
+        self.assertEqual(io.ran, [])
+
+    def test_resume_waiting_without_confirmation_also_reports_current_cap(self):
+        io = FakeIO([step(run="ask: 你", by="human")])
+        run(io)
+        io.calls.clear()
+        with mock.patch.object(engine, "load_limits", return_value=None):
+            result = run(io, resume=9)
+        self.assertEqual(result["level"], "prepare")
+        self.assertIn("release-limits.json", "".join(result["notes"]))
+        self.assertEqual(io.writes(), [])
+
+    def test_stopped_retry_is_rechecked_against_current_cap(self):
+        io = FakeIO()
+        io.command_result["exit"] = 2
+        self.assertEqual(run(io)["result"], "stopped")
+        with mock.patch.object(engine, "load_limits", return_value=None):
+            result = run(io, resume=9)
+        self.assertEqual(result["result"], "waiting")
+        self.assertIn("当前发布档位 prepare", result["reason"])
+        self.assertEqual(len(io.ran), 1)
 
 
 class ResumeTest(unittest.TestCase):
@@ -492,11 +561,23 @@ class CLIIntegrationTest(unittest.TestCase):
         code, output, errors, mint, revoke = self.invoke(["--version", "1.2.3", "--dry-run"],
                 FakeIO([step(), step("ask", run="ask: 你", by="human")]))
         self.assertEqual(code, 0, errors)
-        self.assertIn("发布档位：auto", output)
+        self.assertIn("原始发布档位：auto", output)
+        self.assertIn("实际发布档位：auto-confirm", output)
+        self.assertIn("缺少 rollback", output)
         self.assertIn("publish：会执行", output)
         self.assertIn("ask：会停下等人（等 你 确认）", output)
         mint.assert_called_once_with(REPO, {"contents": "read", "issues": "read"})
         revoke.assert_called_once_with("installation-token")
+
+    def test_cli_dry_run_uses_prepare_when_limits_are_unreadable(self):
+        with mock.patch.object(engine, "load_limits", return_value=None):
+            code, output, errors, mint, revoke = self.invoke(["--version", "1.2.3", "--dry-run"])
+        self.assertEqual(code, 0, errors)
+        self.assertIn("原始发布档位：auto", output)
+        self.assertIn("实际发布档位：prepare", output)
+        self.assertIn("release-limits.json 不存在或读不懂", output)
+        self.assertIn("publish：会停下等人（当前发布档位 prepare", output)
+        revoke.assert_called_once()
 
     def test_cli_waiting_prints_link_and_resume_example(self):
         code, output, errors, mint, revoke = self.invoke(["--version", "1.2.3"],
