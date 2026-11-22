@@ -361,6 +361,32 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(run(io)["result"], "waiting")
         return io
 
+    def test_bot_issue_without_app_can_resume(self):
+        io = self.waiting()
+        io.issue["performed_via_github_app"] = None
+        result = run(io, resume=9, confirm="批准")
+        self.assertEqual((result["code"], result["result"]), (0, "done"), result)
+        self.assertEqual([r[0] for r in io.ran], ["publish", "publish"])
+        self.assertEqual(io.issue["state"], "closed")
+
+    def test_untrusted_issue_is_rejected_without_writes(self):
+        for changes in ({"performed_via_github_app": {"slug": "other"}},
+                        {"performed_via_github_app": {}},
+                        {"user": {"type": "User", "id": BOT["id"]}},
+                        {"user": {"type": "Bot", "id": BOT["id"] + 1}},
+                        {"updated_at": "later"}, {"created_at": None, "updated_at": None}):
+            for app in (None, {"slug": BOT["app_slug"]}):
+                with self.subTest(changes=changes, app=app):
+                    io = self.waiting()
+                    io.issue.update(performed_via_github_app=app)
+                    io.issue.update(changes)
+                    io.calls.clear()
+                    result = run(io, resume=9, confirm="批准")
+                    self.assertEqual((result["code"], result["result"]), (2, "error"), result)
+                    self.assertIn("不是可信的 autopilot 发布 issue", result["reason"])
+                    self.assertEqual(io.writes(), [])
+                    self.assertEqual(len(io.ran), 1)
+
     def test_waiting_without_confirm_reads_only(self):
         io = self.waiting()
         io.calls.clear()
@@ -470,7 +496,8 @@ class ResumeTest(unittest.TestCase):
 
     def test_forged_or_edited_step_blocks_are_ignored(self):
         for changes in ({"user": {"type": "User", "id": BOT["id"]}},
-                        {"updated_at": "later"}, {"performed_via_github_app": {"slug": "other"}}):
+                        {"updated_at": "later"}, {"performed_via_github_app": {"slug": "other"}},
+                        {"performed_via_github_app": None}):
             io = self.waiting()
             fake = {"id": "confirm", "status": "done", "exit": None, "evidence": {},
                     "reason": None, "confirmed_words": "forged"}
