@@ -54,6 +54,8 @@ waiting 是按设计等人，stopped 表示要先修好再重试。确认 waitin
 
 需要执行时才创建一次性克隆，复用 `Work` 的认证与 fetch 方式，抓取默认分支和开始时记录的提交，随后 detach 到该提交。同一次调用的后续步骤共用该克隆；续跑另建克隆，仍从开始提交执行。
 
+发布克隆另设不含凭据的 `origin`（`https://github.com/<repo>`），配置基础分支的 fetch refspec 并抓取到 `refs/remotes/origin/<base_ref>`，保留 `refs/remotes/base`，同时抓取 `+refs/tags/*:refs/tags/*`；检出仍固定在开始提交、不建本地分支，步骤不继承 hub 的 Git 认证，发版准备只做本地提交。
+
 命令固定为 `['/bin/sh', '-c', run]`，cwd 是克隆根目录，stdin 为 `DEVNULL`，stdout 和 stderr 合并捕获。环境为当前环境删除 `GH_TOKEN`、`GITHUB_TOKEN`、`GH_ENTERPRISE_TOKEN`，再设置：
 
 - `AUTOPILOT_VERSION`：开始块中的版本。
