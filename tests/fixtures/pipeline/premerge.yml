@@ -1,0 +1,7 @@
+name: premerge
+rollback: false
+steps:
+  - id: lint
+    at: pre-merge
+    run: echo lint
+    by: ai

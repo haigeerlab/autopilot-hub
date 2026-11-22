@@ -18,6 +18,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 10**：本机编排 `orchestrator/cli.py run --repo <owner/name> --pr <n> [--dry-run]`：以机器人身份发接管评论、在一次性克隆里跑检查、调 delegate 审查（第 2 轮对照第 1 轮复审）、发证据、用同一份准入代码重算，然后按审过的 head SHA 合并并读回。规格见 [docs/spec/slice-10.md](docs/spec/slice-10.md)。
 - **切片 11**：收窄与计数。本机编排遇到撤回、主干变红、回归引起的降级 issue 时，在 spec-guard 项目里用 spec-guard 的 `narrow` 开一个收窄 PR（T4，你合并），其他仓库留言提醒；降级 issue 只有仓库管理员本人关闭才算解除，否则自动重开；`orchestrator/cli.py stats` 给出自动合并、被撤回或返修、因 Codex 不可用停下三个数。规格见 [docs/spec/slice-11.md](docs/spec/slice-11.md)。
 - **切片 12**：模块产物改档。spec-guard 模块 PR 里改的本模块 `spec/<模块>.md`、`tasks/<模块>/**`，由本机编排在 head 上用 spec-guard 的 `map_view.py` 核对批准仍有效、写进证据后，从 T4 降为 T2；能力图、别的模块的产物和 `.agent/**` 永远 T4。规格见 [docs/spec/slice-12.md](docs/spec/slice-12.md)。
+- **切片 13**：流程文件。仓库 `.github/autopr/pipeline.yml` 只写相对 hub 模板的差异，支持追加、定位插入、删除和整步替换；`python3 -B pipeline/cli.py show --repo <本地检出> [--json]` 校验并按段打印合并结果，只展示不执行。规格见 [docs/spec/slice-13.md](docs/spec/slice-13.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
 ## 规则
