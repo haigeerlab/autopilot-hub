@@ -3,7 +3,7 @@
 # Spec：切片 1，准入脚本读取接入结论（只报告）
 
 > 2026-11-19。用户原话：「批准最小切片」（针对 autopr-design 的建议："以 agent-relay 为试点，准入脚本只做一件事：读取接入结论，把信任上限设为 L2，用只报告模式运行，不拦截、不合并；顺带建好中心仓库，并确定 agent 身份"）。
-> 上游：[README.md](README.md)（设计 r4/r5，整体未批准）；repo-readiness 的 Spec `/Users/vilin/Documents/haigeerlab/repo-readiness/docs/spec/SPEC.md`（用户 11-19 已批准），重点是 §3.3 接入结论、§6 防火墙、§11 接口清单。
+> 上游：[README.md](README.md)（设计 r4/r5，整体未批准）；repo-readiness 的 Spec `haigeerlab/repo-readiness` 仓库的 `docs/spec/SPEC.md`（用户 11-19 已批准），重点是 §3.3 接入结论、§6 防火墙、§11 接口清单。
 > 本切片**不依赖**设计稿整体获批，也不受需求拷问后续结论的影响：改名、AI 介入等级等都不改变这里的行为。
 
 ## 1. 目标
