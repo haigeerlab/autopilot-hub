@@ -120,6 +120,8 @@ class Work:
 
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
+        # Steps intentionally have no hub credentials for git push: release preparation
+        # only creates local commits. Authentication stays in git_env for hub Git calls.
         env = dict(_clean_env(), AUTOPILOT_VERSION=version, AUTOPILOT_REPO=repo,
                    AUTOPILOT_RELEASE_ISSUE=str(issue), AUTOPILOT_HUB=HUB)
         try:
@@ -233,6 +235,10 @@ class LocalIO:
         pr = {"head": {"sha": commit}, "base": {"ref": base_ref}}
         with tempfile.TemporaryDirectory(prefix="autopilot-release-") as tmp:
             work = Work(tmp, repo, pr, self.token, None)
+            work.git("remote", "add", "-t", base_ref, "origin", "https://github.com/%s" % repo)
+            work.git("fetch", "-q", "origin",
+                     "+refs/heads/%s:refs/remotes/origin/%s" % (base_ref, base_ref),
+                     "+refs/tags/*:refs/tags/*")
             work.git("checkout", "-q", "--detach", commit)
             yield work
 

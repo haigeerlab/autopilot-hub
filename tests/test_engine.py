@@ -721,7 +721,7 @@ class LocalReleaseIOTest(unittest.TestCase):
             with io.release_checkout(REPO, "main", COMMIT) as work:
                 self.assertIs(work, work_class.return_value)
         self.assertEqual(work_class.call_args.args[2], {"base": {"ref": "main"}, "head": {"sha": COMMIT}})
-        work_class.return_value.git.assert_called_once_with("checkout", "-q", "--detach", COMMIT)
+        work_class.return_value.git.assert_any_call("checkout", "-q", "--detach", COMMIT)
 
     def test_resolve_reads_base_pipeline_and_category_fallback(self):
         from unittest import mock
