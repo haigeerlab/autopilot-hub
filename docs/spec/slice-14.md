@@ -96,9 +96,9 @@ waiting 是按设计等人，stopped 表示要先修好再重试。确认 waitin
 
 ## 续跑与可信记录
 
-issue 必须为 open 的普通 issue，并有合法、可信的开始块，否则退出 `2`。开始块与步骤块都复用 `rest_comment` 和 `admission.decide.trusted`，只认 `bot-identity.json` 中的 App slug、数字 ID、Bot 类型，且正文未编辑的记录。人发的、其他 App 发的、被编辑过的块忽略。
+issue 必须为 open 的普通 issue，并有合法、可信的开始块，否则退出 `2`。开始块使用专门的 issue 判定，只认 `bot-identity.json` 中的数字 ID、Bot 类型，且正文未编辑的记录；GitHub 不在 App 创建的 issue 上返回 `performed_via_github_app`，因此允许其为 null，非 null 时仍必须匹配 App slug。步骤块继续复用 `rest_comment` 和 `admission.decide.trusted`，要求 App slug、数字 ID、Bot 类型匹配且未编辑。人发的、其他 App 发的、被编辑过的块不可信。
 
-REST issue 的 `updated_at` 会随评论或标签变化，不能直接当正文编辑时间。`LocalIO.release_issue` 在时间变化时补读 GraphQL `lastEditedAt`：正文从未编辑则以创建时间送入 `trusted`，正文编辑过则拒绝。读取不到编辑时间就报错，不放宽身份检查。评论仍直接使用 REST 的创建、更新时间校验。
+REST issue 的 `updated_at` 会随评论或标签变化，不能直接当正文编辑时间。`LocalIO.release_issue` 在时间变化时补读 GraphQL `lastEditedAt`：正文从未编辑则以创建时间送入 issue 判定，正文编辑过则拒绝。读取不到编辑时间就报错，不放宽身份检查。评论仍直接使用 REST 的创建、更新时间校验。
 
 机器块必须位于正文或评论末尾，使用 JSON 解码器识别完整对象，允许用户原话包含 `-->` 等字符。输出折叠区中的伪造块不能覆盖真实步骤记录。续跑按流程顺序还原日志，已 done 的步骤跳过。
 

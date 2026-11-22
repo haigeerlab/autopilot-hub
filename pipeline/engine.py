@@ -84,10 +84,21 @@ def pipeline_sha256(pipeline):
     return hashlib.sha256(json.dumps(pipeline, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _trusted_issue(issue, bot):
+    """Posted by the configured bot and never edited; issue timestamps are normalized by release_issue."""
+    user = issue.get("user") or {}
+    created = issue.get("created_at")
+    app = issue.get("performed_via_github_app")
+    # GitHub does not return performed_via_github_app on App-created issues; comments still require it.
+    return (bot is not None and user.get("type") == "Bot" and user.get("id") == bot["id"]
+            and (app is None or app.get("slug") == bot["app_slug"])
+            and bool(created) and issue.get("updated_at") == created)
+
+
 def _start(issue, bot):
     if not isinstance(issue, dict) or issue.get("state") != "open" or "pull_request" in issue:
         raise Stop("issue", "跟踪 issue 不存在、不是 issue 或不是 open 状态")
-    data = payload(issue.get("body") or "", START) if trusted(rest_comment(issue), bot) else None
+    data = payload(issue.get("body") or "", START) if _trusted_issue(issue, bot) else None
     if (not data or any(not isinstance(data.get(k), str) or not data[k]
                         for k in ("version", "commit", "template", "level", "pipeline_sha256"))
             or data["level"] not in LEVELS or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", data["commit"])
