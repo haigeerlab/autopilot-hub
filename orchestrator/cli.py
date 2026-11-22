@@ -1,6 +1,7 @@
 """`autopilot run`: drive one PR with the local orchestrator (slice 10). See orchestrator/flow.py.
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
+    python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --resume 9 [--confirm "..."]
 
@@ -27,7 +28,7 @@ from admission import decide as d
 from checkup import workflow
 from checkup import yamlsub
 from degrade.run import ApiError, NotFound, parse_pages
-from orchestrator import flow, token as tokens
+from orchestrator import batch, flow, token as tokens
 from pipeline import engine, model as pipeline_model
 from risk.tiers import REPO_CONFIGS
 
@@ -66,7 +67,22 @@ def find_project_config():
 
 def find_map_view():
     """spec-guard 0.91+ `hooks/map_view.py` (slice 12 reads each module's review state on the head commit)."""
+    root = os.environ.get("AUTOPILOT_SPEC_GUARD_ROOT")
+    if root:
+        return os.path.join(root, "hooks", "map_view.py")
     return os.environ.get("AUTOPILOT_SPEC_GUARD_MAP") or _newest(SPEC_GUARD_CACHE, (0, 91, 0), "hooks/map_view.py")
+
+
+def find_spec_guard_root():
+    """The batch acceptance contract requires spec-guard 0.92.0 or newer."""
+    return os.environ.get("AUTOPILOT_SPEC_GUARD_ROOT") or _newest(SPEC_GUARD_CACHE, (0, 92, 0), "")
+
+
+def _git_env(token):
+    auth = base64.b64encode(("x-access-token:%s" % token).encode()).decode()
+    return dict(_clean_env(), GIT_CONFIG_COUNT="1", GIT_TERMINAL_PROMPT="0",
+                GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                GIT_CONFIG_VALUE_0="AUTHORIZATION: basic %s" % auth)
 
 
 def _clean_env():
@@ -79,10 +95,7 @@ class Work:
     def __init__(self, root, repo, pr, token, delegate):
         self.root, self.pr, self.delegate = root, pr, delegate
         self.head, self.base_ref = pr["head"]["sha"], pr["base"]["ref"]
-        auth = base64.b64encode(("x-access-token:%s" % token).encode()).decode()
-        self.git_env = dict(_clean_env(), GIT_CONFIG_COUNT="1", GIT_TERMINAL_PROMPT="0",
-                            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
-                            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic %s" % auth)
+        self.git_env = _git_env(token)
         self.git("init", "-q")
         self.git("fetch", "-q", "--no-tags", "https://github.com/%s" % repo,
                  "+refs/heads/%s:refs/remotes/base" % self.base_ref, self.head)
@@ -242,6 +255,138 @@ class LocalIO:
             work.git("checkout", "-q", "--detach", commit)
             yield work
 
+    @staticmethod
+    def _batch_process(args, *, cwd=None, timeout=120, env=None):
+        # Plugin subprocesses receive no hub token or inherited Git authentication.
+        if env is None:
+            env = {k: v for k, v in _clean_env().items() if not k.startswith("GIT_CONFIG_")}
+        return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+
+    def first_stage(self, repo):
+        root = self.checkout_of(repo)
+        if not root:
+            raise ValueError("~/.autopilot/config.json 的 checkouts 没有配置 " + repo)
+        executable = os.environ.get("AUTOPILOT_MODULE_CREW") or "module-crew"
+        result = self._batch_process([executable, "merge", "first-stage", "--json"], cwd=root)
+        if result.returncode != 0:
+            raise ValueError("module-crew first-stage 失败（退出码 %d）：%s" % (
+                result.returncode, (result.stdout + result.stderr).strip()[:300]))
+        return result.stdout
+
+    def batch_pr(self, repo, number, pr=None):
+        """REST PR timestamps change on comments; lastEditedAt identifies actual body edits."""
+        pr = self.api(f"repos/{repo}/pulls/{number}") if pr is None else pr
+        owner, name = repo.split("/", 1)
+        query = ("query($owner:String!,$name:String!,$number:Int!){"
+                 "repository(owner:$owner,name:$name){pullRequest(number:$number){lastEditedAt}}}")
+        result = self.api("graphql", "POST", {"query": query, "variables": {
+            "owner": owner, "name": name, "number": number}})
+        try:
+            edited = result["data"]["repository"]["pullRequest"]["lastEditedAt"]
+        except (KeyError, TypeError) as error:
+            raise ApiError("读不到 batch PR 的正文编辑时间，无法验证来源") from error
+        # A non-null edit is disqualifying even when GitHub timestamps share one second.
+        return dict(pr, updated_at=pr.get("created_at") if edited is None else None)
+
+    def push_batch(self, repo, head, branch):
+        result = self._batch_process(["git", "-C", self.checkout_of(repo), "push", "--force",
+                                      "https://github.com/" + repo, head + ":refs/heads/" + branch],
+                                     timeout=300, env=_git_env(self.token))
+        if result.returncode != 0:
+            raise ValueError("推送 batch 分支失败：" + (result.stdout + result.stderr).strip()[:300])
+
+    @contextlib.contextmanager
+    def acceptance_worktree(self, repo, head):
+        root = self.checkout_of(repo)
+        with tempfile.TemporaryDirectory(prefix="autopilot-acceptance-") as tmp:
+            target = os.path.join(tmp, "checkout")
+            added = False
+            try:
+                result = self._batch_process(["git", "-C", root, "worktree", "add", "--detach", target, head],
+                                             timeout=300)
+                if result.returncode != 0:
+                    raise flow.Stop("acceptance", "建立验收 worktree 失败：" + (result.stdout + result.stderr).strip()[:300])
+                added = True
+                yield target
+            finally:
+                result = self._batch_process(["git", "-C", root, "worktree", "remove", "--force", target], timeout=300)
+                if result.returncode != 0 and added:
+                    raise flow.Stop("acceptance", "清理验收 worktree 失败：" + (result.stdout + result.stderr).strip()[:300])
+
+    def acceptance_map(self, root):
+        plugin = find_spec_guard_root()
+        if not plugin:
+            raise flow.Stop("acceptance", "找不到 spec-guard 0.92.0 以上版本，可设 AUTOPILOT_SPEC_GUARD_ROOT")
+        result = self._batch_process(["python3", "-B", os.path.join(plugin, "hooks", "map_view.py"),
+                                      "--json", "--project", root], cwd=root)
+        try:
+            data = json.loads(result.stdout) if result.returncode == 0 else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("modules"), list):
+            raise flow.Stop("acceptance", "spec-guard map_view 读不了：" + (result.stdout + result.stderr).strip()[:300])
+        return data
+
+    def module_start(self, root, module):
+        result = self._batch_process(["git", "-C", root, "log", "--diff-filter=A", "--format=%H", "--", f"spec/{module}.md"])
+        commits = result.stdout.strip().splitlines()
+        if result.returncode != 0 or not commits:
+            raise flow.Stop("acceptance", "找不到模块 Spec 最初加入的提交，交你核对审查范围")
+        result = self._batch_process(["git", "-C", root, "rev-parse", commits[-1] + "^"])
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", result.stdout.strip()):
+            raise flow.Stop("acceptance", "找不到模块开工前的父提交，交你核对审查范围")
+        return result.stdout.strip()
+
+    @staticmethod
+    def read_bytes(path):
+        return Path(os.path.expanduser(path)).read_bytes()
+
+    def local_evidence(self, repo, head):
+        path = os.path.join(STATE, "evidence", repo.replace("/", "__"), head + ".json")
+        try:
+            return json.loads(self.read_bytes(path))
+        except (OSError, ValueError):
+            return None
+
+    def review_acceptance(self, root, base, head, module, task):
+        if not self.delegate:
+            return {"execution_status": "failed", "review_outcome": None}
+        args = ["bash", self.delegate, "review", "--repo", root, "--base", base, "--head", head,
+                "--spec", f"spec/{module}.md", "--", task]
+        try:
+            return Work._parse(self._batch_process(args, cwd=root, timeout=REVIEW_TIMEOUT))
+        except (OSError, subprocess.TimeoutExpired):
+            return {"execution_status": "failed", "review_outcome": None}
+
+    @staticmethod
+    def save_acceptance_review(repo, module, head, report):
+        path = os.path.join(STATE, "reviews", repo.replace("/", "__"), f"acceptance-{module}-{head[:12]}.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=1)
+        return path
+
+    def mark_acceptance(self, root, module, report):
+        plugin = find_spec_guard_root()
+        if not plugin:
+            raise flow.Stop("acceptance", "找不到 spec-guard 0.92.0 以上版本")
+        result = self._batch_process(["python3", "-B", os.path.join(plugin, "hooks", "review_mark.py"),
+                                      "--project", root, "--module", module, "--target", "acceptance",
+                                      "--state", "codex-approved", "--review", os.path.expanduser(report), "--confirm"], cwd=root)
+        return {"exit": result.returncode, "output": result.stdout + result.stderr}
+
+    def shared_acceptance(self, root, module):
+        result = self._batch_process(["git", "-C", root, "rev-parse", "--git-common-dir"])
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        common = result.stdout.strip()
+        common = common if os.path.isabs(common) else os.path.join(root, common)
+        try:
+            return json.loads(self.read_bytes(os.path.join(common, "spec-guard", "acceptance", module + ".json")))
+        except (OSError, ValueError):
+            return None
+
     def resolve_pipeline(self, repo, ref, notes):
         """Resolve base-branch configuration with the hub's installed templates."""
         text = flow.base_file(self, repo, ".github/autopr/pipeline.yml", ref)
@@ -354,34 +499,47 @@ class LocalIO:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, path)
 
+    @staticmethod
+    def acceptance_paths(root):
+        """Shared Git directory first, then the legacy per-worktree location."""
+        paths = []
+        for args in (("--git-common-dir",), ("--git-path", "spec-guard/acceptance")):
+            r = subprocess.run(["git", "-C", root, "rev-parse"] + list(args),
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            path = r.stdout.strip()
+            path = path if os.path.isabs(path) else os.path.join(root, path)
+            if args == ("--git-common-dir",):
+                path = os.path.join(path, "spec-guard", "acceptance")
+            path = os.path.normpath(path)
+            if path not in paths:
+                paths.append(path)
+        return paths
+
     def find_modules(self, repo, head):
-        """Modules whose final-acceptance record (outside the commit) is bound to `head`, read from the user's
-        checkout: `git rev-parse --git-path spec-guard/acceptance`/*.json with sha == head."""
+        """Read acceptance records in priority order; newer records shadow legacy ones."""
         root = self.checkout_of(repo)
         if not root:
             return []
-        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-path", "spec-guard/acceptance"],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
-        if r.returncode != 0:
-            return []
-        folder = r.stdout.strip()
-        folder = folder if os.path.isabs(folder) else os.path.join(root, folder)
-        found = []
-        try:
-            names = sorted(os.listdir(folder))
-        except OSError:
-            return []
-        for name in names:
-            if not name.endswith(".json"):
-                continue
+        found, seen = set(), set()
+        for folder in self.acceptance_paths(root):
             try:
-                with open(os.path.join(folder, name), encoding="utf-8") as fh:
-                    rec = json.load(fh)
-            except (OSError, ValueError):
+                names = sorted(os.listdir(folder))
+            except OSError:
                 continue
-            if isinstance(rec, dict) and rec.get("sha") == head and isinstance(rec.get("module"), str):
-                found.append(rec["module"])
-        return found
+            for name in names:
+                if not name.endswith(".json") or name in seen:
+                    continue
+                seen.add(name)
+                try:
+                    with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                        rec = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(rec, dict) and rec.get("sha") == head and isinstance(rec.get("module"), str):
+                    found.add(rec["module"])
+        return sorted(found)
 
     @staticmethod
     def checkout_of(repo):
@@ -394,30 +552,28 @@ class LocalIO:
         return os.path.expanduser(path) if isinstance(path, str) and path else None
 
     def acceptance(self, repo, module):
-        """{"record", "report_text"} from `git rev-parse --git-path spec-guard/acceptance/<module>.json` in the
-        user's checkout, or None when there is no record (or no checkout configured)."""
+        """Read the preferred record and its report from the user's configured checkout."""
         root = self.checkout_of(repo)
-        if not root or not re.fullmatch(r"[\w.-]+", module or ""):
+        if not root or not re.fullmatch(r"[\w.-]+", module or "") or module in (".", ".."):
             return None
-        r = subprocess.run(["git", "-C", root, "rev-parse", "--git-path", "spec-guard/acceptance/%s.json" % module],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
-        if r.returncode != 0:
-            return None
-        rec_path = r.stdout.strip()
-        rec_path = rec_path if os.path.isabs(rec_path) else os.path.join(root, rec_path)
-        try:
-            with open(rec_path, encoding="utf-8") as fh:
-                record = json.load(fh)
-        except (OSError, ValueError):
-            return None
-        text = None
-        if isinstance(record, dict) and isinstance(record.get("report"), str):
+        for folder in self.acceptance_paths(root):
+            rec_path = os.path.join(folder, module + ".json")
+            if not os.path.lexists(rec_path):
+                continue
             try:
-                with open(os.path.expanduser(record["report"]), encoding="utf-8") as fh:
-                    text = fh.read()
-            except OSError:
-                text = None
-        return {"record": record if isinstance(record, dict) else {}, "report_text": text}
+                with open(rec_path, encoding="utf-8") as fh:
+                    record = json.load(fh)
+            except (OSError, ValueError):
+                return None
+            text = None
+            if isinstance(record, dict) and isinstance(record.get("report"), str):
+                try:
+                    with open(os.path.expanduser(record["report"]), encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError:
+                    pass
+            return {"record": record if isinstance(record, dict) else {}, "report_text": text}
+        return None
 
     @staticmethod
     def ledger(event):
@@ -436,6 +592,30 @@ class LocalIO:
     @staticmethod
     def now():
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def batch_command(args):
+    try:
+        token = tokens.mint(args.repo, READ if args.dry_run else WRITE)
+    except tokens.TokenError as error:
+        print("autopilot: 换不出机器人令牌：%s" % error, file=sys.stderr)
+        return 2
+    try:
+        result = batch.run(LocalIO(token, find_delegate()), args.repo, dry_run=args.dry_run)
+    except (ApiError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("autopilot: batch 环境或接口校验失败：%s" % error, file=sys.stderr)
+        return 2
+    finally:
+        tokens.revoke(token)
+    stream = sys.stderr if result["code"] == 2 else sys.stdout
+    print("autopilot batch %s：%s" % (args.repo, result["reason"]), file=stream)
+    if result.get("pr") is not None:
+        print("PR：https://github.com/%s/pull/%s" % (args.repo, result["pr"]), file=stream)
+    for step in result.get("plan", []):
+        print("  会执行：" + step, file=stream)
+    for note in result.get("notes", []):
+        print("  说明：" + note, file=stream)
+    return result["code"]
 
 
 def release(args):
@@ -488,6 +668,9 @@ def main(argv=None):
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
+    bat = sub.add_parser("batch", help="推进一个 module-crew 合并第一段模块")
+    bat.add_argument("--repo", required=True, help="owner/name")
+    bat.add_argument("--dry-run", action="store_true", help="只读 first-stage 与 GitHub，不推分支、不开 PR、不验收、不合并")
     st = sub.add_parser("stats", help="the three counts: auto-merged, reverted or reworked, Codex-unavailable stops")
     st.add_argument("--repo", required=True, help="owner/name")
     st.add_argument("--json", action="store_true")
@@ -502,6 +685,8 @@ def main(argv=None):
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", a.repo):
         print("autopilot: --repo 要写成 owner/name", file=sys.stderr)
         return 2
+    if a.cmd == "batch":
+        return batch_command(a)
     if a.cmd == "release":
         return release(a)
     if a.cmd == "stats":
