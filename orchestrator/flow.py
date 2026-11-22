@@ -310,7 +310,8 @@ def check_evidence(repo, head, command, check, ran_at):
 
 def accepted_review(io, repo, module, head):
     """Final acceptance of a spec-guard module, recorded outside the commit
-    (`git rev-parse --git-path spec-guard/acceptance/<module>.json`). Returns (acceptance, report). Raises Stop."""
+    (shared `git-common-dir/spec-guard/acceptance/<module>.json`, then the legacy per-worktree path).
+    Returns (acceptance, report). Raises Stop."""
     found = io.acceptance(repo, module)
     if not found:
         raise Stop("acceptance", f"模块 {module} 还没有最终验收：本机检查证据已写好，等 spec-guard 让 Codex 对照 Spec 验收后再运行")
@@ -343,7 +344,7 @@ def gate_review(report):
     return fp
 
 
-def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None, extra_checks=()):
+def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None, extra_checks=(), queue_check=None):
     checks = [dict(check, cmd=command)] + list(extra_checks)
     payload = {"head_sha": head, "runner": "autopilot-orchestrator",
                "checks": [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in checks],
@@ -354,16 +355,20 @@ def evidence_body(head, command, check, report, rounds, fp, acceptance=None, art
     if artifacts is not None:
         payload["artifacts"] = artifacts
     check_lines = "\n".join(f"- 检查：`{c['cmd']}`，退出码 {c['exit']}（在一次性克隆里由本机编排重新运行）" for c in checks)
+    queue_line = ""
+    if queue_check:
+        queue_line = (f"module-crew 合并队列检查：{queue_check['command']}，{queue_check['result']}，"
+                      f"耗时 {queue_check['seconds']} 秒（额外参考，不替代本机重跑）\n\n")
     tail = "\n\n".join(c["cmd"] + "\n" + "\n".join(c["tail"]) for c in checks)
     return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`）\n\n"
             f"{check_lines}\n"
             f"- 审查：delegate／{report.get('backend')}，第 {rounds} 轮，{report.get('review_outcome')}，"
             f"blocking 0，补丁指纹 `{fp[:16]}`\n\n"
-            f"<details><summary>检查输出最后 {TAIL} 行</summary>\n\n```\n{tail}\n```\n</details>\n\n"
+            + queue_line + f"<details><summary>检查输出最后 {TAIL} 行</summary>\n\n```\n{tail}\n```\n</details>\n\n"
             + block("autopilot-evidence", payload) + "\n")
 
 
-def merge_method(repo_info):
+def default_merge_method(repo_info):
     if repo_info.get("allow_squash_merge"):
         return "squash"
     if repo_info.get("allow_merge_commit"):
@@ -371,9 +376,10 @@ def merge_method(repo_info):
     return "rebase"
 
 
-def run(io, repo, number, *, dry_run=False):
+def run(io, repo, number, *, dry_run=False, merge_method=None):
     """Returns {"result": "merged" | "stopped", "step", "reason", "notes", "head_sha"}."""
     notes, pr = [], None
+    queue_check = None
     bot = io.bot_identity()
 
     def say(text):
@@ -385,6 +391,18 @@ def run(io, repo, number, *, dry_run=False):
             raise Stop("identity", "hub 没配机器人身份（bot-identity.json），不能以机器人身份做任何事")
         pr = io.api(f"repos/{repo}/pulls/{number}")
         head = pr["head"]["sha"]
+        extra = getattr(io, "extra_evidence", None)
+        if extra is not None:
+            from orchestrator.batch import batch_payload
+            pr = io.batch_pr(repo, number, pr=pr)
+            source = batch_payload(pr, bot)
+            if not source or any(source.get(k) != extra.get(k) for k in ("module", "mergeCommit", "approval")):
+                raise Stop("batch", "batch PR 来源、正文或提交已变化，交你核对")
+            check_info = extra.get("check")
+            if (isinstance(check_info, dict) and isinstance(check_info.get("command"), str)
+                    and isinstance(check_info.get("result"), str)
+                    and type(check_info.get("seconds")) in (int, float)):
+                queue_check = check_info
         if pr.get("state") != "open" or pr.get("draft"):
             raise Stop("pr", "PR 不是打开状态，或还是草稿")
         if (pr["head"].get("repo") or {}).get("full_name") != repo:
@@ -477,14 +495,17 @@ def run(io, repo, number, *, dry_run=False):
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
                     "notes": notes, "head_sha": head}
         say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts,
-                          extra_checks=evidence["checks"][1:]))
+                          extra_checks=evidence["checks"][1:], queue_check=queue_check))
 
         decision = evaluate(io, repo, pr, bot)
         if not decision["auto_merge"]:
             raise Stop("admission", decision["headline"])
 
         repo_info = io.api(f"repos/{repo}")
-        io.api(f"repos/{repo}/pulls/{number}/merge", "PUT", {"sha": head, "merge_method": merge_method(repo_info)})
+        if merge_method == "merge" and not repo_info.get("allow_merge_commit"):
+            raise Stop("merge", "仓库不允许 merge commit，module-crew 的合并是叠起来的，不能压平或变基，交你在仓库设置里打开 Allow merge commits")
+        method = default_merge_method(repo_info) if merge_method is None else merge_method
+        io.api(f"repos/{repo}/pulls/{number}/merge", "PUT", {"sha": head, "merge_method": method})
         after = io.api(f"repos/{repo}/pulls/{number}")
         if not after.get("merged") or not after.get("merge_commit_sha"):
             raise Stop("readback", "已请求合并，但读回 PR 没有显示已合并")

@@ -119,7 +119,7 @@ class FakeIO:
         if path.startswith(f"repos/{REPO}/issues?labels=autopilot:degrade"):
             return self.degrade
         if path == f"repos/{REPO}":
-            return {"allow_squash_merge": True}
+            return {"allow_squash_merge": True, "allow_merge_commit": True}
         raise AssertionError(f"unexpected GET {path}")
 
     def api_optional(self, path):
@@ -172,6 +172,13 @@ def run(io, **kw):
 
 
 class HappyPathTest(unittest.TestCase):
+    def test_explicit_merge_preserves_commit_history(self):
+        io = FakeIO()
+        res = run(io, merge_method="merge")
+        self.assertEqual(res["result"], "merged", res)
+        self.assertEqual(io.merge_calls(), [("PUT", f"repos/{REPO}/pulls/7/merge",
+                                            {"sha": HEAD, "merge_method": "merge"})])
+
     def test_merges_the_reviewed_head(self):
         io = FakeIO()
         res = run(io)
@@ -217,6 +224,17 @@ class StopTest(unittest.TestCase):
             self.assertIn(text, res["reason"])
         self.assertEqual(io.merge_calls(), [])
         return res
+
+    def test_explicit_merge_stops_when_repository_disallows_merge_commits(self):
+        io = FakeIO()
+        original = io.api
+        def api(path, method="GET", body=None):
+            if path == f"repos/{REPO}":
+                return {"allow_squash_merge": True, "allow_merge_commit": False}
+            return original(path, method, body)
+        io.api = api
+        res = self.assertStops(io, "merge", merge_method="merge")
+        self.assertEqual(res["reason"], "仓库不允许 merge commit，module-crew 的合并是叠起来的，不能压平或变基，交你在仓库设置里打开 Allow merge commits")
 
     def test_no_bot_identity(self):
         io = FakeIO(bot=None)
