@@ -1,0 +1,52 @@
+name: npm
+class: npm
+rollback: false
+steps:
+  - id: version-branch
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_branch'
+    by: ai
+    auto_when: "release: prepare"
+  - id: candidate-check
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_check'
+    by: ai
+    auto_when: "release: prepare"
+  - id: pack-smoke
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" pack_smoke'
+    by: ai
+    auto_when: "release: prepare"
+  - id: preflight
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" preflight'
+    by: ai
+    auto_when: "release: prepare"
+  - id: stage-publish
+    at: release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" stage_publish'
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: approve-stage
+    at: release
+    run: "npm stage approve（每个版本都要 2FA，只能你本人做）"
+    by: human
+  - id: readback
+    at: after-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" readback'
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: fresh-install
+    at: after-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" fresh_install'
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: move-latest
+    at: after-release
+    run: "ask: 你（移动 latest）"
+    by: human
+  - id: wrap-up
+    at: after-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_wrap_up'
+    by: ai
+    auto_when: "release: auto-confirm"

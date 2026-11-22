@@ -1,4 +1,4 @@
-"""Unit tests for slice-5 checkup (docs/spec/slice-5.md): C1-C13, the three fixes, exit codes, conclusion.
+"""Checkup tests: C1-C14, draft fixes, exit codes and the takeover conclusion.
 
 Run: python3 -B -m unittest discover -s tests -v
 No test touches the network: GitHub answers come from an injected fake transport.
@@ -304,6 +304,69 @@ class C13RiskPathsTest(unittest.TestCase):
             self.assertEqual(data["schema"], "autopilot.risk-paths/v1")
 
 
+class C14PipelineTest(unittest.TestCase):
+    def test_missing_and_valid_pipeline(self):
+        root = make_repo(self, {"a": "x"})
+        self.assertEqual(status(root, "C14"), "missing")
+        for template in ("plugin", "npm", "site", "sandbox"):
+            root = make_repo(self, {".github/autopr/pipeline.yml": "extends: " + template})
+            found = run_checks(root)[0]
+            self.assertEqual(list(found)[-2:], ["C13", "C14"])
+            self.assertEqual(found["C14"]["title"], "流程文件")
+            self.assertEqual(found["C14"]["status"], "ok")
+
+    def test_invalid_pipeline_is_unknown_with_at_most_five_problems(self):
+        cases = (("extends: absent\n", "不存在"), ("extends: [\n", "YAML"), ("", "映射"),
+                 ("extends: sandbox\n" + "".join("wrong%d: true\n" % i for i in range(6)), "wrong0"))
+        for content, detail in cases:
+            with self.subTest(content=content):
+                root = make_repo(self, {".github/autopr/pipeline.yml": content})
+                finding = run_checks(root)[0]["C14"]
+                self.assertEqual(finding["status"], "unknown")
+                self.assertIn(detail, finding["detail"])
+                self.assertNotIn("wrong5", finding["detail"])
+                if "wrong0" in content:
+                    self.assertIn("wrong4", finding["detail"])
+
+    def test_f5_patch_uses_risk_category_then_nonprivate_package(self):
+        import tempfile
+        cases = (({".github/autopr/risk-tiers.yml": "extends: plugin"}, "plugin"),
+                 ({".github/autopr/risk-tiers.json": '{"extends":"frontend"}',
+                   "package.json": '{"private":false}'}, "site"),
+                 ({"package.json": '{}'}, "npm"),
+                 ({"package.json": '{"private":false}'}, "npm"),
+                 ({".github/autopr/risk-tiers.yml": "extends: content", "package.json": '{}'}, "npm"))
+        for files, template in cases:
+            with self.subTest(template=template, files=files), tempfile.TemporaryDirectory() as out:
+                root = make_repo(self, files)
+                fixes = remedy.build_fixes(root, NAME, "main", [{"id": "C14", "status": "missing"}], None, out)
+                self.assertEqual(len(fixes), 1)
+                fix = fixes[0]
+                self.assertEqual((fix["id"], fix["finding"], fix["files"]), ("F5", "C14", ["pipeline.patch"]))
+                self.assertIn("T4", fix["note"])
+                path = os.path.join(root, ".github", "autopr", "pipeline.yml")
+                self.assertFalse(os.path.exists(path))
+                patch = os.path.join(out, "pipeline.patch")
+                subprocess.run(["git", "-C", root, "apply", "--check", patch], check=True)
+                subprocess.run(["git", "-C", root, "apply", patch], check=True)
+                self.assertEqual(read(path), "# 改这个文件算 T4，由人审后合并\nextends: %s\n" % template)
+                self.assertEqual(status(root, "C14"), "ok")
+
+    def test_unknown_category_generates_only_a_note_and_existing_file_is_not_replaced(self):
+        import tempfile
+        for files in ({"a": "x"}, {"package.json": '{"private":true}'}, {"package.json": "[]"},
+                      {"package.json": "{oops"}, {".github/autopr/risk-tiers.yml": "["}):
+            with self.subTest(files=files), tempfile.TemporaryDirectory() as out:
+                root = make_repo(self, files)
+                fix = remedy.build_fixes(root, NAME, "main", [{"id": "C14", "status": "missing"}], None, out)[0]
+                self.assertEqual((fix["id"], fix["files"]), ("F5", []))
+                self.assertEqual(fix["note"], "看不出类别（plugin / npm / site），请告诉我")
+                self.assertEqual(os.listdir(out), [])
+                for state in ("ok", "unknown"):
+                    self.assertEqual(remedy.build_fixes(root, NAME, "main", [{"id": "C14", "status": state}],
+                                                       None, out), [])
+
+
 class FixesTest(unittest.TestCase):
     def build(self, root, out, extra=None):
         found = run_checks(root, {"repos/o/n": repo_meta(), **(extra or {})})[0]
@@ -332,7 +395,7 @@ class FixesTest(unittest.TestCase):
     def test_no_files_without_out(self):
         root = make_repo(self, {".claude-plugin/plugin.json": "{}"})
         fixes = self.build(root, None)
-        self.assertEqual({f["id"] for f in fixes}, {"F1", "F2", "F3", "F4"})
+        self.assertEqual({f["id"] for f in fixes}, {"F1", "F2", "F3", "F4", "F5"})
         self.assertTrue(all(f["files"] == [] for f in fixes))
         self.assertFalse(os.path.exists(os.path.join(root, ".github/autopr/risk-tiers.json")))
 
@@ -378,6 +441,7 @@ class FixesTest(unittest.TestCase):
 
     def test_nothing_generated_when_everything_is_fine(self):
         root = make_repo(self, {**GOOD, "CLAUDE.md": "## autopilot\n", ".github/autopr/risk-tiers.json": "{}\n",
+                                ".github/autopr/pipeline.yml": "extends: sandbox\n",
                                 ".github/autopr/risk-paths.json": tiers.risk_paths_text(tiers.load_templates(), {})})
         out = self.out_dir()
         found = run_checks(root, good_github())[0]
@@ -444,12 +508,12 @@ class CliTest(unittest.TestCase):
             code, out, _ = self.go(root, "--json", "--out", out_dir, transport=FakeTransport(good_github()))
             self.assertEqual(code, 0)
             data = json.loads(out)
-            self.assertEqual([f["id"] for f in data["findings"]], ["C%d" % i for i in range(1, 14)])
+            self.assertEqual([f["id"] for f in data["findings"]], ["C%d" % i for i in range(1, 15)])
             for f in data["findings"]:
                 self.assertIn(f["status"], ("ok", "missing", "unknown"))
             self.assertEqual(data["repo"], NAME)
             self.assertEqual(data["conclusion"]["level"], "只接管 Plan")
-            self.assertEqual({f["id"] for f in data["fixes"]}, {"F2", "F3", "F4"})
+            self.assertEqual({f["id"] for f in data["fixes"]}, {"F2", "F3", "F4", "F5"})
             self.assertTrue(os.path.exists(os.path.join(out_dir, "instructions-claude-md.patch")))
             self.assertTrue(os.path.exists(os.path.join(out_dir, "risk-paths.patch")))
 
@@ -476,7 +540,7 @@ class CliTest(unittest.TestCase):
 
 class ConclusionTest(unittest.TestCase):
     def fs(self, **st):
-        base = {"C%d" % i: "ok" for i in range(1, 14)}
+        base = {"C%d" % i: "ok" for i in range(1, 15)}
         base.update(st)
         return [{"id": k, "status": v, "skipped": False} for k, v in sorted(base.items(), key=lambda kv: int(kv[0][1:]))]
 
@@ -501,6 +565,12 @@ class ConclusionTest(unittest.TestCase):
         self.assertEqual((c["level"], c["missing"]), ("只接管 Plan", ["C2"]))
         c = checks.conclusion(self.fs(C1="unknown"), False)
         self.assertIn("C1（判不了）", c["text"])
+
+    def test_c14_is_only_a_reminder(self):
+        for state in ("missing", "unknown"):
+            result = checks.conclusion(self.fs(C14=state), True)
+            self.assertEqual((result["level"], result["missing"], result["reminders"]),
+                             ("接管到合并", [], ["C14"]))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,54 @@
+name: plugin
+class: plugin
+rollback: false
+steps:
+  - id: impact
+    at: post-merge
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" impact'
+    by: ai
+    auto_when: "release: human"
+  - id: full-test
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" check'
+    by: ai
+    auto_when: "release: prepare"
+    stop_if: "exit != 0"
+  - id: prepare
+    at: before-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_prepare'
+    by: ai
+    auto_when: "release: prepare"
+  - id: approve
+    at: before-release
+    run: "echo 档位允许自动发版"
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: tag-and-release
+    at: release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_publish'
+    by: ai
+    auto_when: "release: auto-confirm"
+    evidence: [stdout, url]
+  - id: install-local
+    at: release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" install_local'
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: verify-install
+    at: after-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" verify_install'
+    by: ai
+    auto_when: "release: auto-confirm"
+  - id: restart-codex
+    at: after-release
+    run: "ask: 你（⌘Q 重开 ChatGPT／Codex，让新插件版本生效）"
+    by: human
+  - id: reload-claude
+    at: after-release
+    run: "在每个在用的 Claude Code 会话里打 /reload-plugins（不必 /clear）"
+    by: human
+  - id: record
+    at: after-release
+    run: 'python3 -B "$AUTOPILOT_HUB/pipeline/entry.py" release_record'
+    by: ai
+    auto_when: "release: auto-confirm"

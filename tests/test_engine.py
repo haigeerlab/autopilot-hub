@@ -636,7 +636,7 @@ class LocalReleaseIOTest(unittest.TestCase):
         work = cli.Work.__new__(cli.Work)
         work.root = "/fake/clone"
         environment = {"PATH": "/bin", "HOME": "/home/test", "GH_TOKEN": "secret", "GITHUB_TOKEN": "secret",
-                       "GH_ENTERPRISE_TOKEN": "secret", "CUSTOM": "kept"}
+                       "GH_ENTERPRISE_TOKEN": "secret", "CUSTOM": "kept", "AUTOPILOT_HUB": "/wrong/hub"}
         completed = subprocess.CompletedProcess([], 0, "output\n", None)
         with mock.patch.dict(os.environ, environment, clear=True), \
                 mock.patch.object(cli.subprocess, "run", return_value=completed) as process:
@@ -647,7 +647,8 @@ class LocalReleaseIOTest(unittest.TestCase):
         self.assertEqual(options["cwd"], "/fake/clone")
         self.assertEqual(options["env"], {"PATH": "/bin", "HOME": "/home/test", "CUSTOM": "kept",
                                           "AUTOPILOT_VERSION": "1.2.3", "AUTOPILOT_REPO": REPO,
-                                          "AUTOPILOT_RELEASE_ISSUE": "9"})
+                                          "AUTOPILOT_RELEASE_ISSUE": "9", "AUTOPILOT_HUB": cli.HUB})
+        self.assertTrue(os.path.isabs(options["env"]["AUTOPILOT_HUB"]))
         self.assertEqual(options["stdin"], subprocess.DEVNULL)
         self.assertEqual(options["stderr"], subprocess.STDOUT)
         self.assertEqual(options["timeout"], 1800)
