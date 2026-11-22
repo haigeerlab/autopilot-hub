@@ -29,7 +29,7 @@ ALLOW = "autopilot" + "-allow"
 NOQA = "# no" + "qa"
 
 
-def waiver(rule, until="2027-01-31", who="vilin", token=ALLOW, reason="历史遗留"):
+def waiver(rule, until="2027-01-31", who="reviewer", token=ALLOW, reason="历史遗留"):
     return f"# {token} {rule}: {reason} until {until} approved-by {who}"
 
 
