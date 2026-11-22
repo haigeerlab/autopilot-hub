@@ -235,11 +235,11 @@ class CloseCheckTest(unittest.TestCase):
 
 
 class RevertLabelTest(unittest.TestCase):
-    def test_revert_labels_the_reverted_pr(self):
+    def test_revert_does_not_call_issue_labels(self):
         api = FakeApi(pulls_of(REVERTED, [AUTHORED]))
         r.run("push", push_event(revert_message()), api)
-        labels = [c for c in api.calls if c[0] == "POST" and c[1] == f"repos/{REPO}/issues/7/labels"]
-        self.assertEqual(labels[0][2], {"labels": ["autopilot:reverted"]})
+        labels = [c for c in api.calls if "/issues/" in c[1] and c[1].endswith("/labels")]
+        self.assertEqual(labels, [])
 
 
 class IdempotencyAndErrorsTest(unittest.TestCase):

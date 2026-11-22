@@ -202,8 +202,6 @@ class DegradeRevertCorrectionTest(unittest.TestCase):
                 return [self.PR]
             if method == "GET" and "labels=autopilot:degrade" in path:
                 return []
-            if method == "POST" and path.endswith(f"issues/{self.PR['number']}/labels"):
-                return []  # slice 11: the reverted PR gets autopilot:reverted
             return inner(path, method, body)
         api.call = call
         return api, call

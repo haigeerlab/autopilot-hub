@@ -13,8 +13,8 @@ Triggers (all scoped to the whole repo, tier "*"):
 The same (reason, ref) never opens a second issue while one is open; it gets a comment instead.
 
 Slice 11: closing a degrade issue lifts it only when a repo admin's own account closed it; a bot or anyone
-without admin is undone (reopened with a comment). A reverted autopilot PR gets the `autopilot:reverted` label
-for the counts in `orchestrator/cli.py stats`.
+without admin is undone (reopened with a comment).
+被撤回的次数由 orchestrator stats 从 revert 降级 issue 统计。
 Any API failure raises ApiError before anything is written, so the run turns red instead of guessing.
 """
 import argparse
@@ -30,7 +30,6 @@ if __package__ in (None, ""):
 from admission.decide import DEGRADE_BLOCK  # noqa: E402
 
 AUTHORED = "autopilot:authored"
-REVERTED_LABEL = "autopilot:reverted"
 DEGRADE_LABEL = "autopilot:degrade"
 LABEL_TRIGGERS = {"autopilot:regression": ("regression", "L2"), "autopilot:freeze": ("freeze", "L0")}
 REVERT_TITLE = re.compile(r'\ARevert "')
@@ -129,7 +128,7 @@ def candidates(event_name, event, api, repo, default_branch, notes):
             if pr is None:
                 notes.append(f"{commit['id'][:12]} 撤回了 {reverted[:12]}，它不属于带 {AUTHORED} 的 PR，不降级")
                 continue
-            found.append({"reason": "revert", "level": "L2", "ref": commit["id"], "pr": pr.get("number"),
+            found.append({"reason": "revert", "level": "L2", "ref": commit["id"],
                           "evidence": [pr.get("html_url"), f"https://github.com/{repo}/commit/{commit['id']}"]})
     elif event_name == "workflow_run":
         run = event.get("workflow_run") or {}
@@ -221,8 +220,6 @@ def run(event_name, event, api):
         result["opened"] += 1
         result["actions"].append({"opened": (created or {}).get("html_url"), **c})
         if c["reason"] == "revert":
-            if c.get("pr") is not None:
-                api(f"repos/{repo}/issues/{c['pr']}/labels", "POST", {"labels": [REVERTED_LABEL]})
             record_revert_correction(api, repo, c, notes)
     return result
 
