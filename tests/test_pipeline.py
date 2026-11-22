@@ -32,14 +32,37 @@ class PipelineTest(unittest.TestCase):
     def test_load_template_and_defaults(self):
         template = model.load_template("sandbox")
         self.assertEqual(template["name"], "sandbox")
+        self.assertEqual(template["class"], "sandbox")
         self.assertIs(template["rollback"], True)
         result = self.resolve()
         self.assertEqual(result["template"], "sandbox")
+        self.assertEqual(result["class"], "sandbox")
         self.assertEqual([s["id"] for s in result["steps"]],
-                         ["impact", "prepare", "confirm", "publish", "verify", "rollback-check"])
+                         ["impact", "prepare", "confirm", "publish", "verify", "rollback-check", "rollback"])
         self.assertEqual(result["steps"][0]["evidence"], ["stdout"])
         self.assertIsNone(result["steps"][0]["auto_when"])
         self.assertIsNone(result["steps"][0]["stop_if"])
+        self.assertEqual(result["steps"][-1], dict(step("rollback", at="after-live", run="echo 回滚演练"),
+                                                  auto_when="release: auto", stop_if=None, evidence=["stdout"]))
+
+    def test_template_class_is_required_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "example.yml"
+            for category in ("plugin", "npm", "site", "sandbox", None, "unknown", [], True):
+                content = {"name": "example", "rollback": True, "steps": []}
+                if category is not None:
+                    content["class"] = category
+                path.write_text("\n".join(key + ": " + json.dumps(value)
+                                          for key, value in content.items()), encoding="utf-8")
+                with self.subTest(category=category):
+                    if isinstance(category, str) and category in ("plugin", "npm", "site", "sandbox"):
+                        self.assertEqual(model.resolve({"extends": "example"}, directory)["class"], category)
+                    else:
+                        self.assertIn("class", self.problems({"extends": "example"}, directory))
+
+    def test_repository_cannot_override_template_class_or_rollback(self):
+        for key, value in (("class", "site"), ("rollback", True)):
+            self.assertIn(key, self.problems({"extends": "sandbox", key: value}))
 
     def test_template_validation(self):
         with self.assertRaises(model.PipelineError) as caught:
@@ -77,7 +100,7 @@ class PipelineTest(unittest.TestCase):
 
     def test_replace_can_change_segment(self):
         result = self.resolve(replace=[step("publish", at="after-live")])
-        self.assertEqual([s["id"] for s in result["steps"]][-2:], ["publish", "rollback-check"])
+        self.assertEqual([s["id"] for s in result["steps"]][-3:], ["publish", "rollback-check", "rollback"])
 
     def test_duplicate_ids(self):
         for additions in ([step("impact")], [step("new"), step("new")]):
@@ -168,7 +191,7 @@ class PipelineTest(unittest.TestCase):
         result = self.resolve(replace=[step("publish", at="after-live")],
                               add=[step("before-publish", at="after-live", before="publish")])
         self.assertEqual([s["id"] for s in result["steps"] if s["at"] == "after-live"],
-                         ["before-publish", "publish", "rollback-check"])
+                         ["before-publish", "publish", "rollback-check", "rollback"])
         self.assertIn("不存在", self.problems({"extends": "sandbox", "remove": ["confirm"],
                                                "add": [step(after="confirm")]}))
 

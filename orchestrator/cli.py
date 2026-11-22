@@ -452,7 +452,10 @@ def release(args):
     for note in result["notes"]:
         print("  说明：" + note, file=stream)
     if result["result"] == "dry-run":
-        print("发布档位：" + result["level"])
+        print("原始发布档位：" + result["level_raw"])
+        print("实际发布档位：" + result["level"])
+        if result["level_cap_reason"] is None:
+            print("档位说明：未降档")
         for step in result["plan"]:
             action = "会执行" if step["status"] == "execute" else "会停下等人（%s）" % step["reason"]
             print("  %s：%s" % (step["id"], action))

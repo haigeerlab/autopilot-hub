@@ -1,4 +1,5 @@
 name: sandbox
+class: sandbox
 rollback: true
 steps:
   - id: impact
@@ -29,5 +30,10 @@ steps:
   - id: rollback-check
     at: after-live
     run: "echo 回滚预案就绪"
+    by: ai
+    auto_when: "release: auto"
+  - id: rollback
+    at: after-live
+    run: "echo 回滚演练"
     by: ai
     auto_when: "release: auto"

@@ -1,0 +1,11 @@
+{
+  "schema": "autopilot.release-limits/v1",
+  "pipeline_own": [
+    "haigeerlab/spec-guard-plugin",
+    "haigeerlab/module-crew",
+    "haigeerlab/delegate-plugin",
+    "haigeerlab/agent-relay"
+  ],
+  "repo_caps": {"haigeerlab/kb-plugin": "auto-confirm"},
+  "sandbox_repos": ["haigeerlab/autopilot-sandbox"]
+}

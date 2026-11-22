@@ -1,4 +1,5 @@
 name: duplicate
+class: sandbox
 rollback: false
 steps:
   - {id: duplicate, at: release, run: echo one, by: ai}

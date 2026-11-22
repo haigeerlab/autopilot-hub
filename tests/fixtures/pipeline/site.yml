@@ -1,3 +1,4 @@
 name: site
+class: site
 rollback: false
 steps: []

@@ -1,4 +1,5 @@
 name: premerge
+class: sandbox
 rollback: false
 steps:
   - id: lint

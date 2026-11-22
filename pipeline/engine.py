@@ -1,4 +1,4 @@
-"""Slice-14 release engine. All external I/O is supplied by the caller."""
+"""Release engine with hub-owned caps; remote and execution I/O use the caller."""
 import contextlib
 import hashlib
 import json
@@ -8,6 +8,7 @@ from urllib.parse import quote
 from admission.decide import trusted
 from checkup import yamlsub
 from orchestrator.flow import SG_CAPABILITY_MAP, Stop, base_file, block, read_sg_config, rest_comment
+from pipeline.limits import effective_level, load_limits
 from pipeline.model import LEVELS
 
 START = "autopilot-release"
@@ -159,10 +160,12 @@ def _comment(io, repo, issue, record):
 def run(io, repo, version=None, *, resume=None, confirm=None, dry_run=False):
     """Run or resume a release, returning a printable result with its CLI exit code."""
     notes, issue, url, level = [], resume, None, None
+    level_raw, level_cap_reason = None, None
 
     def outcome(code, result, reason, **extra):
         return dict({"code": code, "result": result, "reason": reason, "notes": notes,
                      "issue": issue, "url": url, "level": level,
+                     "level_raw": level_raw, "level_cap_reason": level_cap_reason,
                      "resume_command": f"python3 -B orchestrator/cli.py release --repo {repo} --resume {issue}"}, **extra)
 
     try:
@@ -191,7 +194,10 @@ def run(io, repo, version=None, *, resume=None, confirm=None, dry_run=False):
             reason = "发布进行中流程文件变了，请重新发起"
             io.api(f"repos/{repo}/issues/{issue}/comments", "POST", {"body": reason})
             return outcome(1, "stopped", reason)
-        level = read_release_level(io, repo, current_commit, notes)
+        level_raw = read_release_level(io, repo, current_commit, notes)
+        level, level_cap_reason = effective_level(repo, level_raw, pipeline, load_limits())
+        if level_cap_reason:
+            notes.append(level_cap_reason)
         if dry_run:
             plan = [{"id": step["id"], "at": step["at"], "status": decision(step, level)[0],
                      "reason": decision(step, level)[1]} for step in steps]
@@ -220,6 +226,7 @@ def run(io, repo, version=None, *, resume=None, confirm=None, dry_run=False):
         else:
             commit, records = current_commit, {}
             start = {"version": version, "commit": commit, "template": pipeline["template"], "level": level,
+                     "level_raw": level_raw, "level_cap_reason": level_cap_reason,
                      "pipeline_sha256": digest, "steps": identifiers}
             if io.api_optional(f"repos/{repo}/labels/autopilot%3Arelease") is None:
                 io.api(f"repos/{repo}/labels", "POST", {"name": "autopilot:release", "color": "0e8a16",
@@ -228,6 +235,7 @@ def run(io, repo, version=None, *, resume=None, confirm=None, dry_run=False):
                 "title": f"autopilot 发布 {repo} v{version}", "labels": ["autopilot:release"],
                 "body": (f"跟踪 {repo} 版本 {version} 的发布：合并后 → 发布前 → 发布 → 发布后 → 上线后。\n"
                          f"开始提交：`{commit}`，模板：{pipeline['template']}，发布档位：{level}。\n"
+                         + (f"档位说明：{level_cap_reason}。\n" if level_cap_reason else "") +
                          "每步在评论里留证据；等人时确认后续跑，出问题时先修好再重试。\n\n" + block(START, start))})
             issue = created["number"]
             url = created.get("html_url") or f"https://github.com/{repo}/issues/{issue}"

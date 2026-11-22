@@ -20,6 +20,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 12**：模块产物改档。spec-guard 模块 PR 里改的本模块 `spec/<模块>.md`、`tasks/<模块>/**`，由本机编排在 head 上用 spec-guard 的 `map_view.py` 核对批准仍有效、写进证据后，从 T4 降为 T2；能力图、别的模块的产物和 `.agent/**` 永远 T4。规格见 [docs/spec/slice-12.md](docs/spec/slice-12.md)。
 - **切片 13**：流程文件。仓库 `.github/autopr/pipeline.yml` 只写相对 hub 模板的差异，支持追加、定位插入、删除和整步替换；`python3 -B pipeline/cli.py show --repo <本地检出> [--json]` 校验并按段打印合并结果，只展示不执行。规格见 [docs/spec/slice-13.md](docs/spec/slice-13.md)。
 - **切片 14**：执行引擎。`orchestrator/cli.py release --repo <owner/name> --version <版本> [--dry-run]` 按流程执行发布五段，以机器人跟踪 issue 逐步留证据，等人确认或失败时停下；`--resume <issue 号> [--confirm "用户原话"]` 从原提交续跑，只认未编辑的机器人记录。规格见 [docs/spec/slice-14.md](docs/spec/slice-14.md)。
+- **切片 15**：发布硬卡。内核按 hub 的 `release-limits.json` 限制实际发布档位：四个流水线自用插件最高 `prepare`，`kb-plugin` 最高 `auto-confirm`；仅 `site` 或沙盒名单内的 `sandbox` 流程在声明回滚并含回滚步骤时可到 `auto`，并叠加仓库明确上限取更严者，其余最高 `auto-confirm`；上限配置读不懂时从严到 `prepare`。新发布、续跑与预演都重算，仅实际降档时说明原因。规格见 [docs/spec/slice-15.md](docs/spec/slice-15.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
 ## 规则
