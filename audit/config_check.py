@@ -103,6 +103,9 @@ def read_pins(root):
 
 
 def check_pins(pins, baseline):
+    if baseline["hub_pin"] is None:  # registered without caller files: they must stay absent until re-registered
+        return [problem("pin-unregistered", "提醒", "%s 是基线之后新加的，钉 %s；请更新基线" % (
+            rel, "、".join(sorted({s[:12] for s in found})) or "（无）")) for rel, found in pins.items() if found is not None]
     out = []
     for rel, found in pins.items():
         if not found:

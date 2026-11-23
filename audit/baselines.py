@@ -3,7 +3,7 @@
 Format (autopilot.audit-baselines/v1):
   {"schema": "autopilot.audit-baselines/v1",
    "repos": {"owner/name": {"since": "YYYY-MM-DD", "approval": "<where the user's words are>",
-                            "hub_pin": "<40 hex>", "takeover": {"project": <value>, "modules": {id: <value>}},
+                            "hub_pin": "<40 hex>" | null (no caller files), "takeover": {"project": <value>, "modules": {id: <value>}},
                             "checkup": {"C1": "ok" | "missing" | "unknown", ...}}}}
 A takeover value is a spec-guard preset ("none", "plan", "merge") or an item object
 ({"spec", "plan", "merge", "release"} for spec-guard projects; {"merge", "release"} for takeover.yml repos).
@@ -45,8 +45,9 @@ def validate(data):
             problems.append("%s：since 必须是 YYYY-MM-DD" % where)
         if not isinstance(item.get("approval"), str) or not item["approval"].strip():
             problems.append("%s：approval 要写明批准原话的出处" % where)
-        if not isinstance(item.get("hub_pin"), str) or not SHA.fullmatch(item["hub_pin"]):
-            problems.append("%s：hub_pin 必须是 40 位提交号" % where)
+        if "hub_pin" not in item or (item["hub_pin"] is not None and not (
+                isinstance(item["hub_pin"], str) and SHA.fullmatch(item["hub_pin"]))):
+            problems.append("%s：hub_pin 必须是 40 位提交号，没接入调用文件的写 null" % where)
         takeover = item.get("takeover")
         if not isinstance(takeover, dict) or not isinstance(takeover.get("modules", {}), dict):
             problems.append("%s：takeover 必须是 {project, modules}" % where)

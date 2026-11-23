@@ -10,11 +10,11 @@
   - 其他仓库读 `takeover.yml` 的 `merge`、`release`。
 
   然后逐项和基线比，比基线宽的一律算"严重"。顺序：spec、plan 为 human < codex；merge 为 human < auto；release 为 human < prepare < auto-confirm < auto。读不懂的也算"严重"。
-- **钉**（M3②）：两个调用文件里所有 `uses:@` 和 `hub_ref`，都要等于基线的 `hub_pin`；文件缺失，或者没有钉 autopilot-hub，都算"提醒"。
+- **钉**（M3②）：两个调用文件里所有 `uses:@` 和 `hub_ref`，都要等于基线的 `hub_pin`；文件缺失，或者没有钉 autopilot-hub，都算"提醒"。没接入调用文件的仓库，基线写 `hub_pin: null`，这时两个调用文件必须仍然不存在；后来加了就报 `pin-unregistered`（提醒），提示更新基线。
 - **体检**（M3③④）：基线里是 ok、现在不是 ok 的，算"提醒"；基线里没登记的检查项不比。
 - **降级**（M3⑤）：本仓库有未关闭的降级 issue，算"提醒"。
 
-基线在 18c 登记了 agent-relay（#194 合并后的样子）和沙盒。
+基线在 18c 登记了 agent-relay（#194 合并后的样子）和沙盒；之后登记了 delegate-plugin（#37，没接入调用文件）。spec-guard-plugin、kb-plugin 也已开"只接管 Plan"，等机器人 App 装上后再登记。
 
 ## 18b：Plan 审批检查
 
