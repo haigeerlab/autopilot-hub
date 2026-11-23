@@ -14,7 +14,7 @@
 - **体检**（M3③④）：基线里是 ok、现在不是 ok 的，算"提醒"；基线里没登记的检查项不比。
 - **降级**（M3⑤）：本仓库有未关闭的降级 issue，算"提醒"。
 
-基线在 18c 登记了 agent-relay（#194 合并后的样子）和沙盒；之后登记了 delegate-plugin（#37，没接入调用文件）。spec-guard-plugin、kb-plugin 也已开"只接管 Plan"，等机器人 App 装上后再登记。
+基线在 18c 登记了 agent-relay（#194 合并后的样子）和沙盒；之后登记了 delegate-plugin（#37，没接入调用文件）。spec-guard-plugin（#482，没接入调用文件）、kb-plugin（#5，钉旧版 3081e7b）在用户加装机器人 App 后登记。
 
 ## 18b：Plan 审批检查
 

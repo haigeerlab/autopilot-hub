@@ -83,6 +83,56 @@
         "C13": "missing",
         "C14": "missing"
       }
+    },
+    "haigeerlab/kb-plugin": {
+      "since": "2026-11-23",
+      "approval": "kb-plugin#5（合并提交 772166b，只接管 Plan），用户原话「kb-plugin 接管档位设为 plan」（ecosystem-lead #22319 转）。钉仍是旧版 3081e7b，按 #22320 推荐升到 713a3d8 后要更新本项",
+      "hub_pin": "3081e7b47fc192b5c2652cc3397937297d7c7f12",
+      "takeover": {
+        "project": "plan",
+        "modules": {}
+      },
+      "checkup": {
+        "C1": "ok",
+        "C2": "unknown",
+        "C3": "unknown",
+        "C4": "ok",
+        "C5": "ok",
+        "C6": "unknown",
+        "C7": "unknown",
+        "C8": "ok",
+        "C9": "ok",
+        "C10": "ok",
+        "C11": "ok",
+        "C12": "ok",
+        "C13": "missing",
+        "C14": "missing"
+      }
+    },
+    "haigeerlab/spec-guard-plugin": {
+      "since": "2026-11-23",
+      "approval": "spec-guard-plugin#482（合并提交 56dded8，只接管 Plan），用户原话「设为只接管 Plan」（ecosystem-lead #22319 转）",
+      "hub_pin": null,
+      "takeover": {
+        "project": "plan",
+        "modules": {}
+      },
+      "checkup": {
+        "C1": "ok",
+        "C2": "unknown",
+        "C3": "unknown",
+        "C4": "ok",
+        "C5": "ok",
+        "C6": "unknown",
+        "C7": "unknown",
+        "C8": "ok",
+        "C9": "ok",
+        "C10": "ok",
+        "C11": "missing",
+        "C12": "missing",
+        "C13": "missing",
+        "C14": "missing"
+      }
     }
   }
 }
