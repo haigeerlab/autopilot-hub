@@ -149,6 +149,19 @@ class PinsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(c.check_pins(c.read_pins(root), baseline())[0]["kind"], "pin-missing")
 
+    def test_not_connected_baseline_accepts_no_callers(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(c.check_pins(c.read_pins(root), baseline(hub_pin=None)), [])
+
+    def test_not_connected_baseline_flags_new_callers(self):
+        with tempfile.TemporaryDirectory() as root:
+            write(root, ".github/workflows/autopilot-admission.yml", caller("admission", PIN, PIN))
+            problems = c.check_pins(c.read_pins(root), baseline(hub_pin=None))
+            self.assertEqual([p["kind"] for p in problems], ["pin-unregistered"])
+
+    def test_null_pin_is_valid_baseline(self):
+        self.assertEqual(b.validate({"schema": b.SCHEMA, "repos": {REPO: baseline(hub_pin=None)}})[REPO]["hub_pin"], None)
+
 
 class CheckupAndDegradeTest(unittest.TestCase):
     def test_regression_only_from_ok(self):

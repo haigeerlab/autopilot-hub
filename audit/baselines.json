@@ -3,7 +3,7 @@
   "repos": {
     "haigeerlab/agent-relay": {
       "since": "2026-11-23",
-      "approval": "agent-relay#194（只接管 Plan），用户原话「同意写入并开 PR」见 PR 正文",
+      "approval": "agent-relay#194（合并提交 9181505，只接管 Plan），用户原话「同意写入并开 PR」见 PR 正文，「同意，体检过了再开」经 agent-relay-owner 转述（ecosystem-lead #22319）",
       "hub_pin": "713a3d81f24d226e5c31c1802c0e7ab912e54812",
       "takeover": {
         "project": "plan",
@@ -54,6 +54,34 @@
         "C12": "missing",
         "C13": "missing",
         "C14": "ok"
+      }
+    },
+    "haigeerlab/delegate-plugin": {
+      "since": "2026-11-23",
+      "approval": "delegate-plugin#37（合并提交 cecad55，只接管 Plan）在 delegate-owner 会话由用户确认；发布档位原话「发布档位设为 auto-confirm」见 #35（ecosystem-lead #22319 转）。auto-confirm 由内核压到 prepare",
+      "hub_pin": null,
+      "takeover": {
+        "project": {
+          "plan": "codex",
+          "release": "auto-confirm"
+        },
+        "modules": {}
+      },
+      "checkup": {
+        "C1": "ok",
+        "C2": "unknown",
+        "C3": "unknown",
+        "C4": "missing",
+        "C5": "missing",
+        "C6": "unknown",
+        "C7": "unknown",
+        "C8": "ok",
+        "C9": "ok",
+        "C10": "ok",
+        "C11": "ok",
+        "C12": "missing",
+        "C13": "missing",
+        "C14": "missing"
       }
     }
   }
