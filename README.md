@@ -22,7 +22,7 @@ haigeerlab 自动维护系统的中心仓库。各仓库共用的准入、合并
 - **切片 14**：执行引擎。`orchestrator/cli.py release --repo <owner/name> --version <版本> [--dry-run]` 按流程执行发布五段，以机器人跟踪 issue 逐步留证据，等人确认或失败时停下；`--resume <issue 号> [--confirm "用户原话"]` 从原提交续跑，只认未编辑的机器人记录。规格见 [docs/spec/slice-14.md](docs/spec/slice-14.md)。
 - **切片 15**：发布硬卡。内核按 hub 的 `release-limits.json` 限制实际发布档位：四个流水线自用插件最高 `prepare`，`kb-plugin` 最高 `auto-confirm`；仅 `site` 或沙盒名单内的 `sandbox` 流程在声明回滚并含回滚步骤时可到 `auto`，并叠加仓库明确上限取更严者，其余最高 `auto-confirm`；上限配置读不懂时从严到 `prepare`。新发布、续跑与预演都重算，仅实际降档时说明原因。规格见 [docs/spec/slice-15.md](docs/spec/slice-15.md)。
 - **切片 16**：模板与体检。提供 plugin、npm、site 发布模板，通过 `pipeline/entry.py` 调用项目 `interface.yml` 登记的命令；保留插件重开与会话加载、npm 2FA 等人工步骤。体检新增 C14 流程校验，缺失时生成 T4 草稿 `pipeline.patch`；合并前在核心检查通过后执行基础分支流程追加的 pre-merge 步骤，结果进入本机和评论证据。首版无条件分支，不含自动回滚步骤。规格见 [docs/spec/slice-16.md](docs/spec/slice-16.md)。
-- **切片 18（进行中）**：合规监测。`audit/baselines.json` 登记每个仓库批准的接管档位、钉和体检状态（改它算 T4）；18a 已能检查接管档位有没有被改宽、钉有没有变、体检有没有退化、有没有挂着的降级。规格见 [docs/spec/slice-18.md](docs/spec/slice-18.md)。
+- **切片 18（进行中）**：合规监测。`audit/baselines.json` 登记每个仓库批准的接管档位、钉和体检状态（改它算 T4）；18a 已能检查接管档位有没有被改宽、钉有没有变、体检有没有退化、有没有挂着的降级。18b 读 spec-guard 的 map_view，检查已开工的模块 Plan 是否真被批过、Codex 批的是否在档位允许之内、重要需求的 Spec 是否由人批。规格见 [docs/spec/slice-18.md](docs/spec/slice-18.md)。
 - **module-crew 合并第一段**：`orchestrator/cli.py batch --repo <owner/name> [--dry-run]` 每次推进一个本地合并模块，由 autopilot 推 batch 分支、开 PR、补验收并按现有准入合并；规格见 [docs/spec/module-crew-batch.md](docs/spec/module-crew-batch.md)。
 - 其余部分都还在设计阶段，设计稿在 plugin-ecosystem 总账的 `research/2026-11-18-自动PR系统设计/`。
 
