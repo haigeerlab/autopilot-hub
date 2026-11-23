@@ -56,6 +56,12 @@ class PlanApprovedTest(unittest.TestCase):
         self.assertEqual(result["problems"], [])
         self.assertTrue(any("判不了" in n for n in result["notes"]))
 
+    def test_many_unmarked_modules_make_one_note(self):
+        result = run(*[module("m%d" % i, plan="none", by_plan=None) for i in range(12)])
+        unjudged = [n for n in result["notes"] if "判不了" in n]
+        self.assertEqual(len(unjudged), 1)
+        self.assertIn("12 个", unjudged[0])
+
 
 class CodexRouteTest(unittest.TestCase):
     def test_codex_approval_not_allowed_by_takeover_is_severe(self):

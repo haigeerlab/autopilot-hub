@@ -21,7 +21,7 @@ def check_plan(view):
     if not isinstance(view, dict) or not isinstance(view.get("modules"), list):
         return {"problems": [problem("map-unavailable", "提醒", "读不到 spec-guard 的 map_view，Plan 审批判不了")],
                 "notes": []}
-    problems, notes = [], [ROUNDS_NOTE]
+    problems, notes, unmarked = [], [ROUNDS_NOTE], []
     for m in view["modules"]:
         mid = m.get("id")
         if not started(m):
@@ -31,7 +31,7 @@ def check_plan(view):
         route = m.get("codexRoute") or {}
         plan = review.get("plan")
         if plan in UNJUDGED:
-            notes.append("模块 %s 的 Plan 没有批准标记，判不了" % mid)
+            unmarked.append(mid)
         elif plan == "revised":
             problems.append(problem("plan-revised", "提醒", "模块 %s 已开工，Plan 批准后又改过，需要重新审" % mid))
         elif plan == "codex-approved" and not by.get("plan"):
@@ -46,4 +46,7 @@ def check_plan(view):
         if reasons and (spec == "codex-approved" or spec in ("pending", "invalid")):
             problems.append(problem("important-not-user", "严重", "模块 %s 是重要需求（%s），已开工，但 Spec 不是你批的（%s）" % (
                 mid, "、".join(reasons), spec)))
+    if unmarked:
+        shown = "、".join(str(m) for m in unmarked[:8]) + ("等" if len(unmarked) > 8 else "")
+        notes.append("%d 个已开工模块的 Plan 没有批准标记（多为用批准标记之前的旧模块），判不了：%s" % (len(unmarked), shown))
     return {"problems": problems, "notes": notes}
