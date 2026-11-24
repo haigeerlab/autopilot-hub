@@ -7,7 +7,7 @@ Codex 进入本仓库时读这份文件。
 
 本仓库是 haigeerlab 自动维护系统 autopilot 的中心仓库：各插件仓库共用的准入、合并硬卡、降级、风险分级、规则检查、体检、发布流程和合规监测都在这里，各仓库按 40 位提交 SHA 引用。开发规范见 [docs/plugin-standard.md](docs/plugin-standard.md)。
 
-- **全部改动都属于 T4**：只开 PR，由用户审阅后合并，永不自动合并。主干要求 `CI` 的两个检查通过。
+- **全部改动都属于 T4**：只开 PR，先问用户可以合并吗；用户在对话里说「合并」后，由会话执行 `gh pr merge --squash --auto`，等主干必需检查 `CI required` 通过后由 GitHub 合并，会话核实已合并、记下合并提交再告诉用户（规范 F3）。永不开「合并：自动」（验证通过不问就合）。
 - **只用 Python 标准库**，兼容 macOS 自带的 `/usr/bin/python3`（3.9）。改完跑两遍测试：
   `python3 -B -m unittest discover -s tests` 和 `/usr/bin/python3 -B -m unittest discover -s tests`。
 - **先写测试再实现**；每个切片的规格写在 `docs/spec/`，README 的「现状」同步一行。
