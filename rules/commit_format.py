@@ -2,12 +2,16 @@
 
 Spec: docs/plugin-standard.md (F1). Only the first line of each commit message counts. Types: feat, fix, docs,
 chore, test, ci, refactor. Chinese is judged like rules/chinese_commit.py (prefix, backticks, URLs and paths do not
-count). Passes: commits with two or more parents, and git's standard `Revert "…"` subject. Release commits get no
-exemption. The PR title/body check stays in chinese_commit.py and is not part of this card.
+count). Passes: commits with two or more parents, git's standard `Revert "…"` subject, and commits whose GitHub
+author login AND PR author login are both exactly `dependabot[bot]`. Release commits get no exemption.
+The PR title/body check stays in chinese_commit.py and is not part of this card.
 Exit codes: 0 pass, 1 violation, 2 bad input.
 
     python3 -B rules/commit_format.py (--input commits.json | --message-file <file>) [--out-md out.md]
-    commits.json: {"commits": [{"message": str, "parents": int}, ...]} (plain strings are read as one parent)
+    commits.json: {"pr_author": str | null, "commits": [{"message": str, "parents": int, "author": str | null}, ...]}
+    pr_author is optional and comes from the PR's .user.login; author is an optional GitHub commit author login.
+    Commit author logins alone can be forged via email and never grant an exemption without pr_author.
+    Plain strings have one parent and no author exemption.
 """
 import argparse
 import json
@@ -45,9 +49,11 @@ def problem(message, parents=1):
     return None
 
 
-def check(commits):
+def check(commits, pr_author=None):
     errors = []
     for c in commits or []:
+        if pr_author == "dependabot[bot]" and not isinstance(c, str) and c.get("author") == "dependabot[bot]":
+            continue
         message, parents = (c, 1) if isinstance(c, str) else (c.get("message"), int(c.get("parents") or 1))
         why = problem(message, parents)
         if why:
@@ -68,10 +74,11 @@ def render(errors):
 def main(argv=None):
     p = argparse.ArgumentParser(description="插件开发规范 F1：提交说明中文加类型前缀")
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--input", help='{"commits": [{"message", "parents"}]} 的 JSON')
+    src.add_argument("--input", help='{"pr_author": "PR 作者账号（可选）", "commits": [{"message", "parents", "author"}]} 的 JSON')
     src.add_argument("--message-file", help="单条提交说明（commit-msg 钩子用）")
     p.add_argument("--out-md")
     a = p.parse_args(argv)
+    pr_author = None
     try:
         if a.input:
             with open(a.input, encoding="utf-8") as fh:
@@ -79,6 +86,7 @@ def main(argv=None):
             commits = data.get("commits") if isinstance(data, dict) else None
             if not isinstance(commits, list):
                 raise ValueError("--input 要有 commits 列表")
+            pr_author = data.get("pr_author")
         else:
             with open(a.message_file, encoding="utf-8") as fh:
                 lines = [x for x in fh.read().splitlines() if not x.startswith("#")]
@@ -86,7 +94,7 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print(f"{RULE}: 输入读不了：{e}", file=sys.stderr)
         return 2
-    errors = check(commits)
+    errors = check(commits, pr_author=pr_author)
     text = render(errors)
     print(text)
     if a.out_md:
