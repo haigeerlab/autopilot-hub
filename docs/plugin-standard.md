@@ -265,12 +265,12 @@
 | A1 本机路径和用户名 | 卡 | `rules/local_paths.py`（PR 新增或改动的行，新文件查全文；本机运行时另查登录名） | 已写，影子运行中（检查 `autopilot/rule/local-paths`，不设为必需） |
 | A2 密钥 | 卡 | `rules/no_secrets.py`（模式清单第 1 版，只放行精确假值；不叫 `secrets.py`，免得作为脚本运行时遮住标准库的同名模块） | 已写，影子运行中（检查 `autopilot/rule/no-secrets`，不设为必需） |
 | A3 LICENSE 统一 MIT | 卡 | 体检新项（LICENSE 存在、MIT、版权行），并接进 PR 检查 | 待写；hub 自己已满足 |
-| B1 版本号一致 | 卡 | `rules/version_consistency.py` | 待写 |
-| B5 标签规则 | 卡 | `rules/release_tag.py`（发版命令调用；推送标签时的 workflow 调用） | 待写 |
+| B1 版本号一致 | 卡 | `rules/version_consistency.py`（PR 改到版本声明时，读 PR head 稀疏检出的清单，只当数据读） | 已写，影子运行中（检查 `autopilot/rule/version-consistency`） |
+| B5 标签规则 | 卡 | `rules/release_tag.py`（读标签所指提交里的版本声明，查附注标签、是否在远端默认分支上；发版命令调用，推送标签的 workflow 调用） | 脚本已写；推送标签的 workflow 模板随下一批 |
 | C1 有 CI 且汇总检查 `CI required` 为必需 | 卡 | 体检新项（`CI` workflow 存在、无路径过滤，主干保护要求 `CI required`）；各仓 CI 模板带汇总任务 | 待写；hub 自己的汇总任务已加 |
 | C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本；插件在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的 git archive 导出副本运行）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 待写 |
 | C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：zizmor（钉版本）高危拦下；顶层 `permissions: {}`；checkout 设 `persist-credentials: false` | 待写；hub 的 `ci.yml` 已满足后两项 |
-| F1 提交说明中文加类型前缀 | 卡 | `rules/chinese_commit.py` | 中文检查已有；类型前缀、合并与 revert 放行待补 |
+| F1 提交说明中文加类型前缀 | 卡 | `rules/commit_format.py`（只看第一行；两个以上父提交和标准 `Revert "…"` 放行；另有 `--message-file` 供 commit-msg 钩子用）。PR 标题和正文仍由 `rules/chinese_commit.py` 查，不算卡 | 已写，影子运行中（检查 `autopilot/rule/commit-format`） |
 | 其余 22 条提醒（含 C9、C10） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
 
 各仓库接入方式：在自己的 `CI` workflow 里加一个调用 hub 卡检查的 job（模板由 hub 提供），并由汇总任务 `CI required` 依赖它；按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。
