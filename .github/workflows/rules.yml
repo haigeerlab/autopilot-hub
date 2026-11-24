@@ -131,11 +131,12 @@ jobs:
             --out-md .rules/out/workflow-audit.md || { [ $? -eq 1 ] && echo failed > .rules/out/workflow-audit.failed || rc=2; }
           # C8, zizmor half: high-severity findings in the changed workflows only (offline, pinned and hash-checked).
           python3 -B .hub/rules/workflow_audit.py --pr-files .rules/files.json --list-changed > .rules/changed-workflows.txt
-          if [ -s .rules/changed-workflows.txt ]; then
+          mapfile -t changed_wf < <(grep -v '^$' .rules/changed-workflows.txt || true)  # skip blank lines (an older hub_ref printed one)
+          if [ "${#changed_wf[@]}" -gt 0 ]; then
             printf '%s\n' "zizmor==${ZIZMOR_VERSION} --hash=sha256:${ZIZMOR_WHEEL_SHA256}" > .rules/zizmor-req.txt
             python3 -m pip install --quiet --user --only-binary=:all: --require-hashes -r .rules/zizmor-req.txt
             zres=0
-            (cd .head-manifests && xargs "$HOME/.local/bin/zizmor" --offline --min-severity high < ../.rules/changed-workflows.txt) \
+            (cd .head-manifests && "$HOME/.local/bin/zizmor" --offline --min-severity high "${changed_wf[@]}") \
               > .rules/zizmor.txt 2>&1 || zres=$?
             { echo "zizmor ${ZIZMOR_VERSION}（只看本次改动的 workflow，只报高危）："; cat .rules/zizmor.txt; } > .rules/out/zizmor.md
             case "${zres}" in
