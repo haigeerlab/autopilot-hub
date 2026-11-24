@@ -7,7 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
-- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.5），附条目与 hub 检查的对应表。
+- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.6），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。
 - `LICENSE`（MIT）、`.gitignore`、`CLAUDE.md`、`AGENTS.md`、`README.en.md`、本文件。
 - 合规监测（切片 18a–18d）：`audit/cli.py`、批准基线、合规周报 issue 与违规 issue、按审查轮次核验 Codex 批准。
@@ -19,6 +19,8 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - 规范卡 C7、C8 的共享检查：`rules/frontmatter.py`（元信息真正解析 YAML）、`rules/workflow_audit.py`（改动的 workflow 最小权限与不留凭证）、`rules.yml` 跑 zizmor 1.32.0；`rules.yml` 新增输入 `mode: report|enforce`。各仓模板 `examples/caller-ci-standard.yml`（含 `CI required`、C7 的 `claude plugin validate --strict`）、`examples/caller-release-tag.yml`（B5）。**需要升钉**。
 
 - 体检报告加规范项（`checkup/standard.py`，编号用「规范」前缀，和体检原有的 C1–C14 区分）：规范A3、规范C1、规范C9、规范C10。
+
+- 影子运行后的修复：hub 的可复用 workflow 与示例调用文件顶层改为 `permissions: {}`、权限移到任务级（范围不变）；降级调用的 `workflow_run` 加 zizmor `dangerous-triggers` 行内忽略并写明原因；新增 0 行的空文件不再判为"没法检查"。**需要升钉**（改到 `.github/workflows/`、`rules/`）。
 
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。

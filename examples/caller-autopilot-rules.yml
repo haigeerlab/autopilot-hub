@@ -11,13 +11,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
 
-permissions:
-  contents: read
-  checks: write
-  pull-requests: read
+# plugin-standard C8: nothing at the top level; each job asks for what it needs.
+permissions: {}
 
 jobs:
   rules:
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
+    # Template only: replace both <HUB_SHA> placeholders with the same 40-char commit SHA.
     uses: haigeerlab/autopilot-hub/.github/workflows/rules.yml@<HUB_SHA>
     with:
       hub_ref: <HUB_SHA>

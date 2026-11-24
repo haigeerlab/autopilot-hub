@@ -18,14 +18,16 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: read
-  actions: read
+# plugin-standard C8: nothing at the top level; each job asks for what it needs.
+permissions: {}
 
 jobs:
   degrade:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
