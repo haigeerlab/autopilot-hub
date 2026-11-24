@@ -6,12 +6,14 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+# plugin-standard C8: nothing at the top level; each job asks for what it needs.
+permissions: {}
 
 jobs:
   test:
     timeout-minutes: 5
+    permissions:
+      contents: read
     # plugin-standard C4: the macOS system Python users actually run (3.9) and a current one.
     # setup-python has no 3.9 build for the current Ubuntu image, so 3.9 is the macOS runner's /usr/bin/python3.
     runs-on: ${{ matrix.os }}
@@ -37,3 +39,26 @@ jobs:
           "$PY" --version
           "$PY" -c 'import sys; assert sys.version_info >= (3, 9), sys.version'
           "$PY" -B -m unittest discover -s tests -v
+      - name: Working tree still clean (plugin-standard C10)
+        run: git diff --exit-code
+
+  # plugin-standard C1: the only required check on main. It runs even when a job fails or is cancelled
+  # (if: always()) and fails unless every job it needs succeeded, so adding or renaming jobs never touches
+  # the branch protection settings. This workflow has no path filter, so the check always reports.
+  ci-required:
+    name: CI required
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Every CI job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$NEEDS" | python3 -c '
+          import json, sys
+          bad = {job: r["result"] for job, r in json.load(sys.stdin).items() if r["result"] != "success"}
+          print(bad or "all CI jobs succeeded")
+          sys.exit(1 if bad else 0)'

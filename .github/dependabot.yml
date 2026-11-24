@@ -1,0 +1,10 @@
+# plugin-standard C9: only GitHub Actions, monthly, and a new release waits 7 days before it is proposed
+# (cooldown applies to version updates; security updates are not delayed).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7

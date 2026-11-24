@@ -1,4 +1,4 @@
-# haigeerlab 插件开发规范（v1.1，2026-11-24 用户批准）
+# haigeerlab 插件开发规范（v1.3，2026-11-24 用户批准）
 
 > 本文件是规范的正式存放处（hub 副本），由 autopr-design 维护；改动要用户批准，走 hub 的 PR（T4，由用户合并）。原稿与审查记录在 plugin-ecosystem 总账 `research/2026-11-23-插件开发规范/`。文末附「条目与 hub 检查的对应表」。
 
@@ -94,10 +94,10 @@
 - 规则：
   - 有名为 `CI` 的 workflow，PR 和推送主干时都跑；
   - 跑仓库的全量检查（C2 的 `scripts/validate.sh`），以及各条卡的 hub 检查；
-  - 在 GitHub 的主干保护里，把它设为合并前必须通过的检查。
+  - 在 GitHub 的主干保护里，只把一个汇总任务 `CI required` 设为合并前必须通过的检查。这个任务带 `if: always()`，依赖所有其他任务，任何一个失败或被取消它就失败；它所在的 workflow 不加路径过滤。
 - 改主干保护属于改仓库设置，每个仓库都要用户原话同意。
 - 查什么范围：hub 体检逐仓检查 workflow 是否存在，以及主干保护是否要求它通过。
-- 为什么：没有 CI，「非作者检查」只能靠本机跑，结果没人能复核；有 CI 但不设为必须通过，CI 红了照样能合。11-24 核查时，module-crew、delegate 没有 CI，kb-plugin、autopilot-hub 有 CI 但不拦合并。
+- 为什么：没有 CI，「非作者检查」只能靠本机跑，结果没人能复核；有 CI 但不设为必须通过，CI 红了照样能合。只设一个汇总检查，以后加任务、改名都不用改仓库设置；加了路径过滤的必需检查在不相关的 PR 上不会上报，PR 会一直卡住（Codex 的 `blocking-ci.yml`、官方插件市场的 `validate-plugins.yml` 都这么做）。11-24 核查时，module-crew、delegate 没有 CI，kb-plugin、autopilot-hub 有 CI 但不拦合并。
 
 **C2 统一的本地检查入口（提醒）**
 - 规则：`scripts/validate.sh`，另有 `--quick` 快档。
@@ -115,6 +115,26 @@
 
 **C5 Bash 3.2 兼容（提醒）**
 - 为什么：macOS 自带的 bash 是 3.2，用了新语法的脚本在用户机器上会直接报错。
+
+**C7 插件清单与元信息校验（卡）**
+- 规则：CI 跑官方的 `claude plugin validate --strict`，校验 marketplace 和插件清单，CLI 版本由 hub 模板统一钉住；再用脚本真正解析所有 skill、command、agent 文件开头的元信息（frontmatter）：YAML 能解析；skill 和 agent 的 `name`、`description` 必填，command 只要求 `description`（command 的名字取自文件名，元信息里没有 `name`）。官方命令不检查 YAML 能否解析，不带 `--strict` 时缺 `description` 也只报警告（kb-lead 11-24 在 2.1.321 和 2.1.328 上实测）。Codex 清单暂无官方校验器，按 B1 和 D2 检查。
+- 查什么范围：每次 PR 都查全部插件文件。
+- 在哪拦：PR 的检查，作为 `CI required` 的一部分。
+- 为什么：我们自己写的检查跟不上官方格式的变化；元信息缺字段或 YAML 写错，本地不报错，用户装上才失败。官方插件市场在 CI 里就是这么查的。
+
+**C8 workflow 安全审计（卡）**
+- 规则：用 zizmor 审计 `.github/workflows/`，高危发现拦下；新增或改动的 workflow 顶层写 `permissions: {}`，按任务单独放权；`actions/checkout` 设 `persist-credentials: false`，确实需要推送的任务除外，并写明原因。
+- 查什么范围：只查本次 PR 新增或改动的 workflow 文件；其余文件的发现列在体检报告里。
+- 在哪拦：PR 的检查。
+- 为什么：C6 钉 SHA 只防了「引用被挪动」，挡不住权限过宽、危险触发器、凭证留在磁盘上被后续步骤读走。CI 里有机器人私钥。MCP python-sdk 用 zizmor，Codex 和 OpenAI Agents 默认最小权限。
+
+**C9 Dependabot 只升级 Actions，冷却 7 天（提醒）**
+- 规则：每个仓库放 `.github/dependabot.yml`，只开 `github-actions`，每月检查一次，`cooldown` 7 天。
+- 为什么：C6 钉了 SHA 以后就没人升级了，安全修复也跟不上；冷却 7 天能避开刚发布就被投毒的版本。Codex 就这么配。
+
+**C10 CI 最后检查工作区干净（提醒）**
+- 规则：CI 在检查跑完之后单独执行 `git diff --exit-code`，有变化就失败。不放进 `scripts/validate.sh`，因为本机开发时工作区常有未提交的改动，放进去本地会一律失败。
+- 为什么：生成文件、版本号或清单改了却漏提交时，本机看起来是好的，别人拉下来就不对。Codex 的 `repo-checks.yml` 最后一步就是这个。
 
 ## D. 仓库结构与命名
 
@@ -232,6 +252,8 @@
   - 裁定记录见 `审查裁定-v0.2.md`。
 - v1.0（2026-11-24）：用户批准 v0.2 正文，三处都同意（原话「批准，三处都同意」）：F1 取消发版提交豁免；新增 H4、C6。共 27 条：5 条卡、22 条提醒。C6 列在 H 章末尾，编号沿用 C6。
 - v1.1（2026-11-24）：用户「对，按推荐改」：C1 升为卡（必须有 CI 且设为合并前必须通过）；A3 升为卡（统一 MIT，版权署名统一写 haigeerlab）；C4 加「CI 至少测 3.9 和一个新版本」。共 27 条：7 条卡、20 条提醒。各插件按 11-24 核查结果发整改单。
+- v1.2（2026-11-24）：参考官方与高星仓库（见 `官方高星仓库对照.md`），用户「加这 5 条」：C1 改为只设一个汇总必需检查 `CI required`、不加路径过滤；新增 C7 插件清单与元信息校验（卡）、C8 workflow 安全审计（卡）、C9 Dependabot 冷却（提醒）、C10 工作区干净（提醒）。共 31 条：9 条卡、22 条提醒。C7 按 kb-lead 实测补充：官方命令须带 `--strict`，YAML 另行解析（实施细节，不改条目）。
+- v1.3（2026-11-24）：用户「批准，升 v1.3」：C7 只对 skill、agent 要求 `name`，command 只要求 `description`；C10 改为 CI 在检查之后执行，不放进 validate.sh（以上两处来自 agent-relay-owner #22460）；追认 C7 必须带 `--strict` 并另行解析 YAML。条目数不变：31 条，9 条卡。
 
 ## 附：条目与 hub 检查的对应表
 
@@ -241,11 +263,13 @@
 | --- | --- | --- | --- |
 | A1 本机路径和用户名 | 卡 | `rules/local_paths.py`（PR 新增或改动的行，新文件查全文） | 待写；hub 自己已有 `tests/test_no_local_paths.py` |
 | A2 密钥 | 卡 | `rules/secrets.py`（带版本号的模式清单，只放行精确假值） | 待写 |
-| A3 LICENSE 统一 MIT | 卡 | 体检新项（LICENSE 存在、MIT、版权行），并接进 PR 检查 | 待写 |
+| A3 LICENSE 统一 MIT | 卡 | 体检新项（LICENSE 存在、MIT、版权行），并接进 PR 检查 | 待写；hub 自己已满足 |
 | B1 版本号一致 | 卡 | `rules/version_consistency.py` | 待写 |
 | B5 标签规则 | 卡 | `rules/release_tag.py`（发版命令调用；推送标签时的 workflow 调用） | 待写 |
-| C1 有 CI 且合并前必须通过 | 卡 | 体检新项（名为 `CI` 的 workflow 存在，且主干保护要求它通过） | 待写 |
+| C1 有 CI 且汇总检查 `CI required` 为必需 | 卡 | 体检新项（`CI` workflow 存在、无路径过滤，主干保护要求 `CI required`）；各仓 CI 模板带汇总任务 | 待写；hub 自己的汇总任务已加 |
+| C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 待写 |
+| C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：zizmor（钉版本）高危拦下；顶层 `permissions: {}`；checkout 设 `persist-credentials: false` | 待写；hub 的 `ci.yml` 已满足后两项 |
 | F1 提交说明中文加类型前缀 | 卡 | `rules/chinese_commit.py` | 中文检查已有；类型前缀、合并与 revert 放行待补 |
-| 其余 20 条提醒 | 提醒 | 体检新项，列在体检报告里 | 待写 |
+| 其余 22 条提醒（含 C9、C10） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
 
-各仓库接入方式：在自己的 `CI` workflow 里加一个调用 hub 卡检查的 job（模板由 hub 提供），按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。
+各仓库接入方式：在自己的 `CI` workflow 里加一个调用 hub 卡检查的 job（模板由 hub 提供），并由汇总任务 `CI required` 依赖它；按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。
