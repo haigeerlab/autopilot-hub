@@ -8,7 +8,7 @@ on:
   push:
     branches: [main]
   workflow_run:
-    workflows: [ci]
+    workflows: [CI]
     types: [completed]
     branches: [main]
   issues:
