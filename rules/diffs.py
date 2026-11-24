@@ -70,5 +70,6 @@ def load_files(pr_files=None, diff=None):
 
 
 def unchecked(files):
-    """Files that changed but came without a patch (binary, or too large for the API): cannot be checked."""
-    return [f.get("filename") for f in files if f.get("status") != "removed" and f.get("patch") is None]
+    """Patchless changes cannot be checked, except newly added files with zero added lines."""
+    return [f.get("filename") for f in files if f.get("status") != "removed" and f.get("patch") is None
+            and not (f.get("status") == "added" and f.get("additions") == 0)]

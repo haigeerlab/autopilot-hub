@@ -16,6 +16,7 @@ sys.path.insert(0, ROOT)
 
 from rules import local_paths as lp
 from rules import no_secrets as sc
+from rules.diffs import unchecked
 
 U = "/" + "Users/"
 H = "/" + "home/"
@@ -38,6 +39,14 @@ class AddedLinesTest(unittest.TestCase):
         files = lp.files_from_diff(diff)
         self.assertEqual([f["filename"] for f in files], ["x.md", "y.md"])
         self.assertEqual(list(lp.added_lines(files[1])), [(1, "fresh")])
+
+    def test_empty_added_file_without_patch_is_checkable(self):
+        files = [{"filename": "empty.txt", "status": "added", "patch": None, "additions": 0}]
+        self.assertEqual(unchecked(files), [])
+
+    def test_nonempty_added_file_without_patch_is_unchecked(self):
+        files = [{"filename": "large.txt", "status": "added", "patch": None, "additions": 10000}]
+        self.assertEqual(unchecked(files), ["large.txt"])
 
 
 class LocalPathsTest(unittest.TestCase):

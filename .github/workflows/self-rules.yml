@@ -6,13 +6,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
 
-permissions:
-  contents: read
-  checks: write
-  pull-requests: read
+# plugin-standard C8: nothing at the top level; each job asks for what it needs.
+permissions: {}
 
 jobs:
   rules:
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
     uses: ./.github/workflows/rules.yml
     with:
       hub_ref: ${{ github.event.pull_request.head.sha }}

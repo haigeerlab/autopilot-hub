@@ -8,14 +8,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
-permissions:
-  contents: read
-  checks: write
-  pull-requests: write
-  issues: write
+# plugin-standard C8: nothing at the top level; each job asks for what it needs.
+permissions: {}
 
 jobs:
   admission:
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      issues: write
     uses: ./.github/workflows/admission.yml
     with:
       hub_ref: ${{ github.event.pull_request.head.sha }}
