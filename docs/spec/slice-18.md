@@ -25,7 +25,7 @@
 | Plan 没批就开工（M2①） | `review.plan` 不是 approved／codex-approved，或者 `reviewApprovedBy.plan` 为空 → 严重；`revised`（批后又改过）→ 提醒；`none`（项目不用批准标记）→ 判不了，所有这类模块合成一条说明（个数加前 8 个模块名） |
 | Codex 批了不该它批的（M2②） | `review.plan` 是 codex-approved，但 `reviewApprovedBy.plan` 为空（spec-guard 认为档位不允许，这次批准不算）→ 严重，并写明 `codexRoute.plan` |
 | 重要需求没让你批（M2③） | `important.reasons` 不为空，并且 `review.spec` 是 codex-approved，或者是 pending／invalid → 严重。`revised` 表示你批过、后来改过文件，不算违规 |
-| 两轮仍有阻断（M2④） | map_view 没有轮次数据，依靠 spec-guard 自己兜底，说明里写"未独立核验" |
+| 两轮仍有阻断（M2④） | 18d 起按 `reviewRounds` 独立核验，见下文 18d；spec-guard 低于 0.93 时没有轮次数据，说明里写"未独立核验" |
 | map_view 读不到 | 提醒，Plan 审批判不了 |
 
 在 module-crew（42 个模块）和沙盒的真实数据上试过：第三条最初的写法把 6 个"你批过、后来改过"的模块误报成违规，改成上表的判定后，两个仓库都没有违规。
@@ -49,3 +49,15 @@ python3 -B audit/cli.py [--repo owner/name ...] [--ref 分支] [--no-post] [--js
 演练中发现：评论会改变 issue 的 `updated_at`，旧逻辑因此把自己开的周报当成被改过，又另开了一个。已改成按 `lastEditedAt` 判断，并补了测试。多开出的 #50–#52 已关闭，周报以 #46 为准。
 
 **agent-relay**：只读跑一次，结果合规。9 个带批准标记的已开工模块都已批准；另外 71 个旧模块没有标记，判不了。这和人工核对一致。
+
+## 18d：审查轮次核验
+
+spec-guard 0.93.0（接口 1.17）起，`/map --json` 每个模块有 `reviewRounds`，按文件顺序列出 Spec、Plan 每一轮 Codex 审查的轮次、阻断数和被审内容指纹，修订前的轮次也在里面。spec-guard 只给事实，不下结论。autopilot 对**已开工、由 Codex 批准**（`review` 为 codex-approved 且 `reviewApprovedBy` 为 codex）的 Spec 和 Plan，按 spec-guard `review_mark` 自己的规则复核：
+
+| 检查 | 判定 |
+| --- | --- |
+| 批准那一轮还有阻断 | 最后一轮 `blocking > 0` → 严重 `codex-approved-with-blocking` |
+| 两轮仍有阻断没转人批 | 文件里已有两轮带阻断、且上一轮带阻断之后，又出现了新的 Codex 轮次 → 严重 `rounds-not-escalated`。`review_mark` 在这种情况下会拒绝，所以出现这样的轮次说明绕过了"转人批" |
+| 没有审查依据 | Codex 批准但文件里没有任何轮次记录 → 提醒 `codex-approved-without-rounds` |
+
+由用户批准的不看轮次。对五个已登记仓库只读跑一次，结果都合规，没有误报。S110 切换后，新流程模块改查三项（见 S110 方案），这一节只管老流程模块。

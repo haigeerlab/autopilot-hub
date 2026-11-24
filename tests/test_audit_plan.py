@@ -13,8 +13,8 @@ from audit import plan_check as p
 
 
 def module(mid="m", status="in_progress", done=3, spec="approved", plan="approved", by_spec="user", by_plan="user",
-           route=None, reasons=()):
-    return {"id": mid, "status": status, "step": "build", "progress": {"done": done, "total": done + 2},
+           route=None, reasons=(), rounds=None):
+    return {"reviewRounds": rounds if rounds is not None else {"spec": [], "plan": []},"id": mid, "status": status, "step": "build", "progress": {"done": done, "total": done + 2},
             "review": {"spec": spec, "plan": plan}, "reviewApprovedBy": {"spec": by_spec, "plan": by_plan},
             "codexRoute": route if route is not None else {"spec": None, "plan": None},
             "important": {"reasons": list(reasons)}}
@@ -37,7 +37,8 @@ class StartedTest(unittest.TestCase):
 
 class PlanApprovedTest(unittest.TestCase):
     def test_clean(self):
-        self.assertEqual(run(module(), module("n", plan="codex-approved", by_plan="codex"))["problems"], [])
+        self.assertEqual(run(module(), module("n", plan="codex-approved", by_plan="codex",
+                                              rounds={"spec": [], "plan": rnd(0)}))["problems"], [])
 
     def test_unapproved_plan_with_work_is_severe(self):
         result = run(module(plan="pending", by_plan=None))
@@ -90,7 +91,7 @@ class ImportantTest(unittest.TestCase):
 
 class NotesTest(unittest.TestCase):
     def test_rounds_not_independently_verified(self):
-        self.assertTrue(any("未独立核验" in n for n in run(module())["notes"]))
+        self.assertTrue(any("未独立核验" in n for n in run(old_view_module())["notes"]))
 
     def test_unreadable_view(self):
         result = p.check_plan(None)
@@ -99,3 +100,50 @@ class NotesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def old_view_module():
+    m = module()
+    del m["reviewRounds"]
+    return m
+
+
+def rnd(*blocking):
+    return [{"round": i + 1, "blocking": b, "sha256": "%012x" % i} for i, b in enumerate(blocking)]
+
+
+class ReviewRoundsTest(unittest.TestCase):
+    def codex(self, plan_rounds, spec_rounds=()):
+        return run(module(plan="codex-approved", by_plan="codex", rounds={"spec": rnd(*spec_rounds), "plan": rnd(*plan_rounds)}))
+
+    def test_clean_codex_approval(self):
+        self.assertEqual(kinds(self.codex([1, 0])), [])
+
+    def test_approval_round_with_blocking_is_severe(self):
+        result = self.codex([0, 2])
+        self.assertEqual(kinds(result), ["codex-approved-with-blocking"])
+        self.assertEqual(result["problems"][0]["severity"], "严重")
+
+    def test_two_blocking_rounds_must_go_to_user(self):
+        self.assertEqual(kinds(self.codex([1, 1, 0])), ["rounds-not-escalated"])
+
+    def test_blocking_rounds_count_across_the_file_like_review_mark(self):
+        # review_mark counts every blocking round in the file, also before a revision
+        self.assertEqual(kinds(self.codex([1, 0, 1, 0])), ["rounds-not-escalated"])
+        self.assertEqual(kinds(self.codex([1, 1, 0, 0])), ["rounds-not-escalated"])  # round 3 should not exist
+        self.assertEqual(kinds(self.codex([1, 0, 0])), [])
+
+    def test_codex_approval_without_rounds_is_a_reminder(self):
+        result = self.codex([])
+        self.assertEqual((kinds(result), result["problems"][0]["severity"]), (["codex-approved-without-rounds"], "提醒"))
+
+    def test_spec_rounds_are_checked_too(self):
+        m = module(spec="codex-approved", by_spec="codex", rounds={"spec": rnd(1, 1, 0), "plan": []})
+        self.assertEqual(kinds(run(m)), ["rounds-not-escalated"])
+
+    def test_user_approval_ignores_rounds(self):
+        m = module(rounds={"spec": [], "plan": rnd(1, 1, 3)})
+        self.assertEqual(kinds(run(m)), [])
+
+    def test_rounds_present_drop_the_unverified_note(self):
+        self.assertFalse(any("未独立核验" in n for n in run(module())["notes"]))
