@@ -45,6 +45,7 @@ jobs:
       # zizmor pinned to a release at least 7 days old (plugin-standard C9 spirit) and installed by wheel hash.
       ZIZMOR_VERSION: "1.32.0"
       ZIZMOR_WHEEL_SHA256: "84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071"
+      NO_COLOR: "1"  # plain text in the published check output
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
