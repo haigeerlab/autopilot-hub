@@ -103,7 +103,8 @@ def main(argv=None):
         print(f"{RULE}: 输入读不了：{e}", file=sys.stderr)
         return 2
     if a.list_changed:
-        print("\n".join(changed_workflows(files)))
+        for rel in changed_workflows(files):  # nothing at all when none changed (rules.yml relies on that)
+            print(rel)
         return 0
     errors = check(a.repo, files)
     text = render(errors)

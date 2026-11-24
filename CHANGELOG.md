@@ -22,6 +22,8 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 - 影子运行后的修复：hub 的可复用 workflow 与示例调用文件顶层改为 `permissions: {}`、权限移到任务级（范围不变）；降级调用的 `workflow_run` 加 zizmor `dangerous-triggers` 行内忽略并写明原因；新增 0 行的空文件不再判为"没法检查"。**需要升钉**（改到 `.github/workflows/`、`rules/`）。
 
+- 修正：PR 没改 workflow 时，`rules.yml` 的 zizmor 一步曾不带输入运行、以退出码 2 让 `rules` 任务失败（各仓换用新模板后会拦下所有不改 workflow 的 PR）。`workflow_audit.py --list-changed` 无文件时不再输出空行，`rules.yml` 改用数组判断。**需要升钉**。
+
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。
 

@@ -129,6 +129,16 @@ class WorkflowAuditTest(unittest.TestCase):
                  changed(".github/workflows/c.yml", "removed"), changed(".github/actions/x/action.yml"), changed("a.yml")]
         self.assertEqual(wa.changed_workflows(files), [".github/workflows/a.yml", ".github/workflows/b.yaml"])
 
+    def test_cli_lists_nothing_when_no_workflow_changed(self):
+        # an empty line here made rules.yml run zizmor with no inputs (exit 2) on every PR without workflow changes
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "files.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump([changed("x.md")], fh)
+            r = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "rules", "workflow_audit.py"), "--pr-files", path,
+                                "--list-changed"], capture_output=True, text=True)
+            self.assertEqual((r.returncode, r.stdout), (0, ""))
+
     def test_cli_lists_changed_files_for_zizmor(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "files.json")
