@@ -20,7 +20,7 @@ RULE = "version-consistency"
 SPEC = "docs/plugin-standard.md（B1）"
 MANIFESTS = (".claude-plugin/plugin.json", ".codex-plugin/plugin.json")
 MARKETPLACE = ".claude-plugin/marketplace.json"
-SKIP_DIRS = {".git", ".claude", "node_modules", ".venv", "venv", "__pycache__"}  # .claude: local worktrees
+SKIP_DIRS = {".git", ".claude", ".hub", "node_modules", ".venv", "venv", "__pycache__"}  # .claude: local worktrees; .hub: CI checkout of the hub
 
 
 def is_declaration(path):
