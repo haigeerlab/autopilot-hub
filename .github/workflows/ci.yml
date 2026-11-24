@@ -1,5 +1,5 @@
 # CI for autopilot-hub itself: unit tests.
-name: ci
+name: CI
 
 on:
   pull_request:
@@ -11,13 +11,29 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     timeout-minutes: 5
+    # plugin-standard C4: the macOS system Python users actually run (3.9) and a current one.
+    # setup-python has no 3.9 build for the current Ubuntu image, so 3.9 is the macOS runner's /usr/bin/python3.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: macos-system, os: macos-latest, python: ""}
+          - {name: "3.13", os: ubuntu-latest, python: "3.13"}
+    name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.python != ''
+        with:
+          python-version: ${{ matrix.python }}
       - name: Unit tests (stdlib only)
+        env:
+          PY: ${{ matrix.python == '' && '/usr/bin/python3' || 'python3' }}
         run: |
-          python3 --version
-          python3 -B -m unittest discover -s tests -v
+          "$PY" --version
+          "$PY" -c 'import sys; assert sys.version_info >= (3, 9), sys.version'
+          "$PY" -B -m unittest discover -s tests -v
