@@ -3,8 +3,9 @@
 # Callers pin BOTH the `uses:` ref and `hub_ref` to the same 40-char commit SHA of autopilot-hub,
 # see examples/caller-autopilot-rules.yml. Updating that SHA in a caller repo is a T4 change.
 #
-# Runs three checks, each publishing its own check run (not a required check):
-#   autopilot/rule/no-weakened-assertion, autopilot/rule/suppression-budget, autopilot/rule/chinese-commit
+# Runs five checks, each publishing its own check run (not a required check):
+#   autopilot/rule/no-weakened-assertion, autopilot/rule/suppression-budget, autopilot/rule/chinese-commit,
+#   autopilot/rule/local-paths and autopilot/rule/no-secrets (plugin-standard A1/A2, shadow run for now)
 #
 # Safety:
 # - Triggered by the caller's `pull_request` event (never pull_request_target).
@@ -73,7 +74,7 @@ jobs:
             | python3 -c 'import json,sys;print(json.dumps([m for page in sys.stdin.read().split("\n") if page.strip() for m in json.loads(page)]))' > .rules/commits.json
           python3 -c 'import json;d=json.load(open(".rules/pr.json"));d["commits"]=json.load(open(".rules/commits.json"));json.dump(d,open(".rules/chinese.json","w"),ensure_ascii=False)'
 
-      - name: Run the three checks
+      - name: Run the checks
         run: |
           mkdir -p .rules/out
           rc=0
@@ -85,6 +86,11 @@ jobs:
           [ -f .rules/rules.json ] && cfg="--config .rules/rules.json"
           python3 -B .hub/rules/chinese_commit.py --input .rules/chinese.json ${cfg} \
             --out-md .rules/out/chinese-commit.md || { [ $? -eq 1 ] && echo failed > .rules/out/chinese-commit.failed || rc=2; }
+          # plugin-standard A1/A2 (cards). Shadow run: published like the others, never required yet.
+          python3 -B .hub/rules/local_paths.py --pr-files .rules/files.json \
+            --out-md .rules/out/local-paths.md || { [ $? -eq 1 ] && echo failed > .rules/out/local-paths.failed || rc=2; }
+          python3 -B .hub/rules/no_secrets.py --pr-files .rules/files.json \
+            --out-md .rules/out/no-secrets.md || { [ $? -eq 1 ] && echo failed > .rules/out/no-secrets.failed || rc=2; }
           for f in .rules/out/*.md; do { echo "### $(basename "$f" .md)"; echo '```text'; cat "$f"; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"; done
           exit "${rc}"
 
@@ -95,7 +101,7 @@ jobs:
       - name: Publish one check run per rule (never required)
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         run: |
-          for name in no-weakened-assertion suppression-budget chinese-commit; do
+          for name in no-weakened-assertion suppression-budget chinese-commit local-paths no-secrets; do
             [ -f ".rules/out/${name}.md" ] || continue
             if [ -f ".rules/out/${name}.failed" ]; then conclusion=failure; else conclusion=success; fi
             RULE_NAME="${name}" CONCLUSION="${conclusion}" python3 - <<'PY' > .rules/check.json

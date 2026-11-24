@@ -7,10 +7,12 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
-- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.3），附条目与 hub 检查的对应表。
+- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.4），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。
 - `LICENSE`（MIT）、`.gitignore`、`CLAUDE.md`、`AGENTS.md`、`README.en.md`、本文件。
 - 合规监测（切片 18a–18d）：`audit/cli.py`、批准基线、合规周报 issue 与违规 issue、按审查轮次核验 Codex 批准。
+
+- 规范卡 A1、A2 的共享检查：`rules/local_paths.py`、`rules/no_secrets.py`（共用 `rules/diffs.py`），接进可复用的 `rules.yml`，影子运行期只报告。**需要升钉**（改到 `rules/` 与 `.github/workflows/`）。
 
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。

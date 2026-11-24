@@ -1,4 +1,4 @@
-# haigeerlab 插件开发规范（v1.3，2026-11-24 用户批准）
+# haigeerlab 插件开发规范（v1.4，2026-11-24 用户批准）
 
 > 本文件是规范的正式存放处（hub 副本），由 autopr-design 维护；改动要用户批准，走 hub 的 PR（T4，由用户合并）。原稿与审查记录在 plugin-ecosystem 总账 `research/2026-11-23-插件开发规范/`。文末附「条目与 hub 检查的对应表」。
 
@@ -117,7 +117,7 @@
 - 为什么：macOS 自带的 bash 是 3.2，用了新语法的脚本在用户机器上会直接报错。
 
 **C7 插件清单与元信息校验（卡）**
-- 规则：CI 跑官方的 `claude plugin validate --strict`，校验 marketplace 和插件清单，CLI 版本由 hub 模板统一钉住；再用脚本真正解析所有 skill、command、agent 文件开头的元信息（frontmatter）：YAML 能解析；skill 和 agent 的 `name`、`description` 必填，command 只要求 `description`（command 的名字取自文件名，元信息里没有 `name`）。官方命令不检查 YAML 能否解析，不带 `--strict` 时缺 `description` 也只报警告（kb-lead 11-24 在 2.1.321 和 2.1.328 上实测）。Codex 清单暂无官方校验器，按 B1 和 D2 检查。
+- 规则：CI 跑官方的 `claude plugin validate --strict`，校验 marketplace 和插件清单，CLI 版本由 hub 模板统一钉住；再用脚本真正解析所有 skill、command、agent 文件开头的元信息（frontmatter）：YAML 能解析；skill 和 agent 的 `name`、`description` 必填，command 只要求 `description`（command 的名字取自文件名，元信息里没有 `name`）。官方命令不检查 YAML 能否解析，不带 `--strict` 时缺 `description` 也只报警告（kb-lead 11-24 在 2.1.321 和 2.1.328 上实测）。插件代码在仓库根目录的（目前只有 module-crew），先用 `git archive` 导出一份去掉根目录 `CLAUDE.md`、`AGENTS.md` 的副本，再对副本跑 `--strict`：官方命令会把插件根目录下的 CLAUDE.md 判为错误，而这两份是给开发者的规矩，插件运行时不读。Codex 清单暂无官方校验器，按 B1 和 D2 检查。
 - 查什么范围：每次 PR 都查全部插件文件。
 - 在哪拦：PR 的检查，作为 `CI required` 的一部分。
 - 为什么：我们自己写的检查跟不上官方格式的变化；元信息缺字段或 YAML 写错，本地不报错，用户装上才失败。官方插件市场在 CI 里就是这么查的。
@@ -254,6 +254,7 @@
 - v1.1（2026-11-24）：用户「对，按推荐改」：C1 升为卡（必须有 CI 且设为合并前必须通过）；A3 升为卡（统一 MIT，版权署名统一写 haigeerlab）；C4 加「CI 至少测 3.9 和一个新版本」。共 27 条：7 条卡、20 条提醒。各插件按 11-24 核查结果发整改单。
 - v1.2（2026-11-24）：参考官方与高星仓库（见 `官方高星仓库对照.md`），用户「加这 5 条」：C1 改为只设一个汇总必需检查 `CI required`、不加路径过滤；新增 C7 插件清单与元信息校验（卡）、C8 workflow 安全审计（卡）、C9 Dependabot 冷却（提醒）、C10 工作区干净（提醒）。共 31 条：9 条卡、22 条提醒。C7 按 kb-lead 实测补充：官方命令须带 `--strict`，YAML 另行解析（实施细节，不改条目）。
 - v1.3（2026-11-24）：用户「批准，升 v1.3」：C7 只对 skill、agent 要求 `name`，command 只要求 `description`；C10 改为 CI 在检查之后执行，不放进 validate.sh（以上两处来自 agent-relay-owner #22460）；追认 C7 必须带 `--strict` 并另行解析 YAML。条目数不变：31 条，9 条卡。
+- v1.4（2026-11-24）：用户「采用导出副本」：C7 补充，插件代码在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的导出副本跑 `--strict`（mc-coord #22488 实测冲突）。条目数不变。
 
 ## 附：条目与 hub 检查的对应表
 
@@ -261,13 +262,13 @@
 
 | 条目 | 等级 | hub 里怎么查 | 状态 |
 | --- | --- | --- | --- |
-| A1 本机路径和用户名 | 卡 | `rules/local_paths.py`（PR 新增或改动的行，新文件查全文） | 待写；hub 自己已有 `tests/test_no_local_paths.py` |
-| A2 密钥 | 卡 | `rules/secrets.py`（带版本号的模式清单，只放行精确假值） | 待写 |
+| A1 本机路径和用户名 | 卡 | `rules/local_paths.py`（PR 新增或改动的行，新文件查全文；本机运行时另查登录名） | 已写，影子运行中（检查 `autopilot/rule/local-paths`，不设为必需） |
+| A2 密钥 | 卡 | `rules/no_secrets.py`（模式清单第 1 版，只放行精确假值；不叫 `secrets.py`，免得作为脚本运行时遮住标准库的同名模块） | 已写，影子运行中（检查 `autopilot/rule/no-secrets`，不设为必需） |
 | A3 LICENSE 统一 MIT | 卡 | 体检新项（LICENSE 存在、MIT、版权行），并接进 PR 检查 | 待写；hub 自己已满足 |
 | B1 版本号一致 | 卡 | `rules/version_consistency.py` | 待写 |
 | B5 标签规则 | 卡 | `rules/release_tag.py`（发版命令调用；推送标签时的 workflow 调用） | 待写 |
 | C1 有 CI 且汇总检查 `CI required` 为必需 | 卡 | 体检新项（`CI` workflow 存在、无路径过滤，主干保护要求 `CI required`）；各仓 CI 模板带汇总任务 | 待写；hub 自己的汇总任务已加 |
-| C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 待写 |
+| C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本；插件在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的 git archive 导出副本运行）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 待写 |
 | C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：zizmor（钉版本）高危拦下；顶层 `permissions: {}`；checkout 设 `persist-credentials: false` | 待写；hub 的 `ci.yml` 已满足后两项 |
 | F1 提交说明中文加类型前缀 | 卡 | `rules/chinese_commit.py` | 中文检查已有；类型前缀、合并与 revert 放行待补 |
 | 其余 22 条提醒（含 C9、C10） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
