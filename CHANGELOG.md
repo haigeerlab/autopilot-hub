@@ -7,7 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
-- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.4），附条目与 hub 检查的对应表。
+- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.5），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。
 - `LICENSE`（MIT）、`.gitignore`、`CLAUDE.md`、`AGENTS.md`、`README.en.md`、本文件。
 - 合规监测（切片 18a–18d）：`audit/cli.py`、批准基线、合规周报 issue 与违规 issue、按审查轮次核验 Codex 批准。

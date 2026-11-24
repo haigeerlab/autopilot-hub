@@ -30,7 +30,7 @@ Development standard for the plugin repositories: [docs/plugin-standard.md](docs
 
 ## Rules
 
-- **Everything in this repository is T4**: never auto-merged; every change is reviewed and merged by a human, because these rules and scripts are the referee.
+- **Everything in this repository is T4**: the user decides every merge in the conversation (standard F3: after the user says "merge", the session runs `gh pr merge --auto`, and GitHub merges once `CI required` passes); "merge without asking after verification" is never turned on, because these rules and scripts are the referee.
 - Other repositories pin this one by 40-character SHA, never by branch or tag. Changing that pin is T4 in those repositories too.
 - Scripts use only the Python standard library and must run on macOS `/usr/bin/python3` (3.9) and on Ubuntu.
 

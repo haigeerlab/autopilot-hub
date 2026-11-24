@@ -1,4 +1,4 @@
-# haigeerlab 插件开发规范（v1.4，2026-11-24 用户批准）
+# haigeerlab 插件开发规范（v1.5，2026-11-24 用户批准）
 
 > 本文件是规范的正式存放处（hub 副本），由 autopr-design 维护；改动要用户批准，走 hub 的 PR（T4，由用户合并）。原稿与审查记录在 plugin-ecosystem 总账 `research/2026-11-23-插件开发规范/`。文末附「条目与 hub 检查的对应表」。
 
@@ -188,6 +188,18 @@
 - 规则：写清改了什么、怎么验证的、有什么风险。参考 spec-guard 的模板。
 - 为什么：审查者和 autopilot 都要从 PR 描述里找验证证据，没有固定位置就要翻整段对话。
 
+**F3 合并统一由会话下令、GitHub 等 CI 后合并（提醒）**
+- 规则：
+  1. 会话问用户「可以合并吗」；
+  2. 用户在对话里回「合并」；
+  3. 会话执行 `gh pr merge --auto`，由 GitHub 等必需检查 `CI required` 通过后合并；
+  4. 会话核实 PR 已合并、记下合并提交，再告诉用户。
+  - 用户不用去 GitHub 点合并，也不用回来报「合完了」。
+  - T4 也走这个流程：用户在对话里说「合并」就是用户本人的决定。以后的「合并：自动」（验证通过后不问就合）对 T4 永远不开。
+  - 各仓库 CLAUDE.md、AGENTS.md 和插件模板里「由用户合并」「用户自己合」的写法改成本条。
+- 前提：仓库打开 GitHub「Allow auto-merge」（每个仓库要用户同意）；主干已把 `CI required` 设为必需检查（C1）。没有必需检查时 `--auto` 会不等 CI 直接合并，所以不满足 C1 的仓库先不开。
+- 为什么：各仓写法不一，有的问完自己合，有的让用户去点，用户要在几个地方来回跑；统一成「用户决定、机器执行」，后面才能接上开发流程改版里验证通过后自动合并的那一步。
+
 ## G. 文档
 
 **G1 必备文档（提醒）**
@@ -255,6 +267,7 @@
 - v1.2（2026-11-24）：参考官方与高星仓库（见 `官方高星仓库对照.md`），用户「加这 5 条」：C1 改为只设一个汇总必需检查 `CI required`、不加路径过滤；新增 C7 插件清单与元信息校验（卡）、C8 workflow 安全审计（卡）、C9 Dependabot 冷却（提醒）、C10 工作区干净（提醒）。共 31 条：9 条卡、22 条提醒。C7 按 kb-lead 实测补充：官方命令须带 `--strict`，YAML 另行解析（实施细节，不改条目）。
 - v1.3（2026-11-24）：用户「批准，升 v1.3」：C7 只对 skill、agent 要求 `name`，command 只要求 `description`；C10 改为 CI 在检查之后执行，不放进 validate.sh（以上两处来自 agent-relay-owner #22460）；追认 C7 必须带 `--strict` 并另行解析 YAML。条目数不变：31 条，9 条卡。
 - v1.4（2026-11-24）：用户「采用导出副本」：C7 补充，插件代码在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的导出副本跑 `--strict`（mc-coord #22488 实测冲突）。条目数不变。
+- v1.5（2026-11-24）：用户确认复述后「对，按这个办」：新增 F3 合并方式（提醒），六个仓库统一为「用户在对话里说合并 → 会话 `gh pr merge --auto` → GitHub 等 CI 后合并 → 会话核实」，T4 同样适用。共 32 条：9 条卡、23 条提醒。
 
 ## 附：条目与 hub 检查的对应表
 
@@ -271,6 +284,6 @@
 | C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本；插件在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的 git archive 导出副本运行）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 待写 |
 | C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：zizmor（钉版本）高危拦下；顶层 `permissions: {}`；checkout 设 `persist-credentials: false` | 待写；hub 的 `ci.yml` 已满足后两项 |
 | F1 提交说明中文加类型前缀 | 卡 | `rules/commit_format.py`（只看第一行；两个以上父提交和标准 `Revert "…"` 放行；另有 `--message-file` 供 commit-msg 钩子用）。PR 标题和正文仍由 `rules/chinese_commit.py` 查，不算卡 | 已写，影子运行中（检查 `autopilot/rule/commit-format`） |
-| 其余 22 条提醒（含 C9、C10） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
+| 其余 23 条提醒（含 C9、C10、F3） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
 
 各仓库接入方式：在自己的 `CI` workflow 里加一个调用 hub 卡检查的 job（模板由 hub 提供），并由汇总任务 `CI required` 依赖它；按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。
