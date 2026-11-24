@@ -15,6 +15,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from checkup import standard
 from checkup import checks, entry, ghprobe, remedy  # noqa: E402
 from checkup.proc import run  # noqa: E402
 
@@ -93,6 +94,7 @@ def main(argv=None, transport=None, runner=entry.run_check, stdout=None, stderr=
     gh = ghprobe.GitHub(transport or ghprobe.LiveTransport()) if name else None
     try:
         findings, ctx = checks.run_checks(root, a.base, gh, name, a.run_check, runner)
+        findings += standard.findings(root, gh, name, ctx["default_branch"] or a.base)  # plugin-standard items
     except ghprobe.EnvNotReady as e:
         print("checkup: 环境没准备好（gh 没登录或网络不通）：%s\n先运行 gh auth login，或检查网络后重试。" % e, file=stderr)
         return 3

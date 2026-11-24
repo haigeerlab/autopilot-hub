@@ -277,13 +277,13 @@
 | --- | --- | --- | --- |
 | A1 本机路径和用户名 | 卡 | `rules/local_paths.py`（PR 新增或改动的行，新文件查全文；本机运行时另查登录名） | 已写，影子运行中（检查 `autopilot/rule/local-paths`，不设为必需） |
 | A2 密钥 | 卡 | `rules/no_secrets.py`（模式清单第 1 版，只放行精确假值；不叫 `secrets.py`，免得作为脚本运行时遮住标准库的同名模块） | 已写，影子运行中（检查 `autopilot/rule/no-secrets`，不设为必需） |
-| A3 LICENSE 统一 MIT | 卡 | 体检新项（LICENSE 存在、MIT、版权行），并接进 PR 检查 | 待写；hub 自己已满足 |
+| A3 LICENSE 统一 MIT | 卡 | 体检项「规范A3」（`checkup/standard.py`：LICENSE 存在、MIT 全文、版权行，清单 license 字段） | 体检项已写；hub 自己已满足 |
 | B1 版本号一致 | 卡 | `rules/version_consistency.py`（PR 改到版本声明时，读 PR head 稀疏检出的清单，只当数据读） | 已写，影子运行中（检查 `autopilot/rule/version-consistency`） |
 | B5 标签规则 | 卡 | `rules/release_tag.py`（读标签所指提交里的版本声明，查附注标签、是否在远端默认分支上；发版命令调用，推送标签时由 `examples/caller-release-tag.yml` 调用） | 脚本与模板已写 |
-| C1 有 CI 且汇总检查 `CI required` 为必需 | 卡 | 各仓 CI 模板 `examples/caller-ci-standard.yml`（带汇总任务，无路径过滤）；体检新项（`CI` workflow 存在、主干保护要求 `CI required`） | 模板已写；体检项待写；hub 自己已满足 |
+| C1 有 CI 且汇总检查 `CI required` 为必需 | 卡 | 各仓 CI 模板 `examples/caller-ci-standard.yml`（带汇总任务，无路径过滤）；体检新项（`CI` workflow 存在、主干保护要求 `CI required`） | 模板与体检项「规范C1」已写（读规则集与旧版保护两处的必需检查，要求只有 `CI required`）；hub 自己已满足 |
 | C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本；插件在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的 git archive 导出副本运行）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 模板与 `rules/frontmatter.py` 已写（hub 严格 YAML 子集解析器，只用标准库；`claude plugin validate --strict` 在 CI 模板里，钉 2.1.321） |
 | C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：`rules/workflow_audit.py` 查顶层 `permissions: {}`、checkout `persist-credentials: false`（`true` 须同行注明原因）；zizmor 1.32.0（按哈希安装、离线、只报高危） | 已写，影子运行中（检查 `autopilot/rule/workflow-audit`、`autopilot/rule/zizmor`） |
 | F1 提交说明中文加类型前缀 | 卡 | `rules/commit_format.py`（只看第一行；两个以上父提交和标准 `Revert "…"` 放行；另有 `--message-file` 供 commit-msg 钩子用）。PR 标题和正文仍由 `rules/chinese_commit.py` 查，不算卡 | 已写，影子运行中（检查 `autopilot/rule/commit-format`） |
-| 其余 23 条提醒（含 C9、C10、F3） | 提醒 | 体检新项，列在体检报告里 | 待写；hub 自己已加 dependabot（C9） |
+| 其余 23 条提醒（含 C9、C10、F3） | 提醒 | 体检项，列在体检报告里 | 「规范C9」「规范C10」已写；其余待写 |
 
 各仓库接入方式：照 `examples/caller-ci-standard.yml` 写自己的 `CI` workflow（其中 `rules` 任务调用 hub 的规则 workflow，影子运行期 `mode: report`，开拦后改 `enforce`），由汇总任务 `CI required` 依赖全部任务；照 `examples/caller-release-tag.yml` 加推送标签检查；按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。

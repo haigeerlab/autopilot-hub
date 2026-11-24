@@ -508,7 +508,8 @@ class CliTest(unittest.TestCase):
             code, out, _ = self.go(root, "--json", "--out", out_dir, transport=FakeTransport(good_github()))
             self.assertEqual(code, 0)
             data = json.loads(out)
-            self.assertEqual([f["id"] for f in data["findings"]], ["C%d" % i for i in range(1, 15)])
+            self.assertEqual([f["id"] for f in data["findings"]],
+                         ["C%d" % i for i in range(1, 15)] + ["规范A3", "规范C1", "规范C9", "规范C10"])
             for f in data["findings"]:
                 self.assertIn(f["status"], ("ok", "missing", "unknown"))
             self.assertEqual(data["repo"], NAME)
