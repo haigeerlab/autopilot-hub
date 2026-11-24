@@ -16,6 +16,8 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 - 规范卡 B1、B5、F1 的共享检查：`rules/version_consistency.py`、`rules/release_tag.py`、`rules/commit_format.py`；B1、F1 接进 `rules.yml` 影子运行，B5 供发版命令和推送标签的 workflow 调用。**需要升钉**。
 
+- 规范卡 C7、C8 的共享检查：`rules/frontmatter.py`（元信息真正解析 YAML）、`rules/workflow_audit.py`（改动的 workflow 最小权限与不留凭证）、`rules.yml` 跑 zizmor 1.32.0；`rules.yml` 新增输入 `mode: report|enforce`。各仓模板 `examples/caller-ci-standard.yml`（含 `CI required`、C7 的 `claude plugin validate --strict`）、`examples/caller-release-tag.yml`（B5）。**需要升钉**。
+
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。
 

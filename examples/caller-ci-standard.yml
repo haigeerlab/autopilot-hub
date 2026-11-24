@@ -1,0 +1,120 @@
+# Template (plugin standard v1.5): a plugin repository's whole CI, covering C1, C4, C7, C8, C10, H3 and the cards
+# checked per PR (A1, A2, B1, F1, C8) through the hub's reusable rules workflow.
+#
+# Copy to .github/workflows/ci.yml. Replace both <HUB_SHA> with the hub target baseline (standard H1): the
+# `uses:` ref and `hub_ref` must be the same 40-char SHA. Changing this file or the pin is T4.
+# Then, with the user's own words, make `CI required` the only required check on the default branch (C1).
+# No path filters anywhere in this workflow, or `CI required` stops reporting on unrelated PRs (C1).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # C4: the macOS system Python users actually run (3.9), and a current one.
+          - {name: macos-system, os: macos-latest, python: ""}
+          - {name: "3.13", os: ubuntu-latest, python: "3.13"}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.python != ''
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Full checks (C2)
+        run: |
+          # On the macOS job put the system /usr/bin/python3 (3.9) first, so validate.sh runs what users run.
+          if [ -z "${{ matrix.python }}" ]; then export PATH="/usr/bin:${PATH}"; fi
+          python3 --version
+          bash scripts/validate.sh
+      - name: Working tree still clean (C10)
+        run: git diff --exit-code
+
+  plugin-validate:
+    name: plugin validate (C7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # One pinned CLI version for every repository, at least 7 days old; bump it here, across all repos at once.
+      CLAUDE_CODE_VERSION: "2.1.321"
+      DISABLE_AUTOUPDATER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out autopilot-hub at the pinned SHA (scripts only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haigeerlab/autopilot-hub
+          ref: <HUB_SHA>
+          path: .hub
+          persist-credentials: false
+      - name: claude plugin validate --strict on an exported copy
+        run: |
+          # Validate a `git archive` export. When the plugin lives at the repository root, drop the root CLAUDE.md
+          # and AGENTS.md from the export: the official command treats them as errors there (standard C7, v1.4).
+          export_dir="${RUNNER_TEMP}/plugin-export"
+          mkdir -p "${export_dir}"
+          git archive HEAD | tar -x -C "${export_dir}"
+          if [ -f "${export_dir}/.claude-plugin/plugin.json" ]; then rm -f "${export_dir}/CLAUDE.md" "${export_dir}/AGENTS.md"; fi
+          cd "${export_dir}"
+          claude() { npx --yes "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "$@"; }
+          claude plugin validate --strict .
+          python3 - <<'PY' > "${RUNNER_TEMP}/plugin-dirs.txt"
+          import json, os
+          data = json.load(open(".claude-plugin/marketplace.json", encoding="utf-8"))
+          for entry in data.get("plugins") or []:
+              src = entry.get("source") if isinstance(entry, dict) else None
+              if isinstance(src, str) and os.path.normpath(src) not in (".", ""):
+                  print(os.path.normpath(src))
+          PY
+          while read -r dir; do claude plugin validate --strict "${dir}"; done < "${RUNNER_TEMP}/plugin-dirs.txt"
+      - name: Skill, command and agent frontmatter really parses (C7)
+        run: python3 -B .hub/rules/frontmatter.py --repo .
+
+  rules:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
+    uses: haigeerlab/autopilot-hub/.github/workflows/rules.yml@<HUB_SHA>
+    with:
+      hub_ref: <HUB_SHA>
+      # report during the shadow run; switch to enforce once the user has seen the shadow-run results.
+      mode: report
+
+  ci-required:
+    name: CI required
+    if: always()
+    needs: [test, plugin-validate, rules]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Every CI job succeeded (skipped means "not run for this event", e.g. rules on push)
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$NEEDS" | python3 -c '
+          import json, sys
+          bad = {job: r["result"] for job, r in json.load(sys.stdin).items() if r["result"] not in ("success", "skipped")}
+          print(bad or "all CI jobs succeeded")
+          sys.exit(1 if bad else 0)'

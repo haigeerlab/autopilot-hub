@@ -6,7 +6,9 @@
 # Runs seven checks, each publishing its own check run (not a required check):
 #   autopilot/rule/no-weakened-assertion, autopilot/rule/suppression-budget, autopilot/rule/chinese-commit,
 #   and the plugin-standard cards in their shadow run: autopilot/rule/local-paths (A1), autopilot/rule/no-secrets
-#   (A2), autopilot/rule/version-consistency (B1) and autopilot/rule/commit-format (F1)
+#   (A2), autopilot/rule/version-consistency (B1), autopilot/rule/commit-format (F1), autopilot/rule/workflow-audit
+#   and autopilot/rule/zizmor (C8). Input `mode`: report (default) only publishes them; enforce also fails this job
+#   when a card fails, so the caller's `CI required` blocks the merge.
 #
 # Safety:
 # - Triggered by the caller's `pull_request` event (never pull_request_target).
@@ -18,21 +20,32 @@ name: autopilot-rules
 on:
   workflow_call:
     inputs:
+      mode:
+        description: "report (default: plugin-standard cards only publish their result) or enforce (a failing card fails this job)"
+        type: string
+        default: report
       hub_ref:
         description: "40-char autopilot-hub commit SHA; must equal the SHA in the caller's `uses:` line"
         required: true
         type: string
 
-permissions:
-  contents: read
-  checks: write
-  pull-requests: read
+# plugin-standard C8: nothing at the top level; the job asks for exactly what it needs.
+permissions: {}
 
 jobs:
   rules:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
     env:
+      MODE: ${{ inputs.mode }}
+      # zizmor pinned to a release at least 7 days old (plugin-standard C9 spirit) and installed by wheel hash.
+      ZIZMOR_VERSION: "1.32.0"
+      ZIZMOR_WHEEL_SHA256: "84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071"
+      NO_COLOR: "1"  # plain text in the published check output
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -42,6 +55,7 @@ jobs:
     steps:
       - name: Check hub_ref is a full commit SHA
         run: |
+          case "${MODE}" in report|enforce) ;; *) echo "::error::mode must be report or enforce"; exit 2 ;; esac
           case "${HUB_REF}" in
             *[!0-9a-f]*|"") echo "::error::hub_ref must be a 40-char lowercase commit SHA"; exit 2 ;;
           esac
@@ -62,7 +76,7 @@ jobs:
           path: .base
           persist-credentials: false
 
-      - name: Check out only the PR head's version declarations (read as JSON data, never executed)
+      - name: Check out only the PR head's manifests, skill/command/agent files and workflows (read as data, never executed)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -72,6 +86,8 @@ jobs:
           sparse-checkout: |
             **/.claude-plugin/*.json
             **/.codex-plugin/*.json
+            .github/workflows/*.yml
+            .github/workflows/*.yaml
 
       - name: Collect inputs from the API (read-only)
         run: |
@@ -110,7 +126,32 @@ jobs:
             --out-md .rules/out/version-consistency.md || { [ $? -eq 1 ] && echo failed > .rules/out/version-consistency.failed || rc=2; }
           python3 -B .hub/rules/commit_format.py --input .rules/commit-format.json \
             --out-md .rules/out/commit-format.md || { [ $? -eq 1 ] && echo failed > .rules/out/commit-format.failed || rc=2; }
+          # plugin-standard C8 (card), static half: changed workflows start from `permissions: {}`, checkout drops credentials.
+          python3 -B .hub/rules/workflow_audit.py --pr-files .rules/files.json --repo .head-manifests \
+            --out-md .rules/out/workflow-audit.md || { [ $? -eq 1 ] && echo failed > .rules/out/workflow-audit.failed || rc=2; }
+          # C8, zizmor half: high-severity findings in the changed workflows only (offline, pinned and hash-checked).
+          python3 -B .hub/rules/workflow_audit.py --pr-files .rules/files.json --list-changed > .rules/changed-workflows.txt
+          if [ -s .rules/changed-workflows.txt ]; then
+            printf '%s\n' "zizmor==${ZIZMOR_VERSION} --hash=sha256:${ZIZMOR_WHEEL_SHA256}" > .rules/zizmor-req.txt
+            python3 -m pip install --quiet --user --only-binary=:all: --require-hashes -r .rules/zizmor-req.txt
+            zres=0
+            (cd .head-manifests && xargs "$HOME/.local/bin/zizmor" --offline --min-severity high < ../.rules/changed-workflows.txt) \
+              > .rules/zizmor.txt 2>&1 || zres=$?
+            { echo "zizmor ${ZIZMOR_VERSION}（只看本次改动的 workflow，只报高危）："; cat .rules/zizmor.txt; } > .rules/out/zizmor.md
+            case "${zres}" in
+              0|11|12|13) ;;
+              14) echo failed > .rules/out/zizmor.failed ;;
+              *) echo "zizmor 运行失败（退出码 ${zres}）" >> .rules/out/zizmor.md; rc=2 ;;
+            esac
+          else
+            echo "zizmor: 通过（本次没有改动 workflow）" > .rules/out/zizmor.md
+          fi
           for f in .rules/out/*.md; do { echo "### $(basename "$f" .md)"; echo '```text'; cat "$f"; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"; done
+          if [ "${MODE}" = "enforce" ] && [ "${rc}" -eq 0 ]; then
+            for card in local-paths no-secrets version-consistency commit-format workflow-audit zizmor; do
+              [ -f ".rules/out/${card}.failed" ] && { echo "::error::规范卡 ${card} 没通过"; rc=1; }
+            done
+          fi
           exit "${rc}"
 
       - name: Fork PR note
@@ -120,7 +161,7 @@ jobs:
       - name: Publish one check run per rule (never required)
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         run: |
-          for name in no-weakened-assertion suppression-budget chinese-commit local-paths no-secrets version-consistency commit-format; do
+          for name in no-weakened-assertion suppression-budget chinese-commit local-paths no-secrets version-consistency commit-format workflow-audit zizmor; do
             [ -f ".rules/out/${name}.md" ] || continue
             if [ -f ".rules/out/${name}.failed" ]; then conclusion=failure; else conclusion=success; fi
             RULE_NAME="${name}" CONCLUSION="${conclusion}" python3 - <<'PY' > .rules/check.json
