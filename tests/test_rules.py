@@ -226,6 +226,25 @@ class ChineseCommitTest(TempDirCase):
     def test_passes_with_chinese_everywhere(self):
         self.assertEqual(cc.check(self.data()), [])
 
+    def test_dependabot_author_exempts_title_body_and_commits(self):
+        data = self.data(author="dependabot[bot]", title="chore(deps): Bump dependency",
+                         body="Bumps dependency to the latest version.", commits=["chore(deps): Bump dependency"])
+        self.assertEqual(cc.check(data), [])
+        inp = write_json(self.tmp, "in.json", data)
+        self.assertEqual(run_cli(cc, ["--input", inp])[0], 0)
+
+    def test_other_authors_do_not_exempt_english_title(self):
+        for author in ("someone", None, "Dependabot[bot]", "dependabot[bot] "):
+            with self.subTest(author=author):
+                errors = cc.check(self.data(author=author, title="chore(deps): Bump dependency"))
+                self.assertEqual(len(errors), 1)
+                self.assertIn("PR 标题没有中文", errors[0])
+
+    def test_dependabot_text_does_not_grant_exemption(self):
+        errors = cc.check(self.data(author="someone", title="chore(deps): Bump dependency by dependabot[bot]",
+                                    body="Created by dependabot[bot].", commits=["chore: dependabot[bot] update"]))
+        self.assertEqual(len(errors), 3)
+
     def test_english_title_fails_with_six_lines(self):
         errors = cc.check(self.data(title="fix: handle pagination overflow"))
         self.assertEqual(len(errors), 1)

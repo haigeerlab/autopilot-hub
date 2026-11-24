@@ -97,12 +97,12 @@ jobs:
           fi
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '[.[] | {filename, status, additions, deletions, patch}]' \
             | python3 -c 'import json,sys;print(json.dumps([f for page in sys.stdin.read().split("\n") if page.strip() for f in json.loads(page)]))' > .rules/files.json
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '{title, body}' > .rules/pr.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '{title, body, author: .user.login}' > .rules/pr.json
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '[.[].commit.message]' \
             | python3 -c 'import json,sys;print(json.dumps([m for page in sys.stdin.read().split("\n") if page.strip() for m in json.loads(page)]))' > .rules/commits.json
           python3 -c 'import json;d=json.load(open(".rules/pr.json"));d["commits"]=json.load(open(".rules/commits.json"));json.dump(d,open(".rules/chinese.json","w"),ensure_ascii=False)'
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '[.[] | {message: .commit.message, parents: (.parents | length)}]' \
-            | python3 -c 'import json,sys;print(json.dumps({"commits": [c for page in sys.stdin.read().split("\n") if page.strip() for c in json.loads(page)]}))' > .rules/commit-format.json
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '[.[] | {message: .commit.message, parents: (.parents | length), author: .author.login}]' \
+            | python3 -c 'import json,sys;print(json.dumps({"pr_author": json.load(open(".rules/pr.json"))["author"], "commits": [c for page in sys.stdin.read().split("\n") if page.strip() for c in json.loads(page)]}))' > .rules/commit-format.json
 
       - name: Run the checks
         run: |

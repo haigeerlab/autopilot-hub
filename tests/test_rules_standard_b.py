@@ -161,6 +161,58 @@ class CommitFormatTest(unittest.TestCase):
     def errors(self, *messages, parents=1):
         return cf.check([{"message": m, "parents": parents} for m in messages])
 
+    def test_dependabot_pr_and_commit_authors_are_exempt(self):
+        for message in ("chore(deps): Bump actions/setup-python from 7.0.0 to 7.1.0", "Bump dependency"):
+            with self.subTest(message=message):
+                self.assertEqual(cf.check([{"message": message, "parents": 1, "author": "dependabot[bot]"}],
+                                          pr_author="dependabot[bot]"), [])
+
+    def test_forged_dependabot_commit_author_is_not_exempt(self):
+        for pr_author in ("someone", "Dependabot[bot]", "dependabot[bot] "):
+            with self.subTest(pr_author=pr_author):
+                errors = cf.check([{"message": "chore(deps): Bump dependency", "author": "dependabot[bot]"}],
+                                  pr_author=pr_author)
+                self.assertEqual(len(errors), 1)
+
+    def test_dependabot_commit_without_pr_author_is_not_exempt(self):
+        self.assertEqual(len(cf.check([{"message": "chore(deps): Bump dependency",
+                                        "author": "dependabot[bot]"}])), 1)
+
+    def test_other_authors_are_not_exempt(self):
+        for author in ("someone", None, "Dependabot[bot]", "dependabot[bot] "):
+            with self.subTest(author=author):
+                self.assertEqual(len(cf.check([{"message": "chore(deps): Bump dependency", "parents": 1,
+                                               "author": author}], pr_author="dependabot[bot]")), 1)
+
+    def test_dependabot_message_does_not_grant_exemption(self):
+        message = "chore(deps): Bump dependency by dependabot[bot]"
+        for commit in (message, {"message": message, "parents": 1},
+                       {"message": message, "parents": 1, "author": "someone"}):
+            with self.subTest(commit=commit):
+                self.assertEqual(len(cf.check([commit], pr_author="dependabot[bot]")), 1)
+
+    def test_dependabot_exemption_only_applies_to_its_commit(self):
+        commits = [{"message": "chore(deps): Bump dependency", "author": "dependabot[bot]"},
+                   {"message": "fix: handle overflow", "author": "someone"}]
+        errors = cf.check(commits, pr_author="dependabot[bot]")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("handle overflow", errors[0])
+
+    def test_cli_dependabot_exemption_requires_both_authors(self):
+        cases = [({"pr_author": "dependabot[bot]"}, "dependabot[bot]", 0),
+                 ({"pr_author": "someone"}, "dependabot[bot]", 1),
+                 ({"pr_author": "dependabot[bot]"}, "someone", 1),
+                 ({}, "dependabot[bot]", 1)]
+        with tempfile.TemporaryDirectory() as tmp:
+            for metadata, author, expected in cases:
+                with self.subTest(metadata=metadata, author=author):
+                    data = dict(metadata, commits=[{"message": "chore(deps): Bump dependency", "parents": 1,
+                                                    "author": author}])
+                    write(tmp, "commits.json", data)
+                    r = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "rules", "commit_format.py"),
+                                        "--input", os.path.join(tmp, "commits.json")], capture_output=True, text=True)
+                    self.assertEqual(r.returncode, expected, r.stdout + r.stderr)
+
     def test_good_subjects(self):
         for m in ("feat: 加了一个功能", "fix(rules): 修正误报", "chore(release): 发布 v0.94.0",
                   "refactor!: 改了接口", "docs: 更新 `README.md` 的说明\n\nbody in English is fine"):

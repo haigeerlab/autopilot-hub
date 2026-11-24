@@ -24,6 +24,8 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 - 修正：PR 没改 workflow 时，`rules.yml` 的 zizmor 一步曾不带输入运行、以退出码 2 让 `rules` 任务失败（各仓换用新模板后会拦下所有不改 workflow 的 PR）。`workflow_audit.py --list-changed` 无文件时不再输出空行，`rules.yml` 改用数组判断。**需要升钉**。
 
+- F1 与中文检查放行 Dependabot（用户定）：PR 作者和提交作者都是 `dependabot[bot]` 的提交放行 F1；PR 作者是 `dependabot[bot]` 时中文检查放行。按 GitHub 返回的账号判断，不看文字。**需要升钉**。
+
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。
 

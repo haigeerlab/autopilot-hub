@@ -1,6 +1,8 @@
 """Rule `chinese-commit`: PR title, body and every commit message must contain Chinese.
 
-Spec: docs/spec/slice-6.md (A13 of lint-starter). Input JSON: {"title": str, "body": str, "commits": [str]}.
+Spec: docs/spec/slice-6.md (A13 of lint-starter).
+Input JSON: {"title": str, "body": str, "commits": [str], "author": str | null}.
+author is an optional GitHub PR author login; exactly `dependabot[bot]` exempts the title, body and all commits.
 Before looking for CJK characters the text is stripped of conventional prefixes (`fix:`, `feat(x):`),
 backticked spans, URLs and file paths, so identifiers cannot count as Chinese. Merge commits are exempt;
 an empty PR body is not a violation. A repo opts out (open-source English) with
@@ -38,6 +40,8 @@ def has_chinese(text):
 
 
 def check(data):
+    if data.get("author") == "dependabot[bot]":
+        return []
     errors = []
 
     def bad(where, text):
