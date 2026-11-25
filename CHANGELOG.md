@@ -7,7 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
-- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.7），附条目与 hub 检查的对应表。
+- `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.7.1），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。
 - `LICENSE`（MIT）、`.gitignore`、`CLAUDE.md`、`AGENTS.md`、`README.en.md`、本文件。
 - 合规监测（切片 18a–18d）：`audit/cli.py`、批准基线、合规周报 issue 与违规 issue、按审查轮次核验 Codex 批准。
@@ -25,6 +25,9 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - 修正：PR 没改 workflow 时，`rules.yml` 的 zizmor 一步曾不带输入运行、以退出码 2 让 `rules` 任务失败（各仓换用新模板后会拦下所有不改 workflow 的 PR）。`workflow_audit.py --list-changed` 无文件时不再输出空行，`rules.yml` 改用数组判断。**需要升钉**。
 
 - F1 与中文检查放行 Dependabot（用户定）：PR 作者和提交作者都是 `dependabot[bot]` 的提交放行 F1；PR 作者是 `dependabot[bot]` 时中文检查放行。按 GitHub 返回的账号判断，不看文字。**需要升钉**。
+
+- 体检报告补齐规范提醒类条目（`checkup/standard.py`，共 22 个规范项）；`standard-target.json` 记规范 H1 的目标基线。
+- 模板 `caller-ci-standard.yml`：PR 改标题、正文（`edited`）时整套 CI 重跑，并加 `concurrency`。
 
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。

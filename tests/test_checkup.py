@@ -509,7 +509,9 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 0)
             data = json.loads(out)
             self.assertEqual([f["id"] for f in data["findings"]],
-                         ["C%d" % i for i in range(1, 15)] + ["规范A3", "规范C1", "规范C9", "规范C10"])
+                         ["C%d" % i for i in range(1, 15)] + ["规范" + n for n in (
+                             "A3", "B2", "B3", "B4", "C1", "C2", "C3", "C4", "C5", "C6", "C9", "C10",
+                             "D1", "D2", "D3", "E1", "F2", "G1", "G2", "H1", "H2", "H4")])
             for f in data["findings"]:
                 self.assertIn(f["status"], ("ok", "missing", "unknown"))
             self.assertEqual(data["repo"], NAME)
