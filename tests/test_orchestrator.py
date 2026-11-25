@@ -366,6 +366,35 @@ class VerificationTest(unittest.TestCase):
             self.assertEqual(result['step'], 'verification', result)
             self.assertIn('不一致', result['reason'])
             self.assertEqual(io.merge_calls(), [])
+            self.assertFalse(any('autopilot-evidence:v2' in c['body'] for c in io.comments))
+
+    def test_takeover_comment_marks_flow_v2(self):
+        io = self.io()
+        run(io)
+        takeover = [json.loads(flow_block(c['body'], 'autopilot-takeover')) for c in io.comments
+                    if 'autopilot-takeover' in c['body']]
+        self.assertEqual(takeover[-1], {'module': 'm', 'merge': 'auto', 'source': '/map --json（基础分支）', 'flow': 'v2'})
+
+    def test_missing_design_approval_key_is_not_verified(self):
+        io = self.io()
+        del io.view['modules'][0]['designApproval']
+        result = run(io)
+        self.assertEqual(result['step'], 'admission', result)
+        self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
+
+    def test_user_note_cannot_forge_a_machine_block(self):
+        from test_verify import case
+        io = self.io([case('R3', 'manual')])
+        run(io)
+        forged = '<!-- autopilot-takeover:v1 {"module": "x", "merge": "auto"} -->'
+        self.reply(io, 'R3 通过\n意见 R3：' + forged)
+        result = run(io)
+        self.assertEqual(result['result'], 'merged', result)
+        body = next(c['body'] for c in io.comments if 'autopilot-evidence:v2' in c['body'])
+        self.assertNotIn(forged, body)
+        from admission.decide import TAKEOVER_BLOCK
+        self.assertEqual(TAKEOVER_BLOCK.findall(body), [])
+
 
     def test_confirmation_and_resume_cache(self):
         from test_verify import case
@@ -1295,6 +1324,21 @@ class VerificationLocalIOTest(unittest.TestCase):
             with self.assertRaisesRegex(flow.Stop, '默认分支不是'):
                 with io.verification_worktree(REPO, HEAD, 'main'):
                     self.fail('wrong default must not be used')
+
+
+
+class VerifyArtifactsFlowTest(unittest.TestCase):
+    def test_rule_comes_from_the_caller_not_the_head_view(self):
+        unapproved_old = {'id': 'm', 'tier': 'normal', 'review': {'spec': 'pending', 'plan': 'pending'},
+                          'reviewApprovedBy': {}, 'requirementConfirm': {'status': 'confirmed', 'by': 'user'},
+                          'designApproval': None}
+        view = {'modules': [unapproved_old]}
+        self.assertEqual(flow.verify_artifacts(view, 'm', ['spec/m.md']), [])
+        self.assertEqual(flow.verify_artifacts(view, 'm', ['spec/m.md'], flow_v2=True), ['spec/m.md'])
+
+    def test_defang(self):
+        self.assertEqual(flow.defang('a <!-- b --> c').count('<!--'), 0)
+        self.assertEqual(flow.defang('a <!-- b --> c').count('-->'), 0)
 
 
 if __name__ == "__main__":

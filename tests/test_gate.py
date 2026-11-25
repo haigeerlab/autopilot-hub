@@ -33,9 +33,9 @@ def evidence(p=None, **kw):
     return bot("硬卡证据\n<!-- autopilot-evidence:v1 " + json.dumps(p or payload()) + " -->\n", **kw)
 
 
-def gate(comments, head=HEAD, module=None, bot_identity=BOT):
+def gate(comments, head=HEAD, module=None, bot_identity=BOT, flow=None):
     notes = []
-    item, _short = g.gate_item(list(comments), bot_identity, head, module, notes)
+    item, _short = g.gate_item(list(comments), bot_identity, head, module, notes, flow)
     return item, notes
 
 
@@ -134,7 +134,7 @@ class GateV2Test(unittest.TestCase):
         for verdict in ("pass", "pass-with-notes"):
             value = self.payload()
             value["verification"]["verdict"] = verdict
-            item, _ = gate([self.evidence(value)], module="m")
+            item, _ = gate([self.evidence(value)], module="m", flow="v2")
             self.assertTrue(item["ok"], item)
             self.assertIn("合并前验证 " + verdict, item["detail"])
             self.assertIn("c" * 12, item["detail"])
@@ -146,34 +146,34 @@ class GateV2Test(unittest.TestCase):
                             "module": [None, "", " ", 1]}.items():
             for value in values:
                 with self.subTest(key=key, value=value):
-                    self.assertFalse(gate([self.evidence(self.payload(**{key: value}))], module="m")[0]["ok"])
+                    self.assertFalse(gate([self.evidence(self.payload(**{key: value}))], module="m", flow="v2")[0]["ok"])
         for key in ("report_sha256", "regression_sha256"):
             for bad in (None, "f" * 63, "z" * 64):
                 value = self.payload()
                 value["verification"][key] = bad
-                self.assertFalse(gate([self.evidence(value)], module="m")[0]["ok"])
+                self.assertFalse(gate([self.evidence(value)], module="m", flow="v2")[0]["ok"])
         value = self.payload()
         value["verification"]["verdict"] = "fail"
-        self.assertIn("合并前验证不通过", gate([self.evidence(value)], module="m")[0]["detail"])
+        self.assertIn("合并前验证不通过", gate([self.evidence(value)], module="m", flow="v2")[0]["detail"])
         value = self.payload()
         del value["verification"]
-        self.assertFalse(gate([self.evidence(value)], module="m")[0]["ok"])
+        self.assertFalse(gate([self.evidence(value)], module="m", flow="v2")[0]["ok"])
 
     def test_checks_still_required(self):
         for checks in ([], [{"cmd": "x", "exit": 1}], [{"cmd": "x", "exit": True}]):
-            self.assertFalse(gate([self.evidence(self.payload(checks=checks))], module="m")[0]["ok"])
+            self.assertFalse(gate([self.evidence(self.payload(checks=checks))], module="m", flow="v2")[0]["ok"])
 
     def test_module_binding(self):
         for module, detail in (("other", "证据的模块和接管评论不一致"),
                                (None, "v2 证据只用于 spec-guard 模块")):
-            item, _ = gate([self.evidence()], module=module)
+            item, _ = gate([self.evidence()], module=module, flow="v2")
             self.assertFalse(item["ok"])
             self.assertIn(detail, item["detail"])
 
     def test_stale_edited_and_human_comments_are_ignored(self):
         for comment in (self.evidence(self.payload(head_sha=OTHER)), self.evidence(edited=True),
                         self.evidence(user={"id": 1, "type": "User"}, app=None)):
-            item, notes = gate([comment], module="m")
+            item, notes = gate([comment], module="m", flow="v2")
             self.assertFalse(item["ok"])
             self.assertTrue(notes)
 
@@ -183,8 +183,19 @@ class GateV2Test(unittest.TestCase):
         new = self.evidence()
         bad_new = self.evidence(self.payload(verification={"verdict": "fail"}))
         for comments, ok in (([bad_old, new], True), ([new, bad_old], False),
-                             ([bad_new, old], True), ([old, bad_new], False)):
+                             ([bad_new, old], False), ([old, bad_new], False)):
+            self.assertEqual(gate(comments, module="m", flow="v2")[0]["ok"], ok)
+        for comments, ok in (([bad_new, old], True), ([old, bad_new], False), ([old, new], False)):
             self.assertEqual(gate(comments, module="m")[0]["ok"], ok)
+
+    def test_flow_fixes_the_evidence_version(self):
+        old = evidence(payload(acceptance={"marker": "approved", "sha": HEAD}))
+        item, _ = gate([old], module="m", flow="v2")
+        self.assertFalse(item["ok"])
+        self.assertIn("证据版本和接管评论的流程不一致", item["detail"])
+        item, _ = gate([self.evidence()], module="m")
+        self.assertFalse(item["ok"])
+        self.assertIn("证据版本和接管评论的流程不一致", item["detail"])
 
 
 if __name__ == "__main__":

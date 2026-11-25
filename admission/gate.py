@@ -13,7 +13,8 @@ Flow v2 modules replace review/acceptance with:
        "verification": {"verdict": "pass" | "pass-with-notes", "report_sha256": "<64 hex>",
                         "regression_sha256": "<64 hex>"},
        "artifacts": {"module": "<module>", "verified": ["spec/<module>.md"]}} -->
-Both versions bind to the current head. The workflow does not recompute patch IDs: after a rebase the
+The trusted takeover comment of a flow v2 module carries "flow": "v2"; the gate then accepts only v2 evidence,
+and only v1 evidence otherwise. Both versions bind to the current head. The workflow does not recompute patch IDs: after a rebase the
 orchestrator reruns, reuses verification by patch ID, and posts evidence bound to the new head.
 Only trusted comments (bot, never edited) whose head_sha equals the PR head count; the latest one decides.
 """
@@ -29,7 +30,7 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def problems(p, head_sha, module):
+def problems(p, head_sha, module, flow=None):
     """Reasons this evidence payload does not satisfy the gate; empty list means it does."""
     out = []
     checks = p.get("checks")
@@ -42,6 +43,10 @@ def problems(p, head_sha, module):
                 out.append("检查记录格式不对")
             elif c["exit"] != 0:
                 out.append(f"检查 `{c['cmd']}` 退出码 {c['exit']}")
+    if (flow == "v2") != (p.get("_v") == 2):
+        # The trusted takeover comment fixes the flow: v2 modules need v2 evidence, all others v1.
+        out.append("证据版本和接管评论的流程不一致（新流程模块要 v2 证据，其他要 v1）")
+        return out
     if p.get("_v") == 2:
         for key in ("patch_id", "base_sha"):
             if not isinstance(p.get(key), str) or not re.fullmatch(r"[0-9a-fA-F]{40}", p[key]):
@@ -115,7 +120,7 @@ def current_evidence(comments, bot, head_sha, notes=None):
     return current
 
 
-def gate_item(comments, bot, head_sha, module, notes):
+def gate_item(comments, bot, head_sha, module, notes, flow=None):
     """The `gate` admission item. `module` is the spec-guard module from the trusted takeover comment
     (None for repos without spec-guard). V1 modules need final acceptance; v2 needs module-bound verification."""
     from admission.decide import BOT_MISSING_SHORT  # local: decide imports this module
@@ -126,7 +131,7 @@ def gate_item(comments, bot, head_sha, module, notes):
     current = current_evidence(comments, bot, head_sha, notes)
     if not current:
         return {"id": "gate", "ok": False, "detail": NO_EVIDENCE}, "硬卡：还没有证据"
-    bad = problems(current[-1], head_sha, module)
+    bad = problems(current[-1], head_sha, module, flow)
     if bad:
         return {"id": "gate", "ok": False, "detail": "证据不合格：" + "；".join(bad)}, "硬卡：证据不合格"
     if current[-1]["_v"] == 2:

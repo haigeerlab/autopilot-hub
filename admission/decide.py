@@ -133,8 +133,9 @@ def decide(*, risk, comments, degrade_issues, repo, bot=None, head_sha=None):
     takeover, takeover_short, payload = takeover_item(comments, bot, notes)
     module = payload.get("module") if isinstance(payload, dict) else None
     module = module if isinstance(module, str) and module else None
+    flow = payload.get("flow") if isinstance(payload, dict) else None
     items, shorts = [], []
-    for item, short in (risk_item(risk), (takeover, takeover_short), gate_item(comments, bot, head_sha, module, notes),
+    for item, short in (risk_item(risk), (takeover, takeover_short), gate_item(comments, bot, head_sha, module, notes, flow),
                         degrade_item(degrade_issues, repo)):
         items.append(item)
         if not item["ok"]:
