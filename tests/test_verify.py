@@ -97,9 +97,9 @@ class RealContractTest(unittest.TestCase):
         return dict(type=kind, path=os.path.relpath(path, self.folder),
                     sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(), source=source)
 
-    def check(self, head_exit, base_exit, reply_word):
+    def check(self, head_exit, base_exit, reply_word, note=True):
         comment = dict(id=5, body='', user={'id': 1}, html_url='https://example.test/c/5', created_at='t', updated_at='t')
-        comment['body'] = 'R1 通过\nR2 %s\n意见 R2：列名可以更清楚' % reply_word
+        comment['body'] = 'R1 通过\nR2 %s' % reply_word + ('\n意见 R2：列名可以更清楚' if note else '')
         replies = parse_replies([comment], 1, 0)
         cases = []
         for entry in self.doc['cases']:
@@ -134,3 +134,9 @@ class RealContractTest(unittest.TestCase):
 
     def test_all_pass_stands(self):
         self.assertEqual(self.check(0, None, '通过')['verdict'], 'pass-with-notes')
+        self.assertEqual(self.check(0, None, '通过', note=False)['verdict'], 'pass')
+
+    def test_baseline_fail_without_notes_is_plain_pass(self):
+        report = self.check(1, 1, '通过', note=False)
+        self.assertEqual(report['verdict'], 'pass')
+        self.assertIn('baseline-fail', [c['result'] for c in report['cases']])
