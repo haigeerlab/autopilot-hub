@@ -6,7 +6,7 @@ is merged unless the local admission -- the same code as the reusable workflow, 
 "可以自动合并" on the exact head SHA that was checked and reviewed.
 
 Steps: PR guards -> degradation -> base takeover -> flow v2 module regression verification and recording
-(stops before merge in S2); old-flow modules retain checks -> recorded final acceptance -> evidence ->
+-> v2 evidence; old-flow modules retain checks -> recorded final acceptance -> v1 evidence ->
 admission -> merge -> readback. Repositories without spec-guard always stop for a human merge.
 """
 import base64
@@ -71,16 +71,32 @@ def sg_artifact(path):
     return (path.startswith("spec/") or path.startswith("tasks/")) and path != risk_tiers.CAPABILITY_MAP
 
 
-def verify_artifacts(view, module, changed):
-    """Slice 12: changed spec/<module>.md and tasks/<module>/** count as verified only when spec-guard (run on the
-    head commit) says both the module's Spec and Plan approvals are still in effect. Other modules' files and
-    the capability map are never verified."""
+def verify_artifacts(view, module, changed, flow_v2=False):
+    """Verify changed spec/<module>.md and tasks/<module>/** using the head's spec-guard view.
+    Old flow: both Spec and Plan have approved/codex-approved status and a reviewApprovedBy value.
+    New flow: the requirement is confirmed by the user, and designApproval is explicitly null (bug and small
+    modules have no design), not-required, or approved by user/reviewer. Which rule applies is decided by the
+    caller from the BASE branch (`flow_v2`), never by the head view, so a PR cannot pick its own rule.
+    Other modules and the capability map are never verified.
+    """
     mod = next((m for m in (view or {}).get("modules") or [] if m.get("id") == module), None)
     if not mod:
         return []
-    review, by = mod.get("review") or {}, mod.get("reviewApprovedBy") or {}
-    if any(review.get(k) not in APPROVED or not by.get(k) for k in ("spec", "plan")):
-        return []
+    if flow_v2:
+        if "designApproval" not in mod:
+            return []
+        requirement = mod.get("requirementConfirm")
+        if not isinstance(requirement, dict) or requirement.get("status") != "confirmed" or requirement.get("by") != "user":
+            return []
+        design = mod.get("designApproval")
+        if design is not None and not (isinstance(design, dict) and (
+                design.get("status") == "not-required" or (design.get("status") == "approved"
+                and design.get("approvedBy") in ("user", "reviewer")))):
+            return []
+    else:
+        review, by = mod.get("review") or {}, mod.get("reviewApprovedBy") or {}
+        if any(review.get(k) not in APPROVED or not by.get(k) for k in ("spec", "plan")):
+            return []
     own = [p for p in changed if p == f"spec/{module}.md" or p.startswith(f"tasks/{module}/")]
     return sorted(own)
 
@@ -151,9 +167,20 @@ def narrow_pending(io, repo, base_ref, issues, sg_project, bot, notes, dry_run):
         notes.append(f"降级 #{number}：{body}")
 
 
-def say_takeover(say, module, merge, source):
+def say_takeover(say, module, merge, source, flow=None):
+    """`flow` "v2" tells the hard gate this module is verified against its regression document and needs v2
+    evidence; without it the gate only accepts v1 evidence."""
+    payload = {"module": module, "merge": merge, "source": source}
+    if flow:
+        payload["flow"] = flow
     say(f"接管档位（来源 {source}" + (f"，模块 {module}" if module else "") + f"）：合并 {merge}\n\n"
-        + block("autopilot-takeover", {"module": module, "merge": merge, "source": source}) + "\n")
+        + block("autopilot-takeover", payload) + "\n")
+
+
+def defang(text):
+    """Neutralise HTML comment markers in text copied into bot comments (check output, user note titles), so it
+    can neither forge nor break a machine block such as autopilot-takeover or autopilot-evidence."""
+    return str(text).replace("<!--", "<!\u2060--").replace("-->", "--\u2060>")
 
 
 def read_sg_config(io, repo, base_ref, notes):
@@ -318,13 +345,34 @@ def evidence_body(head, command, check, report, rounds, fp, acceptance=None, art
     if queue_check:
         queue_line = (f"module-crew 合并队列检查：{queue_check['command']}，{queue_check['result']}，"
                       f"耗时 {queue_check['seconds']} 秒（额外参考，不替代本机重跑）\n\n")
-    tail = "\n\n".join(c["cmd"] + "\n" + "\n".join(c["tail"]) for c in checks)
+    tail = defang("\n\n".join(c["cmd"] + "\n" + "\n".join(c["tail"]) for c in checks))
     return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`）\n\n"
             f"{check_lines}\n"
             f"- 审查：delegate／{report.get('backend')}，第 {rounds} 轮，{report.get('review_outcome')}，"
             f"blocking 0，补丁指纹 `{fp[:16]}`\n\n"
             + queue_line + f"<details><summary>检查输出最后 {TAIL} 行</summary>\n\n```\n{tail}\n```\n</details>\n\n"
             + block("autopilot-evidence", payload) + "\n")
+
+
+def evidence_v2_body(head, base, module, command, check, verification, artifacts, extra_checks=(), queue_check=None):
+    """Render flow v2 evidence from the established verification and the checks just executed."""
+    checks = [dict(check, cmd=command)] + list(extra_checks)
+    payload = {"head_sha": head, "base_sha": base, "patch_id": verification["patch_id"],
+               "module": module, "runner": "autopilot-orchestrator",
+               "checks": [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in checks],
+               "verification": {k: verification[k] for k in ("verdict", "report_sha256", "regression_sha256")},
+               "artifacts": artifacts}
+    check_lines = "\n".join(f"- 检查：`{c['cmd']}`，退出码 {c['exit']}（在一次性克隆里由本机编排重新运行）" for c in checks)
+    notes = "\n".join("- 意见：" + defang(title) for title in verification["notes"])
+    queue_line = ""
+    if queue_check:
+        queue_line = (f"module-crew 合并队列检查：{queue_check['command']}，{queue_check['result']}，"
+                      f"耗时 {queue_check['seconds']} 秒（额外参考，不替代本机重跑）\n\n")
+    tail = defang("\n\n".join(c["cmd"] + "\n" + "\n".join(c["tail"]) for c in checks))
+    return (f"**autopilot 硬卡证据**（提交 `{head[:12]}`，补丁指纹 `{verification['patch_id'][:12]}`）\n\n"
+            f"{check_lines}\n- 合并前验证：{verification['verdict']}\n{notes}\n\n"
+            + queue_line + f"<details><summary>检查输出最后 {TAIL} 行</summary>\n\n```\n{tail}\n```\n</details>\n\n"
+            + "<!-- autopilot-evidence:v2 " + json.dumps(payload, ensure_ascii=False, sort_keys=True) + " -->\n")
 
 
 VERIFY_BLOCK = re.compile(r'<!--\s*autopilot-verify:v1\s+(.*?)\s*-->', re.S)
@@ -394,7 +442,7 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
     merge, reason = view_merge(base_view, module)
     if reason:
         notes.append(reason)
-    say_takeover(say, module, merge, '/map --json（基础分支）')
+    say_takeover(say, module, merge, '/map --json（基础分支）', flow='v2')
     if merge != 'auto':
         raise Stop('takeover', f'模块 {module} 的接管档位里合并由人，交你')
     head = pr['head']['sha']
@@ -499,8 +547,8 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
     if report['verdict'] == 'fail':
         failures = '、'.join(c['id'] + '（' + str(c['failCategory']) + '）' for c in report['cases'] if c['result'] == 'fail')
         raise Stop('verification', '合并前验证不通过：' + failures)
-    raise Stop('verification', f"合并前验证已成立并记录（结论 {report['verdict']}，补丁 {patch_id[:12]}）。"
-               '证据评论 v2 和硬卡在 S3 接上，在那之前新流程模块交你合')
+    return dict(verdict=report['verdict'], report_sha256=digest, regression_sha256=doc['sha256'],
+                patch_id=patch_id, notes=[note['title'] for note in report.get('notes', [])])
 
 
 def default_merge_method(repo_info):
@@ -618,12 +666,10 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 io.write_check_evidence(repo, evidence)
                 if result["exit"] != 0:
                     raise Stop("pre-merge", "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"]))
-            acceptance = artifacts = None
+            acceptance = artifacts = verification = None
             if new_modules:
-                # Flow v2: risk pre-check, the core check and pre-merge steps have passed; verify against the
-                # regression document instead of the Codex final acceptance.
-                return verify_module(io, repo, pr, work, new_modules[0], base_view, notes, dry_run, say)
-            if sg_project:
+                module = new_modules[0]
+            else:
                 modules = io.find_modules(repo, head)
                 if not modules:
                     raise Stop("acceptance", "这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
@@ -631,11 +677,15 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if len(modules) > 1:
                     raise Stop("acceptance", "当前提交有多条验收记录（" + "、".join(sorted(modules)) + "），拿不准属于哪个模块")
                 module = modules[0]
-                base_mod = next((m for m in (base_view or {}).get("modules") or []
-                                 if isinstance(m, dict) and m.get("id") == module), None)
-                if base_mod is not None and base_mod.get("tier") is not None:
-                    # Flow v2 modules never use the Codex final acceptance, even if a record exists.
-                    return verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say)
+            base_mod = next((m for m in (base_view or {}).get("modules") or []
+                             if isinstance(m, dict) and m.get("id") == module), None)
+            if base_mod is not None and base_mod.get("tier") is not None:
+                # Flow v2 modules use regression verification instead of the Codex final acceptance.
+                verification = verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say)
+                if dry_run:
+                    return verification
+                merge_base = work.merge_base
+            else:
                 merge, reason = view_merge(base_view, module)
                 if reason:
                     notes.append(reason)
@@ -647,13 +697,28 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if blocking_of(report):
                     raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
                 notes.append(f"模块 {module} 沿用 spec-guard 的验收审查报告，不另审")
-                artifacts = {"module": module, "verified": verify_artifacts(work.module_view(), module, changed)}
+            artifacts = {"module": module, "verified": verify_artifacts(work.module_view(), module, changed,
+                                                                        flow_v2=verification is not None)}
 
         if dry_run:
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
                     "notes": notes, "head_sha": head}
-        say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts,
-                          extra_checks=evidence["checks"][1:], queue_check=queue_check))
+        if verification is not None:
+            body = evidence_v2_body(head, merge_base, module, command, check, verification, artifacts,
+                                    extra_checks=evidence["checks"][1:], queue_check=queue_check)
+            from admission.gate import EVIDENCE_BLOCK
+            found = EVIDENCE_BLOCK.findall(body)
+            try:
+                posted = json.loads(found[-1][1]) if len(found) == 1 and found[0][0] == "2" else None
+            except ValueError:
+                posted = None
+            expected = {k: verification[k] for k in ("verdict", "report_sha256", "regression_sha256")}
+            if not isinstance(posted, dict) or posted.get("verification") != expected:
+                raise Stop("verification", "证据评论的合并前验证与已成立的报告不一致，没有发证据")
+            say(body)
+        else:
+            say(evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts,
+                              extra_checks=evidence["checks"][1:], queue_check=queue_check))
 
         decision = evaluate(io, repo, pr, bot)
         if not decision["auto_merge"]:

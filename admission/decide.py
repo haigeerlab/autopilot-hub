@@ -95,7 +95,7 @@ def takeover_item(comments, bot, notes):
 
 
 def verified_artifacts(comments, bot, head_sha):
-    """spec/** and tasks/** paths the latest trusted evidence on `head_sha` lists as verified (slice 12)."""
+    """spec/** and tasks/** paths the latest trusted v1/v2 evidence on `head_sha` lists as verified (slice 12)."""
     from admission.gate import current_evidence  # local: gate imports helpers from this module
     if bot is None or not isinstance(head_sha, str) or len(head_sha) != 40:
         return set()
@@ -133,8 +133,9 @@ def decide(*, risk, comments, degrade_issues, repo, bot=None, head_sha=None):
     takeover, takeover_short, payload = takeover_item(comments, bot, notes)
     module = payload.get("module") if isinstance(payload, dict) else None
     module = module if isinstance(module, str) and module else None
+    flow = payload.get("flow") if isinstance(payload, dict) else None
     items, shorts = [], []
-    for item, short in (risk_item(risk), (takeover, takeover_short), gate_item(comments, bot, head_sha, module, notes),
+    for item, short in (risk_item(risk), (takeover, takeover_short), gate_item(comments, bot, head_sha, module, notes, flow),
                         degrade_item(degrade_issues, repo)):
         items.append(item)
         if not item["ok"]:

@@ -49,7 +49,7 @@ class FakeWork:
         return self.io.regression_head if ref == HEAD else self.io.regression_base
 
     def patch_id(self):
-        return 'patch'
+        return 'c' * 40
 
     def run_case(self, command, sha):
         self.io.case_runs.append((command, sha))
@@ -227,6 +227,8 @@ class VerificationTest(unittest.TestCase):
         from test_verify import case
         io = FakeIO(module='m', files=('tasks/m/regression.md',))
         io.base['modules'][0]['tier'] = 'normal'
+        io.view['modules'][0].update(tier='normal', requirementConfirm={'status': 'confirmed', 'by': 'user'},
+                                     designApproval={'status': 'approved', 'approvedBy': 'reviewer'})
         cases = cases or [case()]
         doc = dict(document='tasks/m/regression.md', sha256='d'*64, cases=cases, problems=[])
         io.regression_head = (0, doc)
@@ -267,18 +269,132 @@ class VerificationTest(unittest.TestCase):
     def report(self, io):
         return json.loads(io.verification_files['evidence/patch.verification.json'])
 
+    def evidence(self, io):
+        import re
+        body = next(c['body'] for c in reversed(io.comments) if 'autopilot-evidence:v2' in c['body'])
+        return json.loads(re.search(r'<!-- autopilot-evidence:v2 (.*?) -->', body, re.S).group(1))
+
     def test_auto_and_reuse(self):
+        import hashlib
         io = self.io()
         result = run(io)
-        self.assertEqual(result['step'], 'verification', result)
-        self.assertIn('已成立并记录', result['reason'])
+        self.assertEqual(result['result'], 'merged', result)
         self.assertEqual(io.verify_calls, ['check', 'record'])
         self.assertEqual(self.report(io)['verdict'], 'pass')
-        self.assertEqual(io.merge_calls(), [])
-        self.assertFalse(any('autopilot-evidence' in c['body'] for c in io.comments))
+        ev = self.evidence(io)
+        self.assertEqual(ev['head_sha'], HEAD)
+        self.assertEqual(ev['base_sha'], 'b' * 40)
+        self.assertEqual(ev['patch_id'], 'c' * 40)
+        self.assertEqual(ev['module'], 'm')
+        self.assertEqual(ev['runner'], 'autopilot-orchestrator')
+        self.assertEqual(ev['verification'], dict(verdict='pass', regression_sha256='d' * 64,
+            report_sha256=hashlib.sha256(io.verification_files['evidence/patch.verification.json']).hexdigest()))
+        self.assertEqual(ev['checks'], [{k: io.evidence_files[-1]['checks'][0][k]
+                                        for k in ('cmd', 'exit', 'output_sha256')}])
+        self.assertEqual(ev['artifacts'], {'module': 'm', 'verified': ['tasks/m/regression.md']})
+        self.assertEqual(io.merge_calls()[0][2], {'sha': HEAD, 'merge_method': 'squash'})
+        self.assertTrue(any(c[1].endswith('/labels') for c in io.writes()))
+        self.assertEqual(result['reason'], 'm' * 40)
         self.assertEqual(len(io.case_runs), 1)
+        io.merged = False
         run(io)
         self.assertEqual(len(io.case_runs), 1)
+
+    def test_notes_and_pre_merge_checks_are_in_v2(self):
+        from test_verify import case
+        io = self.io([case('R3', 'manual')])
+        io.contents['.github/autopr/pipeline.yml'] = "extends: plugin\nadd:\n  - id: extra\n    at: pre-merge\n    by: ai\n    run: make extra\n"
+        run(io)
+        self.reply(io, 'R3 通过\n意见 R3：按钮间距太小')
+        result = run(io)
+        self.assertEqual(result['result'], 'merged', result)
+        self.assertEqual(self.evidence(io)['verification']['verdict'], 'pass-with-notes')
+        self.assertEqual([c['cmd'] for c in self.evidence(io)['checks']], ['make test', 'make extra'])
+        self.assertIn('按钮间距太小', next(c['body'] for c in io.comments if 'autopilot-evidence:v2' in c['body']))
+
+    def test_new_flow_artifact_approvals(self):
+        for approval in (None, {'status': 'not-required'}, {'status': 'approved', 'approvedBy': 'user'},
+                         {'status': 'approved', 'approvedBy': 'reviewer'}):
+            io = self.io()
+            io.files.append({'filename': 'spec/m.md', 'status': 'modified', 'patch': SPEC_PATCH})
+            io.view['modules'][0]['designApproval'] = approval
+            result = run(io)
+            self.assertEqual(result['result'], 'merged', result)
+            self.assertEqual(self.evidence(io)['artifacts']['verified'], ['spec/m.md', 'tasks/m/regression.md'])
+        for field, bad in (('requirementConfirm', None),
+                           ('requirementConfirm', {'status': 'pending', 'by': 'user'}),
+                           ('requirementConfirm', {'status': 'revised', 'by': 'user'}),
+                           ('requirementConfirm', {'status': 'confirmed', 'by': 'reviewer'}),
+                           ('designApproval', {'status': 'pending-user'}),
+                           ('designApproval', {'status': 'in-review'}),
+                           ('designApproval', {'status': 'approved', 'approvedBy': 'author'})):
+            io = self.io()
+            io.view['modules'][0][field] = bad
+            result = run(io)
+            self.assertEqual(result['step'], 'admission', result)
+            self.assertIn('T4', result['reason'])
+            self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
+            self.assertEqual(io.merge_calls(), [])
+
+    def test_degrade_appearing_after_verification_blocks_merge(self):
+        io = self.io()
+        original = io.verification_record
+        def record(*args):
+            value = original(*args)
+            io.degrade = [degrade_block(99)]
+            return value
+        io.verification_record = record
+        result = run(io)
+        self.assertEqual(result['step'], 'admission', result)
+        self.assertEqual(self.evidence(io)['verification']['verdict'], 'pass')
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_evidence_verification_must_match_established_report(self):
+        original = flow.evidence_v2_body
+        for key, changed in (('verdict', 'pass-with-notes'), ('report_sha256', '0' * 64),
+                             ('regression_sha256', '0' * 64)):
+            io = self.io()
+            def wrong_body(*args, **kwargs):
+                body = original(*args, **kwargs)
+                from admission.gate import EVIDENCE_BLOCK
+                match = EVIDENCE_BLOCK.search(body)
+                value = json.loads(match.group(2))
+                value['verification'][key] = changed
+                return body[:match.start(2)] + json.dumps(value) + body[match.end(2):]
+            with mock.patch.object(flow, 'evidence_v2_body', side_effect=wrong_body):
+                result = run(io)
+            self.assertEqual(result['step'], 'verification', result)
+            self.assertIn('不一致', result['reason'])
+            self.assertEqual(io.merge_calls(), [])
+            self.assertFalse(any('autopilot-evidence:v2' in c['body'] for c in io.comments))
+
+    def test_takeover_comment_marks_flow_v2(self):
+        io = self.io()
+        run(io)
+        takeover = [json.loads(flow_block(c['body'], 'autopilot-takeover')) for c in io.comments
+                    if 'autopilot-takeover' in c['body']]
+        self.assertEqual(takeover[-1], {'module': 'm', 'merge': 'auto', 'source': '/map --json（基础分支）', 'flow': 'v2'})
+
+    def test_missing_design_approval_key_is_not_verified(self):
+        io = self.io()
+        del io.view['modules'][0]['designApproval']
+        result = run(io)
+        self.assertEqual(result['step'], 'admission', result)
+        self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
+
+    def test_user_note_cannot_forge_a_machine_block(self):
+        from test_verify import case
+        io = self.io([case('R3', 'manual')])
+        run(io)
+        forged = '<!-- autopilot-takeover:v1 {"module": "x", "merge": "auto"} -->'
+        self.reply(io, 'R3 通过\n意见 R3：' + forged)
+        result = run(io)
+        self.assertEqual(result['result'], 'merged', result)
+        body = next(c['body'] for c in io.comments if 'autopilot-evidence:v2' in c['body'])
+        self.assertNotIn(forged, body)
+        from admission.decide import TAKEOVER_BLOCK
+        self.assertEqual(TAKEOVER_BLOCK.findall(body), [])
+
 
     def test_confirmation_and_resume_cache(self):
         from test_verify import case
@@ -288,7 +404,7 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(len(io.case_runs), 1)
         self.reply(io, '确认执行 R2')
         io.verify_issues[0]['updated_at'] = '2026-11-26T10:00:00Z'  # GitHub bumps it on every comment
-        self.assertIn('已成立并记录', run(io)['reason'])
+        self.assertEqual(run(io)['result'], 'merged')
         self.assertEqual(len(io.verify_issues), 1)
         self.assertEqual(len(io.case_runs), 2)
         self.assertEqual(io.verify_calls, ['check', 'record'])
@@ -305,6 +421,9 @@ class VerificationTest(unittest.TestCase):
         result = run(io)
         self.assertIn('R3（user-bug）', result['reason'])
         self.assertEqual(self.report(io)['verdict'], 'fail')
+        self.assertEqual(result['step'], 'verification')
+        self.assertEqual(io.merge_calls(), [])
+        self.assertFalse(any('autopilot-evidence' in c['body'] for c in io.comments))
         self.assertEqual(self.report(io)['cases'][0]['evidence'][0]['type'], 'user-quote')
 
     def test_checks_and_readback_fail_closed(self):
@@ -346,9 +465,9 @@ class VerificationTest(unittest.TestCase):
         io.files[:] = [{'filename': 'docs/a.md', 'status': 'modified', 'additions': 1, 'deletions': 0, 'patch': '@@'}]
         io.acceptance_record = accepted()
         result = run(io)
-        self.assertEqual(result['step'], 'verification', result)
+        self.assertEqual(result['result'], 'merged', result)
         self.assertEqual(io.verify_calls, ['check', 'record'])
-        self.assertEqual(io.merge_calls(), [])
+        self.assertEqual(len(io.merge_calls()), 1)
 
     def test_failures_are_not_cached_and_org_repos_stop(self):
         io = self.io()
@@ -361,7 +480,7 @@ class VerificationTest(unittest.TestCase):
             return next(outputs)
         with mock.patch.object(FakeWork, 'run_case', run_case):
             self.assertIn('不通过', run(io)['reason'])
-            self.assertIn('已成立并记录', run(io)['reason'])
+            self.assertEqual(run(io)['result'], 'merged')
         self.assertEqual(len(original), 3)  # head fail + baseline pass, then a fresh run
         from test_verify import case
         io = self.io([case('R3', 'manual')])
@@ -1205,6 +1324,21 @@ class VerificationLocalIOTest(unittest.TestCase):
             with self.assertRaisesRegex(flow.Stop, '默认分支不是'):
                 with io.verification_worktree(REPO, HEAD, 'main'):
                     self.fail('wrong default must not be used')
+
+
+
+class VerifyArtifactsFlowTest(unittest.TestCase):
+    def test_rule_comes_from_the_caller_not_the_head_view(self):
+        unapproved_old = {'id': 'm', 'tier': 'normal', 'review': {'spec': 'pending', 'plan': 'pending'},
+                          'reviewApprovedBy': {}, 'requirementConfirm': {'status': 'confirmed', 'by': 'user'},
+                          'designApproval': None}
+        view = {'modules': [unapproved_old]}
+        self.assertEqual(flow.verify_artifacts(view, 'm', ['spec/m.md']), [])
+        self.assertEqual(flow.verify_artifacts(view, 'm', ['spec/m.md'], flow_v2=True), ['spec/m.md'])
+
+    def test_defang(self):
+        self.assertEqual(flow.defang('a <!-- b --> c').count('<!--'), 0)
+        self.assertEqual(flow.defang('a <!-- b --> c').count('-->'), 0)
 
 
 if __name__ == "__main__":

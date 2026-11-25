@@ -8,7 +8,7 @@
 # - Never checks out or runs PR code. The risk config is read from the BASE branch via the API.
 # - The merge setting comes from the latest `autopilot-takeover:v1` PR comment written by the local orchestrator;
 #   only comments by the App bot in the hub's bot-identity.json that were never edited count (slice 8).
-# - The hard gate reads the bot's `autopilot-evidence:v1` comment bound to HEAD_SHA (slice 9).
+# - The hard gate reads the bot's `autopilot-evidence:v1` or `autopilot-evidence:v2` comment bound to HEAD_SHA (slice 9).
 # - All event values reach shell only through env vars, never inlined into `run:` scripts.
 # - The check run is always `neutral`: it reports eligibility, it never blocks.
 name: autopilot-admission

@@ -189,6 +189,11 @@ class VerifiedArtifactsFromEvidenceTest(unittest.TestCase):
         body = evidence_body().replace('"acceptance":', '"artifacts": {"module": "m", "verified": ["spec/m.md"]}, "acceptance":')
         self.assertEqual(d.verified_artifacts([bot(body)], BOT, HEAD), {"spec/m.md"})
 
+    def test_v2_verified_artifacts(self):
+        body = evidence_body().replace("autopilot-evidence:v1", "autopilot-evidence:v2").replace(
+            '"runner":', '"artifacts": {"verified": ["spec/m.md", "tasks/m/plan.md", "src/a.py"]}, "runner":')
+        self.assertEqual(d.verified_artifacts([bot(body)], BOT, HEAD), {"spec/m.md", "tasks/m/plan.md"})
+
     def test_untrusted_or_stale_evidence_verifies_nothing(self):
         body = evidence_body().replace('"acceptance":', '"artifacts": {"module": "m", "verified": ["spec/m.md"]}, "acceptance":')
         human = {"login": "haigeerlab", "id": 1, "type": "User"}
