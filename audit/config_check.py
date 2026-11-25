@@ -10,9 +10,10 @@ import re
 
 from checkup import yamlsub
 
-ORDER = {"spec": ("human", "codex"), "plan": ("human", "codex"), "merge": ("human", "auto"),
+ORDER = {"design": ("human", "reviewer"), "merge": ("human", "auto"),
          "release": ("human", "prepare", "auto-confirm", "auto")}
-PRESETS = {"none": {}, "plan": {"plan": "codex"}, "merge": {"spec": "codex", "plan": "codex", "merge": "auto"}}
+PRESETS = {"none": {}, "design": {"design": "reviewer"}, "merge": {"design": "reviewer", "merge": "auto"},
+           "plan": {}}
 CALLERS = (".github/workflows/autopilot-admission.yml", ".github/workflows/autopilot-degrade.yml")
 USES = re.compile(r"uses:\s*haigeerlab/autopilot-hub/\S+@([0-9a-f]{40})")
 HUB_REF = re.compile(r"hub_ref:\s*([0-9a-f]{40})")
@@ -24,10 +25,16 @@ def problem(kind, severity, detail):
 
 
 def items_of(value):
-    """All four items of a takeover value (missing items are human), or None when it is not valid."""
+    """Resolve spec-guard interface 1.22's design/merge/release items, defaulting to human.
+
+    Legacy preset plan means none; merge means the new merge preset. Legacy spec/plan
+    object items accept human/codex but have no effect. Invalid values return None.
+    """
     if isinstance(value, str):
         chosen = PRESETS.get(value)
-    elif isinstance(value, dict) and all(k in ORDER and v in ORDER[k] for k, v in value.items()):
+    elif isinstance(value, dict) and all(
+            (k in ORDER and v in ORDER[k]) or (k in ("spec", "plan") and v in ("human", "codex"))
+            for k, v in value.items()):
         chosen = value
     else:
         chosen = None
@@ -50,7 +57,7 @@ def _read(root, rel):
 
 
 def read_takeover(root):
-    """{"project": value, "modules": {id: value}} from a checkout, resolved the way spec-guard 0.92 does."""
+    """{"project": value, "modules": {id: value}} from a checkout, with spec-guard interface 1.22 value compatibility."""
     if _read(root, "spec/CAPABILITY-MAP.md") is not None:
         try:
             config = json.loads(_read(root, ".agent/config.json") or "{}")

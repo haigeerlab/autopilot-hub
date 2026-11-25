@@ -1,5 +1,5 @@
 {
-  "schema": "autopilot.audit-baselines/v1",
+  "schema": "autopilot.audit-baselines/v2",
   "repos": {
     "haigeerlab/agent-relay": {
       "since": "2026-11-23",

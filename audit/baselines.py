@@ -1,12 +1,12 @@
 """Slice 18a: approved baselines for the compliance audit (audit/baselines.json; changing it is T4).
 
-Format (autopilot.audit-baselines/v1):
-  {"schema": "autopilot.audit-baselines/v1",
+Format (autopilot.audit-baselines/v2):
+  {"schema": "autopilot.audit-baselines/v2",
    "repos": {"owner/name": {"since": "YYYY-MM-DD", "approval": "<where the user's words are>",
                             "hub_pin": "<40 hex>" | null (no caller files), "takeover": {"project": <value>, "modules": {id: <value>}},
                             "checkup": {"C1": "ok" | "missing" | "unknown", ...}}}}
-A takeover value is a spec-guard preset ("none", "plan", "merge") or an item object
-({"spec", "plan", "merge", "release"} for spec-guard projects; {"merge", "release"} for takeover.yml repos).
+A takeover value is a spec-guard preset ("none", "design", "merge") or a design/merge/release item object.
+Both v1 and v2 use interface 1.22 compatibility: legacy plan means none; valid legacy spec/plan items are ignored.
 """
 import json
 import os
@@ -15,7 +15,7 @@ import re
 from audit import config_check
 
 DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baselines.json")
-SCHEMA = "autopilot.audit-baselines/v1"
+SCHEMA = "autopilot.audit-baselines/v2"
 REPO = re.compile(r"[\w.-]+/[\w.-]+")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -32,8 +32,8 @@ class BaselineError(ValueError):
 def validate(data):
     """Return {repo: baseline}; raise BaselineError listing every problem."""
     problems = []
-    if not isinstance(data, dict) or data.get("schema") != SCHEMA or not isinstance(data.get("repos"), dict):
-        raise BaselineError(["基线文件的 schema 必须是 %s，repos 必须是对象" % SCHEMA])
+    if not isinstance(data, dict) or data.get("schema") not in ("autopilot.audit-baselines/v1", SCHEMA) or not isinstance(data.get("repos"), dict):
+        raise BaselineError(["基线文件的 schema 必须是 autopilot.audit-baselines/v1 或 %s，repos 必须是对象" % SCHEMA])
     for repo, item in data["repos"].items():
         where = "基线 %s" % repo
         if not REPO.fullmatch(repo):

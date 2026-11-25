@@ -34,6 +34,11 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - `scripts/validate.sh`（规范 C2）：全量检查入口，按 `unittest discover` 的规则逐个跑测试文件并打印最慢 5 个；`--quick` 只跑改动涉及的测试（按导入关系追到间接依赖，对应不上退回全量，有文档改动时加跑扫全仓的测试）。CI 的测试步骤改为调用它。
 
 ### Changed
+- S110 切片 S1 与 S5 配置部分（跟随 spec-guard 接口 1.22 的接管档位改版）：
+  - 编排：spec-guard 项目的合并档位改为在基础分支提交上跑 `map_view --json`，读模块生效的 `takeover.merge`；读不到、spec-guard 早于 1.22（没有 `designForcedBy`）、字段缺失，一律按人合。删掉自己解析 `.agent/config.json` 的那套算法；收窄说明改为「合并 → 技术方案 → 不接管」。
+  - 合规监测：档位改为 design／merge／release 三项、预设 none／design／merge；旧值按 spec-guard 兼容表读（旧 `plan` 读作 none，旧对象里合法的 spec／plan 忽略）；基线 schema 升到 v2，v1 照常可读。
+  - 发布引擎：新预设 `design` 的发布档位按 human，不再提示读不懂。
+
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。
 
 ## 统一基线 713a3d8（2026-11-23）

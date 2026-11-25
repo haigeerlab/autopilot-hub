@@ -156,6 +156,16 @@ class ReleaseLevelTest(unittest.TestCase):
         self.assertEqual(self.level({})[0], "human")
         self.assertEqual(self.level({"spec/CAPABILITY-MAP.md": ""})[0], "human")
 
+    def test_interface_1_22_presets_are_human_without_notes(self):
+        for value in ("none", "design", "merge"):
+            with self.subTest(value=value):
+                actual, notes = self.level({"spec/CAPABILITY-MAP.md": "", ".agent/config.json":
+                                            json.dumps({"takeover": value})})
+                self.assertEqual((actual, notes), ("human", []))
+        config = {"takeover": {"design": "reviewer", "merge": "auto", "release": "prepare"}}
+        actual, notes = self.level({"spec/CAPABILITY-MAP.md": "", ".agent/config.json": json.dumps(config)})
+        self.assertEqual((actual, notes), ("prepare", []))
+
     def test_invalid_spec_guard_root_has_a_chinese_note(self):
         for config in ("[]", "null", "42"):
             actual, notes = self.level({"spec/CAPABILITY-MAP.md": "", ".agent/config.json": config})

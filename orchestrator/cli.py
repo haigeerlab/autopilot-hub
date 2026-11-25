@@ -166,6 +166,20 @@ class Work:
             return None
         return {"path": relative.as_posix(), "sha256": digest.hexdigest()}
 
+    def base_view(self):
+        """Run spec-guard's map view on the fetched base commit; None if unavailable."""
+        self.git("checkout", "-q", "--detach", self.base_tip)
+        script = find_map_view()
+        if not script or not os.path.exists(script):
+            return None
+        try:
+            result = subprocess.run(["python3", "-B", script, "--json", "--project", self.root], cwd=self.root,
+                                    env=_clean_env(), capture_output=True, text=True,
+                                    stdin=subprocess.DEVNULL, timeout=120)
+            return json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
     def module_view(self):
         """spec-guard's map view of the head commit (the clone is on head after run_check); None if unavailable."""
         script = find_map_view()
@@ -484,7 +498,7 @@ class LocalIO:
             work.git("push", "-q", "--force", url, "HEAD:refs/heads/%s" % branch)
         created = self.api("repos/%s/pulls" % repo, "POST", {
             "title": "autopilot 收窄接管档位：%s（降级 #%d）" % (target, issue_number), "head": branch, "base": base_ref,
-            "body": ("%s。\n\n按 spec-guard 的收窄规则降一格（合并 → Plan → 不接管），由 `project_config.py narrow --source "
+            "body": ("%s。\n\n按 spec-guard 的收窄规则降一格（合并 → 技术方案 → 不接管），由 `project_config.py narrow --source "
                      "autopilot` 生成。改的是 `.agent/config.json`，属于 T4，请你审后合并；在那之前降级 issue #%d 已阻止自动合并。"
                      % (reason, issue_number))})
         return (created or {}).get("html_url")

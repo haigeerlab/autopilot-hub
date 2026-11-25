@@ -35,6 +35,10 @@ def report(blocking=0, status="completed", outcome=None, unreviewed=(), fp="f" *
             "unreviewed": [{"path": p, "reason": "x"} for p in unreviewed], "recheck": recheck}
 
 
+def effective(merge="auto"):
+    return {"design": "reviewer", "merge": merge, "release": "human", "designForcedBy": None}
+
+
 class FakeWork:
     def __init__(self, io):
         self.io = io
@@ -49,6 +53,9 @@ class FakeWork:
         self.io.ran.append(command)
         return self.io.check_results.get(command, flow.check_result(self.io.check_exit, "ok\n"))
 
+    def base_view(self):
+        return self.io.base
+
     def module_view(self):
         return self.io.view
 
@@ -60,7 +67,7 @@ class FakeWork:
 class FakeIO:
     def __init__(self, *, merge="auto", files=("docs/a.md",), author=None, fork=False, degrade=(), takeover=True,
                  reports=None, check_exit=0, check_command="make test", stored=None, merged_ok=True, bot=BOT,
-                 module=None, acceptance=None, sg_config=None):
+                 module=None, acceptance=None, base_takeover=None):
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
         self.evidence_files = []
         self.issue_comments, self.narrow_prs, self.narrow_result = {}, [], "https://github.com/x/pull/9"
@@ -82,10 +89,11 @@ class FakeIO:
         self.contents = {".github/autopr/risk-tiers.yml": "extends: plugin\n"}
         if takeover:
             self.contents[".github/autopr/takeover.yml"] = f"merge: {merge}\n"
-        if module:  # a spec-guard project: capability map + takeover config on the base branch
+        self.base = None
+        if module:  # a spec-guard project: effective takeover on the base commit
             self.contents["spec/CAPABILITY-MAP.md"] = "# 能力图\n"
-            cfg = sg_config if sg_config is not None else {"takeover": "plan", "moduleTakeover": {module: "merge"}}
-            self.contents[".agent/config.json"] = json.dumps(cfg)
+            entries = base_takeover if base_takeover is not None else {module: effective()}
+            self.base = {"modules": [{"id": key, "takeover": value} for key, value in entries.items()]}
         self.degrade = [{"number": n, "body": '<!-- autopilot-degrade:v1 {"scope": {"repo": "%s"}} -->' % REPO}
                         for n in degrade]
 
@@ -491,23 +499,48 @@ class AcceptanceTest(unittest.TestCase):
         io = FakeIO(module="m", acceptance=accepted(), reports=[])
         run(io)
         self.assertIn('"module": "m"', io.comments[0]["body"])
+        self.assertIn("/map --json（基础分支）", io.comments[0]["body"])
+        self.assertFalse(any("contents/.agent/config.json" in path for _, path, _ in io.calls))
 
     def test_spec_guard_project_without_any_auto_stops_before_checks(self):
-        io = FakeIO(module="m", acceptance=accepted(), reports=[], sg_config={"takeover": "plan"})
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"m": effective("human")})
         res = run(io)
         self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
         self.assertEqual(io.ran, [])
 
-    def test_module_merge_from_base_config(self):
+    def test_module_human_from_base_view(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[],
-                    sg_config={"takeover": "merge", "moduleTakeover": {"m": "plan", "other": "merge"}})
+                    base_takeover={"m": effective("human"), "other": effective()})
         res = run(io)
         self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
         self.assertIn("模块 m", res["reason"])
 
-    def test_project_takeover_applies_to_module_without_entry(self):
-        io = FakeIO(module="m", acceptance=accepted(), reports=[], sg_config={"takeover": {"merge": "auto"}})
+    def test_effective_auto_from_base_view(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"m": effective()})
         self.assertEqual(run(io)["result"], "merged")
+
+    def test_unavailable_base_view_stops_before_checks(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[])
+        io.base = None
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
+        self.assertEqual(io.ran, [])
+        self.assertTrue(res["notes"])
+
+    def test_head_cannot_widen_base_takeover(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[],
+                    base_takeover={"m": effective("human"), "other": effective()})
+        io.view["modules"][0]["takeover"] = effective()
+        res = run(io)
+        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
+        self.assertIn("模块 m", res["reason"])
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_module_added_in_head_is_human(self):
+        io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"other": effective()})
+        res = run(io)
+        self.assertEqual(res["step"], "takeover")
+        self.assertIn("基础分支上还没有模块 m", " ".join(res["notes"]))
 
     def test_several_records_for_head_stop(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[])
@@ -734,22 +767,32 @@ class StatsTest(unittest.TestCase):
         self.assertEqual((out["auto_merged"], out["reverted"], out["reverted_or_reworked"]), (1, 0, 0))
 
 
-class TakeoverConfigTest(unittest.TestCase):
-    def test_presets_and_objects(self):
-        self.assertEqual(flow.module_merge({}, "m"), "human")
-        self.assertEqual(flow.module_merge({"takeover": "merge"}, "m"), "auto")
-        self.assertEqual(flow.module_merge({"takeover": "plan"}, "m"), "human")
-        self.assertEqual(flow.module_merge({"takeover": {"plan": "codex"}}, "m"), "human")
-        self.assertEqual(flow.module_merge({"takeover": {"merge": "auto", "release": "prepare"}}, "m"), "auto")
+class TakeoverViewTest(unittest.TestCase):
+    def test_effective_values(self):
+        for merge in ("auto", "human"):
+            for forced in (None, "important"):
+                with self.subTest(merge=merge, forced=forced):
+                    takeover = dict(effective(merge), designForcedBy=forced)
+                    view = {"modules": [{"id": "m", "takeover": takeover}]}
+                    self.assertEqual(flow.view_merge(view, "m"), (merge, None))
 
-    def test_module_entry_wins_and_bad_entries_fall_back(self):
-        cfg = {"takeover": "none", "moduleTakeover": {"m": "merge"}}
-        self.assertEqual(flow.module_merge(cfg, "m"), "auto")
-        self.assertEqual(flow.module_merge(cfg, "n"), "human")
-        bad = {"takeover": "none", "moduleTakeover": {"m": "merge", "x": {"merge": "yes"}}}
-        self.assertEqual(flow.module_merge(bad, "m"), "human")
-        self.assertEqual(flow.module_merge({"takeover": "bogus"}, "m"), "human")
-        self.assertEqual(flow.module_merge({"takeover": {"merge": "auto", "colour": "red"}}, "m"), "human")
+    def test_unavailable_or_missing_module_is_human_with_reason(self):
+        for view in (None, {}, {"modules": []}):
+            with self.subTest(view=view):
+                merge, reason = flow.view_merge(view, "m")
+                self.assertEqual(merge, "human")
+                self.assertTrue(reason)
+        self.assertIn("基础分支上还没有模块 m", flow.view_merge({"modules": []}, "m")[1])
+
+    def test_invalid_or_legacy_takeover_is_human_with_reason(self):
+        partial = [{k: v for k, v in effective().items() if k != drop} for drop in ("design", "release")]
+        for takeover in [None, "merge", {}, {"merge": "auto"}, dict(effective(), merge="yes")] + partial:
+            with self.subTest(takeover=takeover):
+                view = {"modules": [{"id": "m", "takeover": takeover}]}
+                merge, reason = flow.view_merge(view, "m")
+                self.assertEqual(merge, "human")
+                self.assertTrue(reason)
+        self.assertIn("1.22", flow.view_merge({"modules": [{"id": "m", "takeover": {"merge": "auto"}}]}, "m")[1])
 
 
 class LocalIOTest(unittest.TestCase):
@@ -794,6 +837,63 @@ class LocalIOTest(unittest.TestCase):
         self.assertEqual(found["report_text"], "{}")
         self.assertIsNone(self.io.acceptance(REPO, "../m"))
         self.assertIsNone(self.io.acceptance("other/repo", "m"))
+
+
+class LocalBaseViewTest(unittest.TestCase):
+    def test_map_runs_on_base_and_check_returns_to_head(self):
+        import subprocess
+        import tempfile
+        from _checkup_util import commit_on_branch, make_repo
+        from orchestrator import cli
+        root = make_repo(self, {"source": "base"})
+        base = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        commit_on_branch(root, {"source": "head"})
+        head = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.base_tip, work.head, work.git_env = root, base, head, dict(os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "map_view.py")
+            with open(script, "w") as stream:
+                stream.write("import json, pathlib\nprint(json.dumps({'source': pathlib.Path('source').read_text()}))\n")
+            with mock.patch.object(cli, "find_map_view", return_value=script):
+                self.assertEqual(work.base_view(), {"source": "base"})
+        self.assertEqual(work.git("rev-parse", "HEAD").strip(), base)
+        self.assertEqual(work.run_check("test $(cat source) = head")["exit"], 0)
+        self.assertEqual(work.git("rev-parse", "HEAD").strip(), head)
+
+    def test_map_failures_return_none(self):
+        import subprocess
+        from orchestrator import cli
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.base_tip = "/fake/clone", "b" * 40
+        failures = [subprocess.CompletedProcess([], 1, "{}", "failed"),
+                    subprocess.CompletedProcess([], 0, "not json", ""),
+                    subprocess.TimeoutExpired("map", 120), OSError("unavailable")]
+        for result in failures:
+            with self.subTest(result=result), mock.patch.object(work, "git") as git_call, \
+                    mock.patch.object(cli, "find_map_view", return_value="/fake/map_view.py"), \
+                    mock.patch.object(cli.os.path, "exists", return_value=True), \
+                    mock.patch.object(cli.subprocess, "run") as process:
+                if isinstance(result, Exception):
+                    process.side_effect = result
+                else:
+                    process.return_value = result
+                self.assertIsNone(work.base_view())
+                git_call.assert_called_once_with("checkout", "-q", "--detach", work.base_tip)
+                arguments, options = process.call_args
+                self.assertEqual(arguments[0], ["python3", "-B", "/fake/map_view.py", "--json", "--project", work.root])
+                self.assertEqual(options["timeout"], 120)
+                self.assertEqual(options["stdin"], subprocess.DEVNULL)
+
+    def test_missing_map_returns_none(self):
+        from orchestrator import cli
+        work = cli.Work.__new__(cli.Work)
+        work.base_tip = "b" * 40
+        for script, exists in ((None, False), ("/fake/missing.py", False)):
+            with self.subTest(script=script), mock.patch.object(work, "git"), \
+                    mock.patch.object(cli, "find_map_view", return_value=script), \
+                    mock.patch.object(cli.os.path, "exists", return_value=exists):
+                self.assertIsNone(work.base_view())
 
 
 class LocalWorkPipelineTest(unittest.TestCase):
