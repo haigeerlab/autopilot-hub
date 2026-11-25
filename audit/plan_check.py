@@ -46,12 +46,17 @@ def check_plan(view):
     if not isinstance(view, dict) or not isinstance(view.get("modules"), list):
         return {"problems": [problem("map-unavailable", "提醒", "读不到 spec-guard 的 map_view，Plan 审批判不了")],
                 "notes": []}
-    problems, notes, unmarked = [], [], []
+    problems, notes, unmarked, flow_v2 = [], [], [], []
     if any("reviewRounds" not in m for m in view["modules"]):
         notes.append(ROUNDS_NOTE)
     for m in view["modules"]:
         mid = m.get("id")
         if not started(m):
+            continue
+        if m.get("tier") is not None:
+            # spec-guard flow v2 (interface 1.18+): the Plan is approved automatically on write; requirement
+            # confirmation, the design approval and verification are what count, and S110's checks judge them.
+            flow_v2.append(mid)
             continue
         review = m.get("review") or {}
         by = m.get("reviewApprovedBy") or {}
@@ -78,6 +83,10 @@ def check_plan(view):
         if reasons and (spec == "codex-approved" or spec in ("pending", "invalid")):
             problems.append(problem("important-not-user", "严重", "模块 %s 是重要需求（%s），已开工，但 Spec 不是你批的（%s）" % (
                 mid, "、".join(reasons), spec)))
+    if flow_v2:
+        shown = "、".join(str(m) for m in flow_v2[:8]) + ("等" if len(flow_v2) > 8 else "")
+        notes.append("%d 个新流程模块不按老流程审批规则检查（Plan、重要需求 Spec、审查轮次都不查；Plan 写完即自动批准，"
+                     "需求确认与技术方案批准改由 S110 的新流程检查判断，尚未接入）：%s" % (len(flow_v2), shown))
     if unmarked:
         shown = "、".join(str(m) for m in unmarked[:8]) + ("等" if len(unmarked) > 8 else "")
         notes.append("%d 个已开工模块的 Plan 没有批准标记（多为用批准标记之前的旧模块），判不了：%s" % (len(unmarked), shown))

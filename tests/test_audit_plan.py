@@ -147,3 +147,40 @@ class ReviewRoundsTest(unittest.TestCase):
 
     def test_rounds_present_drop_the_unverified_note(self):
         self.assertFalse(any("未独立核验" in n for n in run(module())["notes"]))
+
+
+class FlowV2ModulesTest(unittest.TestCase):
+    """New-flow modules (tier set by spec-guard flow v2) auto-approve their Plan; S110's new-flow checks judge them."""
+
+    def flow_v2(self, **kw):
+        m = module(plan="pending", by_plan="auto", spec="pending", by_spec=None, **kw)
+        m["tier"] = "normal"
+        return m
+
+    def test_flow_v2_module_is_not_judged_by_plan_approval(self):
+        result = run(self.flow_v2())
+        self.assertEqual(result["problems"], [])
+
+    def test_flow_v2_module_is_noted(self):
+        self.assertTrue(any("新流程" in n for n in run(self.flow_v2())["notes"]))
+
+    def test_flow_v2_skips_important_spec_and_rounds_too(self):
+        m = module(spec="codex-approved", by_spec="codex", plan="codex-approved", by_plan="codex",
+                   reasons=("新模块",), rounds={"spec": rnd(1, 1, 0), "plan": rnd(2)})
+        m["tier"] = "important"
+        self.assertEqual(run(m)["problems"], [])
+
+    def test_flow_v2_note_truncates_after_eight(self):
+        mods = []
+        for i in range(9):
+            m = self.flow_v2()
+            m["id"] = "f%d" % i
+            mods.append(m)
+        note = [n for n in run(*mods)["notes"] if "新流程" in n][0]
+        self.assertIn("9 个", note)
+        self.assertTrue(note.endswith("等"))
+
+    def test_old_module_without_tier_is_still_checked(self):
+        m = module(plan="pending", by_plan=None)
+        m["tier"] = None
+        self.assertEqual(kinds(run(m)), ["plan-not-approved"])
