@@ -367,6 +367,7 @@ class VerificationTest(unittest.TestCase):
         io = self.io([case('R3', 'manual')])
         io.pr['base']['repo']['owner']['type'] = 'Organization'
         self.assertIn('组织', run(io)['reason'])
+        self.assertEqual(io.verify_issues, [])
 
     def test_risk_and_core_check_run_before_cases(self):
         io = self.io()

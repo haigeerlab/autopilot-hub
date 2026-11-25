@@ -440,10 +440,10 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:
-            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
             owner = pr['base']['repo']['owner']
-            if owner.get('type') == 'Organization':
+            if owner.get('type') == 'Organization':  # checked before any tracking-issue write
                 raise Stop('verification', '仓库属于组织，跟踪 issue 只认仓库所有者本人的答复，组织仓库还不支持，交你处理')
+            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
             owner_id = owner.get('id')
             if owner_id is None:
                 owner_id = (io.api(f'repos/{repo}').get('owner') or {}).get('id')
