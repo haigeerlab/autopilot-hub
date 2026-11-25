@@ -24,7 +24,7 @@ def read_release_level(io, repo, base_ref, notes):
         if config_notes or not config:
             notes.append(".agent/config.json 缺省或读不懂，发布档位按 human")
         value = config.get("takeover", "none")
-        if value in ("none", "plan", "merge"):
+        if value in ("none", "plan", "design", "merge"):
             return "human"
         if isinstance(value, dict):
             value = value.get("release", "human")

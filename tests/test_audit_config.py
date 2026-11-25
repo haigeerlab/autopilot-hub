@@ -44,9 +44,11 @@ class BaselinesTest(unittest.TestCase):
     def test_load_valid_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "baselines.json")
-            with open(path, "w") as fh:
-                json.dump({"schema": "autopilot.audit-baselines/v1", "repos": {REPO: baseline()}}, fh)
-            self.assertEqual(b.load(path)[REPO]["hub_pin"], PIN)
+            for schema in ("autopilot.audit-baselines/v1", "autopilot.audit-baselines/v2"):
+                with self.subTest(schema=schema):
+                    with open(path, "w") as fh:
+                        json.dump({"schema": schema, "repos": {REPO: baseline()}}, fh)
+                    self.assertEqual(b.load(path)[REPO], baseline())
 
     def test_problems_are_all_listed(self):
         bad = {"schema": "autopilot.audit-baselines/v1", "repos": {
@@ -71,16 +73,27 @@ class BaselinesTest(unittest.TestCase):
 
 class TakeoverItemsTest(unittest.TestCase):
     def test_presets_and_objects(self):
-        self.assertEqual(c.items_of("none"), {"spec": "human", "plan": "human", "merge": "human", "release": "human"})
-        self.assertEqual(c.items_of("plan")["plan"], "codex")
-        self.assertEqual(c.items_of("merge"), {"spec": "codex", "plan": "codex", "merge": "auto", "release": "human"})
-        self.assertEqual(c.items_of({"release": "prepare"})["release"], "prepare")
-        self.assertIsNone(c.items_of("bogus"))
-        self.assertIsNone(c.items_of({"merge": "yes"}))
+        human = {"design": "human", "merge": "human", "release": "human"}
+        self.assertEqual(c.items_of("none"), human)
+        self.assertEqual(c.items_of("design"), dict(human, design="reviewer"))
+        self.assertEqual(c.items_of("merge"), dict(human, design="reviewer", merge="auto"))
+        self.assertEqual(c.items_of("plan"), human)
+        self.assertEqual(c.items_of({"design": "reviewer", "merge": "auto"}), c.items_of("merge"))
+        self.assertEqual(c.items_of({"spec": "codex", "plan": "codex", "merge": "auto"}), dict(human, merge="auto"))
+        self.assertEqual(c.items_of({"spec": "human", "plan": "human"}), human)
+        for release in ("human", "prepare", "auto-confirm", "auto"):
+            self.assertEqual(c.items_of({"release": release}), dict(human, release=release))
+        for value in ("bogus", {"merge": "yes"}, {"plan": "yes"}, {"spec": "yes"},
+                      {"design": "codex"}, {"requirement": "auto"}):
+            with self.subTest(value=value):
+                self.assertIsNone(c.items_of(value))
 
     def test_wider_lists_each_item(self):
+        self.assertEqual(c.wider(c.items_of("plan"), c.items_of("plan")), [])
+        self.assertEqual(c.wider(c.items_of("design"), c.items_of("plan")), [("design", "human", "reviewer")])
+        self.assertEqual(c.wider(c.items_of("design"), c.items_of("merge")), [])
         self.assertEqual(c.wider(c.items_of("merge"), c.items_of("plan")),
-                         [("spec", "human", "codex"), ("merge", "human", "auto")])
+                         [("design", "human", "reviewer"), ("merge", "human", "auto")])
         self.assertEqual(c.wider(c.items_of("none"), c.items_of("plan")), [])
         self.assertEqual(c.wider(c.items_of({"release": "auto"}), c.items_of({"release": "auto-confirm"})),
                          [("release", "auto-confirm", "auto")])
@@ -99,6 +112,16 @@ class ReadTakeoverTest(unittest.TestCase):
             write(root, ".agent/config.json", json.dumps({"takeover": "plan", "moduleTakeover": {"m": "merge", "x": 1}}))
             self.assertEqual(c.read_takeover(root), {"project": "plan", "modules": {}})
 
+    def test_legacy_module_items_are_ignored_but_validated(self):
+        with tempfile.TemporaryDirectory() as root:
+            write(root, "spec/CAPABILITY-MAP.md", "# map\n")
+            legacy = {"spec": "codex", "plan": "codex", "merge": "auto"}
+            write(root, ".agent/config.json", json.dumps({"takeover": "design", "moduleTakeover": {"m": legacy}}))
+            self.assertEqual(c.read_takeover(root), {"project": "design", "modules": {"m": legacy}})
+            write(root, ".agent/config.json", json.dumps({"takeover": "design", "moduleTakeover": {
+                "m": legacy, "bad": {"plan": "yes"}}}))
+            self.assertEqual(c.read_takeover(root), {"project": "design", "modules": {}})
+
     def test_plain_repo_reads_takeover_yml(self):
         with tempfile.TemporaryDirectory() as root:
             write(root, ".github/autopr/takeover.yml", "merge: auto\nrelease: prepare\n")
@@ -116,7 +139,7 @@ class CheckTakeoverTest(unittest.TestCase):
     def test_project_widened_is_severe(self):
         problems = c.check_takeover({"project": "merge", "modules": {}}, baseline())
         self.assertEqual({p["severity"] for p in problems}, {"严重"})
-        self.assertEqual(len(problems), 2)  # spec human→codex and merge human→auto
+        self.assertEqual(len(problems), 2)  # design human to reviewer and merge human to auto
         self.assertTrue(any("merge" in p["detail"] for p in problems))
 
     def test_new_module_entry_wider_than_project_baseline(self):
@@ -125,6 +148,11 @@ class CheckTakeoverTest(unittest.TestCase):
 
     def test_narrower_is_clean(self):
         self.assertEqual(c.check_takeover({"project": "none", "modules": {}}, baseline()), [])
+
+    def test_design_preset_is_readable(self):
+        problems = c.check_takeover({"project": "design", "modules": {}}, baseline())
+        self.assertEqual([p["kind"] for p in problems], ["takeover-wider"])
+        self.assertIn("design 从 human 放宽到 reviewer", problems[0]["detail"])
 
     def test_unreadable_current_value_is_reported(self):
         problems = c.check_takeover({"project": "bogus", "modules": {}}, baseline())

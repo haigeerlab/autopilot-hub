@@ -5,8 +5,8 @@ so the flow itself is testable with fakes. Every stop leaves one bot comment say
 is merged unless the local admission -- the same code as the reusable workflow, fed fresh inputs -- says
 "可以自动合并" on the exact head SHA that was checked and reviewed.
 
-Steps: PR guards -> open degrade issues -> takeover (spec-guard projects: base-branch .agent/config.json once the
-module is known from its acceptance record; others: .github/autopr/takeover.yml) -> risk pre-check -> checks in a throwaway clone
+Steps: PR guards -> open degrade issues -> takeover (spec-guard projects: effective base-commit map view;
+others: .github/autopr/takeover.yml) -> risk pre-check -> checks in a throwaway clone
 -> local check evidence file (read by spec-guard) -> review: spec-guard modules reuse the final-acceptance
 review recorded outside the commit, other repos run delegate (round 2 rechecks against round 1) -> evidence
 comment -> admission -> merge --match-head-commit -> read back -> labels.
@@ -65,10 +65,6 @@ def base_file(io, repo, path, ref):
 
 
 SG_CAPABILITY_MAP = "spec/CAPABILITY-MAP.md"
-SG_CONFIG = ".agent/config.json"
-SG_PRESETS = {"none": "human", "plan": "human", "merge": "auto"}
-SG_ITEMS = {"spec": ("human", "codex"), "plan": ("human", "codex"), "merge": ("human", "auto"),
-            "release": ("human", "prepare", "auto-confirm", "auto")}
 
 
 APPROVED = ("approved", "codex-approved")
@@ -150,7 +146,7 @@ def narrow_pending(io, repo, base_ref, issues, sg_project, bot, notes, dry_run):
         url = io.open_narrow_pr(repo, base_ref, module, number, reason)
         target = f"模块 {module}" if module else "整个项目"
         if url:
-            body = f"已为{target} 开收窄 PR：{url}（按 spec-guard 规则降一格：合并 → Plan → 不接管）。它是 T4，合并后生效；在那之前本 issue 已阻止自动合并。"
+            body = f"已为{target} 开收窄 PR：{url}（按 spec-guard 规则降一格：合并 → 技术方案 → 不接管）。它是 T4，合并后生效；在那之前本 issue 已阻止自动合并。"
         else:
             body = f"{target}的接管档位已是最严，不需要收窄。"
         io.api(f"repos/{repo}/issues/{number}/comments", "POST",
@@ -164,48 +160,43 @@ def say_takeover(say, module, merge, source):
 
 
 def read_sg_config(io, repo, base_ref, notes):
-    """spec-guard's `.agent/config.json` on the BASE branch (a PR cannot widen its own takeover); {} when absent."""
-    text = base_file(io, repo, SG_CONFIG, base_ref)
+    """Read raw base configuration for the release engine's existing import contract."""
+    path = ".agent/config.json"
+    text = base_file(io, repo, path, base_ref)
     if text is None:
         return {}
     try:
         data = json.loads(text)
     except ValueError:
-        notes.append(f"{SG_CONFIG} 读不懂，合并一律按人合")
+        notes.append(f"{path} 读不懂，发布按人批")
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def takeover_merge(value):
-    """`merge` of one spec-guard takeover value (preset or item object, spec/takeover-config.md); None if invalid."""
-    if isinstance(value, str):
-        return SG_PRESETS.get(value)
-    if isinstance(value, dict) and all(k in SG_ITEMS and v in SG_ITEMS[k] for k, v in value.items()):
-        return value.get("merge", "human")
-    return None
-
-
-def module_merge(config, module):
-    """Effective merge item for `module`, as spec-guard 0.91 resolves it: the module's own moduleTakeover entry,
-    else the project takeover, else none. Any bad moduleTakeover entry invalidates the whole key; anything
-    unreadable means human."""
-    project = takeover_merge(config.get("takeover", "none")) or "human"
-    entries = config.get("moduleTakeover", {})
-    if not isinstance(entries, dict) or any(takeover_merge(v) is None for v in entries.values()):
-        return project
-    return takeover_merge(entries[module]) if module in entries else project
-
-
-def any_auto_merge(config):
-    """Cheap pre-check before running checks: could any module of this project merge automatically?"""
-    entries = config.get("moduleTakeover", {})
-    modules = list(entries) if isinstance(entries, dict) else []
-    return module_merge(config, None) == "auto" or any(module_merge(config, m) == "auto" for m in modules)
+def view_merge(view, module):
+    """Read effective merge from the base map view; require the spec-guard 1.22 contract."""
+    if not isinstance(view, dict):
+        return "human", "基础分支的 /map --json 读不到生效档位，按人合"
+    modules = view.get("modules")
+    mod = next((m for m in modules if isinstance(m, dict) and m.get("id") == module), None) \
+        if isinstance(modules, list) else None
+    if mod is None:
+        return "human", f"基础分支上还没有模块 {module}，按人合"
+    takeover = mod.get("takeover")
+    if not isinstance(takeover, dict):
+        return "human", f"模块 {module} 的生效接管档位读不懂，按人合"
+    if "designForcedBy" not in takeover:
+        return "human", "本机 spec-guard 的 map_view 早于接口 1.22，没有生效档位，按人合"
+    if not {"design", "merge", "release"} <= set(takeover):
+        return "human", f"模块 {module} 的生效接管档位缺 design／merge／release 中的项，按人合"
+    if takeover.get("merge") not in ("auto", "human"):
+        return "human", f"模块 {module} 的生效 merge 只认 auto／human，按人合"
+    return takeover["merge"], None
 
 
 def read_takeover(io, repo, base_ref, notes):
     """Takeover setting for a repo without spec-guard: `.github/autopr/takeover.yml` on the base branch.
-    Absent or unreadable -> merge by a human. (spec-guard `/map --json` is read once spec-guard 0.91 ships.)"""
+    Absent or unreadable -> merge by a human."""
     text = base_file(io, repo, ".github/autopr/takeover.yml", base_ref)
     out = {"module": None, "merge": "human", "source": ".github/autopr/takeover.yml"}
     if text is None:
@@ -421,27 +412,35 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
             raise Stop("degrade", degrade["detail"])
 
         base_ref = pr["base"]["ref"]
-        sg_config = None
-        if base_file(io, repo, SG_CAPABILITY_MAP, base_ref) is not None:
-            sg_config = read_sg_config(io, repo, base_ref, notes)
-            if not any_auto_merge(sg_config):
-                say_takeover(say, None, "human", SG_CONFIG)
-                raise Stop("takeover", "spec-guard 项目的接管配置里没有任何模块的合并是 auto，交你")
-        else:
+        sg_project = base_file(io, repo, SG_CAPABILITY_MAP, base_ref) is not None
+        if not sg_project:
             takeover = read_takeover(io, repo, base_ref, notes)
             say_takeover(say, None, takeover["merge"], takeover["source"])
             if takeover["merge"] != "auto":
                 raise Stop("takeover", "接管档位里合并由人，autopilot 不合并，交你")
 
         changed = [f.get("filename") for f in io.api(f"repos/{repo}/pulls/{number}/files?per_page=100") or []]
-        # spec-guard projects: spec/tasks artifacts are verified after the checks; assume they will be for the pre-check
-        optimistic = {p for p in changed if sg_artifact(p)} if sg_config is not None else None
-        pre = evaluate(io, repo, pr, bot, optimistic)
-        risk_item = next(i for i in pre["items"] if i["id"] == "risk")
-        if not risk_item["ok"]:
-            raise Stop("risk", risk_item["detail"])
-
         with io.checkout(repo, pr) as work:
+            base_view = None
+            if sg_project:
+                base_view = work.base_view()
+                modules = base_view.get("modules") if isinstance(base_view, dict) else None
+                merges = [view_merge(base_view, m.get("id")) for m in modules if isinstance(m, dict)] \
+                    if isinstance(modules, list) else []
+                if not any(merge == "auto" for merge, _ in merges):
+                    notes.extend(reason for _, reason in merges if reason)
+                    if not merges:
+                        notes.append("基础分支的 /map --json 读不到生效档位或没有模块，按人合")
+                    say_takeover(say, None, "human", "/map --json（基础分支）")
+                    raise Stop("takeover", "spec-guard 项目的接管配置里没有任何模块的合并是 auto，交你")
+
+            # Spec/tasks artifacts are verified after checks; assume approval for the risk pre-check.
+            optimistic = {p for p in changed if sg_artifact(p)} if sg_project else None
+            pre = evaluate(io, repo, pr, bot, optimistic)
+            risk_item = next(i for i in pre["items"] if i["id"] == "risk")
+            if not risk_item["ok"]:
+                raise Stop("risk", risk_item["detail"])
+
             command = work.find_check()
             if not command:
                 raise Stop("check", "基础分支上找不到检查命令（interface.yml 的 entries.check.run 或 PR workflow），硬卡无法满足")
@@ -470,7 +469,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if result["exit"] != 0:
                     raise Stop("pre-merge", "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"]))
             acceptance = artifacts = None
-            if sg_config is not None:
+            if sg_project:
                 modules = io.find_modules(repo, head)
                 if not modules:
                     raise Stop("acceptance", "这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
@@ -478,8 +477,10 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if len(modules) > 1:
                     raise Stop("acceptance", "当前提交有多条验收记录（" + "、".join(sorted(modules)) + "），拿不准属于哪个模块")
                 module = modules[0]
-                merge = module_merge(sg_config, module)
-                say_takeover(say, module, merge, SG_CONFIG)
+                merge, reason = view_merge(base_view, module)
+                if reason:
+                    notes.append(reason)
+                say_takeover(say, module, merge, "/map --json（基础分支）")
                 if merge != "auto":
                     raise Stop("takeover", f"模块 {module} 的接管档位里合并由人，交你")
                 acceptance, report = accepted_review(io, repo, module, head)
