@@ -7,6 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
+- S110 切片 S2 合并前验证（⑦）：spec-guard 新流程模块（`tier` 不为 null）由本机编排照回归文档执行用例、写 `spec-guard.verification/v1` 报告，交 spec-guard 0.96.0 校验并记录（`verify/core.py`、`orchestrator/flow.py` 的 `verify_module`）。与基础分支一致的命令用例自动执行，新增或改过的命令要你在跟踪 issue（`autopilot:verify`）回复「确认执行」后才跑；人工与 ai-operate 用例由你在跟踪 issue 回复结果。验证成立并记录后停下交你合，证据评论 v2 与硬卡在 S3 接上。老流程模块仍走 Codex 最终验收。不需要升钉（只改本机编排）。
 - `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.7.3），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。
 - `LICENSE`（MIT）、`.gitignore`、`CLAUDE.md`、`AGENTS.md`、`README.en.md`、本文件。
@@ -34,6 +35,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - `scripts/validate.sh`（规范 C2）：全量检查入口，按 `unittest discover` 的规则逐个跑测试文件并打印最慢 5 个；`--quick` 只跑改动涉及的测试（按导入关系追到间接依赖，对应不上退回全量，有文档改动时加跑扫全仓的测试）。CI 的测试步骤改为调用它。
 
 ### Changed
+- 非 spec-guard 仓库一律交你合（S110 方案 Q-A1：没有回归文档就不自动合并），本机编排删掉了只服务这条路径的 delegate 代码审查。
 - S110 切片 S1 与 S5 配置部分（跟随 spec-guard 接口 1.22 的接管档位改版）：
   - 编排：spec-guard 项目的合并档位改为在基础分支提交上跑 `map_view --json`，读模块生效的 `takeover.merge`；读不到、spec-guard 早于 1.22（没有 `designForcedBy`）、字段缺失，一律按人合。删掉自己解析 `.agent/config.json` 的那套算法；收窄说明改为「合并 → 技术方案 → 不接管」。
   - 合规监测：档位改为 design／merge／release 三项、预设 none／design／merge；旧值按 spec-guard 兼容表读（旧 `plan` 读作 none，旧对象里合法的 spec／plan 忽略）；基线 schema 升到 v2，v1 照常可读。

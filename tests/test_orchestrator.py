@@ -42,6 +42,17 @@ def effective(merge="auto"):
 class FakeWork:
     def __init__(self, io):
         self.io = io
+        self.merge_base = "b" * 40
+
+    def regression(self, module, ref):
+        return self.io.regression_head if ref == HEAD else self.io.regression_base
+
+    def patch_id(self):
+        return 'patch'
+
+    def run_case(self, command, sha):
+        self.io.case_runs.append((command, sha))
+        return {'exit': 0, 'timeout': False, 'output': '成功'}
 
     def find_check(self):
         return self.io.check_command
@@ -67,7 +78,9 @@ class FakeWork:
 class FakeIO:
     def __init__(self, *, merge="auto", files=("docs/a.md",), author=None, fork=False, degrade=(), takeover=True,
                  reports=None, check_exit=0, check_command="make test", stored=None, merged_ok=True, bot=BOT,
-                 module=None, acceptance=None, base_takeover=None):
+                 module="__legacy__", acceptance=None, base_takeover=None):
+        if module == "__legacy__":
+            module, acceptance = "m", accepted()
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
         self.evidence_files = []
         self.issue_comments, self.narrow_prs, self.narrow_result = {}, [], "https://github.com/x/pull/9"
@@ -140,6 +153,37 @@ class FakeIO:
     def checkout(self, repo, pr):
         yield FakeWork(self)
 
+    @contextlib.contextmanager
+    def verification_worktree(self, repo, head, base_ref):
+        yield 'checkout'
+
+    def verification_paths(self, repo, patch_id):
+        return ('evidence/patch.verification.json', 'evidence/patch.logs', 'evidence/patch.cases.json')
+
+    def read_bytes(self, path):
+        if path not in self.verification_files:
+            raise FileNotFoundError(path)
+        return self.verification_files[path]
+
+    def write_verification_file(self, path, content):
+        self.verification_files[path] = content.encode() if isinstance(content, str) else content
+
+    def verification_check(self, root, module, report):
+        self.verify_calls.append('check')
+        return self.verify_code, {'problems': [{'code': self.verify_problem}]} if self.verify_code else {}, ''
+
+    def verification_record(self, root, module, report):
+        import hashlib
+        self.verify_calls.append('record')
+        raw = self.verification_files[report]
+        data = json.loads(raw)
+        self.verification_map = {'modules': [{'id': module, 'verification': {
+            'current': self.record_current, 'reportSha256': hashlib.sha256(raw).hexdigest(), 'verdict': data['verdict']}}]}
+        return 0, {}, ''
+
+    def verification_view(self, root):
+        return self.verification_map
+
     def load_review(self, repo, number):
         return self.stored
 
@@ -179,16 +223,162 @@ def run(io, **kw):
     return flow.run(io, REPO, 7, **kw)
 
 
+def legacy_io(**kw):
+    return FakeIO(module="m", acceptance=accepted(), **kw)
+
+
+class VerificationTest(unittest.TestCase):
+    def io(self, cases=None, base_cases=None):
+        from test_verify import case
+        io = FakeIO(module='m', files=('tasks/m/regression.md',))
+        io.base['modules'][0]['tier'] = 'normal'
+        cases = cases or [case()]
+        doc = dict(document='tasks/m/regression.md', sha256='d'*64, cases=cases, problems=[])
+        io.regression_head = (0, doc)
+        io.regression_base = (0, dict(doc, cases=base_cases if base_cases is not None else cases))
+        io.verification_files, io.case_runs, io.verify_calls = {}, [], []
+        io.verify_code, io.verify_problem, io.record_current = 0, None, True
+        io.verification_map = {'modules': [{'id': 'm', 'verification': None}]}
+        io.verify_issues, io.verify_comments = [], []
+        io.pr['base']['repo']['owner']['id'] = 1
+        original = io.api
+        def api(path, method='GET', body=None):
+            if path.startswith(f'repos/{REPO}/issues?labels=autopilot:verify'):
+                io.calls.append((method, path, body))
+                return io.verify_issues
+            if path == f'repos/{REPO}/issues' and method == 'POST':
+                io.calls.append((method, path, body))
+                issue = dict(number=10, id=100, body=body['body'], user=BOT_USER,
+                             performed_via_github_app={'slug': BOT['app_slug']}, created_at=T0, updated_at=T0)
+                io.verify_issues.append(issue)
+                return issue
+            if path.startswith(f'repos/{REPO}/issues/10/comments'):
+                io.calls.append((method, path, body))
+                if method == 'GET':
+                    return list(io.verify_comments)
+                comment = dict(id=max([c['id'] for c in io.verify_comments] or [100])+1, body=body['body'],
+                               user=BOT_USER, performed_via_github_app={'slug': BOT['app_slug']}, created_at=T0, updated_at=T0)
+                io.verify_comments.append(comment)
+                return comment
+            return original(path, method, body)
+        io.api = api
+        return io
+
+    def reply(self, io, body, owner=1, edited=False):
+        io.verify_comments.append(dict(id=200+len(io.verify_comments), body=body, user={'id': owner},
+                                       html_url='https://example.test/comment', created_at=T0,
+                                       updated_at='edited' if edited else T0))
+
+    def report(self, io):
+        return json.loads(io.verification_files['evidence/patch.verification.json'])
+
+    def test_auto_and_reuse(self):
+        io = self.io()
+        result = run(io)
+        self.assertEqual(result['step'], 'verification', result)
+        self.assertIn('已成立并记录', result['reason'])
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+        self.assertEqual(self.report(io)['verdict'], 'pass')
+        self.assertEqual(io.merge_calls(), [])
+        self.assertFalse(any('autopilot-evidence' in c['body'] for c in io.comments))
+        self.assertEqual(len(io.case_runs), 1)
+        run(io)
+        self.assertEqual(len(io.case_runs), 1)
+
+    def test_confirmation_and_resume_cache(self):
+        from test_verify import case
+        io = self.io([case(), case('R2', sha='changed')], [case()])
+        self.assertIn('确认执行 R2', run(io)['reason'])
+        self.assertEqual(len(io.verify_issues), 1)
+        self.assertEqual(len(io.case_runs), 1)
+        self.reply(io, '确认执行 R2')
+        self.assertIn('已成立并记录', run(io)['reason'])
+        self.assertEqual(len(io.case_runs), 2)
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+
+    def test_manual_failure_and_untrusted_replies(self):
+        from test_verify import case
+        io = self.io([case('R3', 'manual')])
+        run(io)
+        self.reply(io, 'R3 通过', owner=9)
+        self.reply(io, 'R3 通过', edited=True)
+        self.assertIn('要你测 R3', run(io)['reason'])
+        self.assertEqual(io.verify_calls, [])
+        self.reply(io, 'R3 不通过：页面打不开')
+        result = run(io)
+        self.assertIn('R3（user-bug）', result['reason'])
+        self.assertEqual(self.report(io)['verdict'], 'fail')
+        self.assertEqual(self.report(io)['cases'][0]['evidence'][0]['type'], 'user-quote')
+
+    def test_checks_and_readback_fail_closed(self):
+        for code, problem in [(1, 'patch-mismatch'), (3, 'author-unknown')]:
+            io = self.io()
+            io.verify_code, io.verify_problem = code, problem
+            result = run(io)
+            self.assertEqual(result['step'], 'verification')
+            self.assertIn(problem, result['reason'])
+            self.assertEqual(io.verify_calls, ['check'])
+        io = self.io()
+        io.record_current = False
+        self.assertIn('current', run(io)['reason'])
+
+    def test_bad_documents(self):
+        for code, data in [(3, {'error': 'no-document'}), (4, {'error': 'unreadable'}),
+                           (0, {'problems': [{'code': 'no-cases'}]})]:
+            io = self.io()
+            io.regression_head = code, data
+            self.assertEqual(run(io)['step'], 'verification')
+            self.assertEqual(io.case_runs, [])
+        io = self.io()
+        io.regression_base = 4, {'error': 'unreadable'}
+        self.assertIn('基础提交', run(io)['reason'])
+
+    def test_multiple_modules_and_batch_mismatch(self):
+        io = self.io()
+        io.base['modules'].append(dict(id='n', tier='normal', takeover=effective()))
+        io.files.append({'filename': 'spec/n.md'})
+        self.assertIn('多个新流程模块', run(io)['reason'])
+        io = self.io()
+        io.extra_evidence = {'module': 'other'}
+        with mock.patch('orchestrator.batch.batch_payload', return_value={'module': 'other'}):
+            io.batch_pr = lambda *a, **k: io.pr
+            self.assertEqual(run(io)['step'], 'batch')
+
+    def test_risk_and_core_check_run_before_cases(self):
+        io = self.io()
+        io.check_exit = 1
+        result = run(io)
+        self.assertEqual(result['step'], 'check', result)
+        self.assertEqual((io.case_runs, io.verify_calls), ([], []))
+        io = self.io()
+        io.files.append({'filename': '.github/workflows/ci.yml'})
+        result = run(io)
+        self.assertEqual(result['step'], 'risk', result)
+        self.assertEqual((io.ran, io.case_runs, io.verify_calls), ([], [], []))
+
+    def test_dry_run_and_non_spec_guard(self):
+        io = self.io()
+        result = run(io, dry_run=True)
+        self.assertEqual((result['result'], result['step']), ('dry-run', 'verification'))
+        self.assertEqual(io.writes(), [])
+        self.assertEqual(io.case_runs, [])
+        self.assertEqual(io.verification_files, {})
+        self.assertEqual(io.verify_calls, [])
+        io = FakeIO(module=None, merge='auto')
+        self.assertIn('一律交你合', run(io)['reason'])
+        self.assertEqual(io.ran, [])
+
+
 class HappyPathTest(unittest.TestCase):
     def test_explicit_merge_preserves_commit_history(self):
-        io = FakeIO()
+        io = legacy_io()
         res = run(io, merge_method="merge")
         self.assertEqual(res["result"], "merged", res)
         self.assertEqual(io.merge_calls(), [("PUT", f"repos/{REPO}/pulls/7/merge",
                                             {"sha": HEAD, "merge_method": "merge"})])
 
     def test_merges_the_reviewed_head(self):
-        io = FakeIO()
+        io = legacy_io()
         res = run(io)
         self.assertEqual(res["result"], "merged", res)
         self.assertEqual(io.merge_calls(), [("PUT", f"repos/{REPO}/pulls/7/merge", {"sha": HEAD, "merge_method": "squash"})])
@@ -197,7 +387,7 @@ class HappyPathTest(unittest.TestCase):
         self.assertEqual(io.ran, ["make test"])
 
     def test_posts_takeover_then_evidence_bound_to_head(self):
-        io = FakeIO()
+        io = legacy_io()
         run(io)
         bodies = [c["body"] for c in io.comments]
         self.assertIn("autopilot-takeover:v1", bodies[0])
@@ -208,14 +398,14 @@ class HappyPathTest(unittest.TestCase):
         self.assertIn("已合并", bodies[-1])
 
     def test_owner_authored_pr_is_allowed(self):
-        self.assertEqual(run(FakeIO(author={"login": "haigeerlab", "id": 1, "type": "User"}))["result"], "merged")
+        self.assertEqual(run(legacy_io(author={"login": "haigeerlab", "id": 1, "type": "User"}))["result"], "merged")
 
     def test_dry_run_writes_nothing(self):
-        io = FakeIO()
+        io = legacy_io()
         res = run(io, dry_run=True)
         self.assertEqual(res["result"], "dry-run")
         self.assertEqual(io.writes(), [])
-        self.assertEqual(len(io.reviews), 1)
+        self.assertEqual(len(io.reviews), 0)
 
 
 def flow_block(body, name):
@@ -234,7 +424,7 @@ class StopTest(unittest.TestCase):
         return res
 
     def test_explicit_merge_stops_when_repository_disallows_merge_commits(self):
-        io = FakeIO()
+        io = legacy_io()
         original = io.api
         def api(path, method="GET", body=None):
             if path == f"repos/{REPO}":
@@ -245,95 +435,109 @@ class StopTest(unittest.TestCase):
         self.assertEqual(res["reason"], "仓库不允许 merge commit，module-crew 的合并是叠起来的，不能压平或变基，交你在仓库设置里打开 Allow merge commits")
 
     def test_no_bot_identity(self):
-        io = FakeIO(bot=None)
+        io = legacy_io(bot=None)
         self.assertStops(io, "identity")
         self.assertEqual(io.calls, [])
 
     def test_fork(self):
-        self.assertStops(FakeIO(fork=True), "pr", "fork")
+        self.assertStops(legacy_io(fork=True), "pr", "fork")
 
     def test_stranger_author(self):
-        self.assertStops(FakeIO(author={"login": "stranger", "id": 9, "type": "User"}), "pr", "stranger")
+        self.assertStops(legacy_io(author={"login": "stranger", "id": 9, "type": "User"}), "pr", "stranger")
 
     def test_open_degrade_issue(self):
-        self.assertStops(FakeIO(degrade=[3]), "degrade", "#3")
+        self.assertStops(legacy_io(degrade=[3]), "degrade", "#3")
 
     def test_takeover_human_or_missing(self):
-        io = FakeIO(merge="human")
+        io = FakeIO(module=None, merge="human")
         self.assertStops(io, "takeover")
         self.assertIn('"merge": "human"', io.comments[0]["body"])
-        self.assertStops(FakeIO(takeover=False), "takeover")
-        self.assertStops(FakeIO(merge="yes"), "takeover")
+        self.assertStops(FakeIO(module=None, takeover=False), "takeover")
+        self.assertStops(FakeIO(module=None, merge="yes"), "takeover")
 
     def test_high_risk_stops_before_any_review(self):
-        io = FakeIO(files=(".github/workflows/ci.yml",))
+        io = legacy_io(files=(".github/workflows/ci.yml",))
         self.assertStops(io, "risk", "T4")
         self.assertEqual(io.reviews, [])
         self.assertEqual(io.ran, [])
 
     def test_no_check_command(self):
-        self.assertStops(FakeIO(check_command=None), "check", "找不到检查命令")
+        self.assertStops(legacy_io(check_command=None), "check", "找不到检查命令")
 
     def test_failing_check(self):
-        io = FakeIO(check_exit=1)
+        io = legacy_io(check_exit=1)
         self.assertStops(io, "check", "退出码 1")
         self.assertEqual(io.reviews, [])
 
     def test_codex_unavailable_stops_and_is_recorded(self):
-        io = FakeIO(reports=[report(status="conditions_missing")])
-        self.assertStops(io, "review", "Codex 不可用")
-        self.assertEqual(io.events[0]["event"], "codex_unavailable")
-        self.assertIsNone(io.stored)
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=0)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_inconclusive_is_unavailable_too(self):
-        self.assertStops(FakeIO(reports=[report(outcome="inconclusive")]), "review", "没有结论")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=1)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_blocking_round_one_asks_for_rework_and_saves_report(self):
-        io = FakeIO(reports=[report(blocking=2)])
-        self.assertStops(io, "review", "2 条 blocking（第 1 轮）")
-        self.assertEqual(io.stored["rounds"], 1)
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=2)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_round_two_rechecks_against_round_one(self):
-        first = report(blocking=1)
-        io = FakeIO(stored={"head_sha": "b" * 40, "rounds": 1, "report": first}, reports=[report()])
-        self.assertEqual(run(io)["result"], "merged")
-        self.assertEqual(io.reviews, [first])
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=3)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_round_two_still_blocking_goes_to_human(self):
-        io = FakeIO(stored={"head_sha": "b" * 40, "rounds": 1, "report": report(blocking=1)},
-                    reports=[report(recheck={"items": [{"status": "unresolved"}]})])
-        self.assertStops(io, "review", "复审 2 轮后仍有 1 条 blocking")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=4)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_same_head_reuses_conclusive_review(self):
-        io = FakeIO(stored={"head_sha": HEAD, "rounds": 1, "report": report()}, reports=[])
-        self.assertEqual(run(io)["result"], "merged")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=5)])
+        self.assertStops(io, "takeover", "一律交你合")
         self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_suggestions_do_not_block(self):
-        r = report()
-        r["findings"] = [{"title": "x", "severity": "suggestion"}]
-        self.assertEqual(run(FakeIO(reports=[r]))["result"], "merged")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=6)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_missing_severity_counts_as_blocking(self):
-        r = report()
-        r["findings"] = [{"title": "x"}]
-        self.assertStops(FakeIO(reports=[r]), "review", "blocking")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=7)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_unreviewed_files(self):
-        self.assertStops(FakeIO(reports=[report(unreviewed=["big.bin"])]), "review", "big.bin")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=8)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_missing_fingerprint(self):
-        self.assertStops(FakeIO(reports=[report(fp=None)]), "review", "指纹")
+        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=9)])
+        self.assertStops(io, "takeover", "一律交你合")
+        self.assertEqual(io.reviews, [])
+        self.assertEqual(io.ran, [])
 
     def test_readback_not_merged(self):
-        io = FakeIO(merged_ok=False)
+        io = legacy_io(merged_ok=False)
         res = run(io)
         self.assertEqual((res["result"], res["step"]), ("stopped", "readback"))
         self.assertEqual(len(io.merge_calls()), 1)  # merge was requested; reading back is what failed
         self.assertFalse([c for c in io.calls if c[1].endswith("/labels")])
 
     def test_every_stop_leaves_a_bot_comment(self):
-        io = FakeIO(check_exit=3)
+        io = legacy_io(check_exit=3)
         run(io)
         self.assertTrue(io.comments[-1]["body"].startswith(flow.RUN_MARKER))
         self.assertIn("「check」", io.comments[-1]["body"])
@@ -356,7 +560,7 @@ def report_for(to):
 
 class CheckEvidenceFileTest(unittest.TestCase):
     def test_written_after_checks_pass(self):
-        io = FakeIO()
+        io = legacy_io()
         run(io)
         ev = io.evidence_files[0]
         self.assertEqual(ev["schema"], "autopilot.check-evidence/v1")
@@ -367,12 +571,12 @@ class CheckEvidenceFileTest(unittest.TestCase):
         self.assertEqual(len(ev["checks"][0]["output_sha256"]), 64)
 
     def test_written_in_dry_run_too(self):
-        io = FakeIO()
+        io = legacy_io()
         run(io, dry_run=True)
         self.assertEqual(len(io.evidence_files), 1)
 
     def test_not_written_when_check_fails(self):
-        io = FakeIO(check_exit=1)
+        io = legacy_io(check_exit=1)
         run(io)
         self.assertEqual(io.evidence_files, [])
 
@@ -386,17 +590,18 @@ class PreMergeTest(unittest.TestCase):
         io.contents[".github/autopr/pipeline.yml"] = "\n".join(lines)
 
     def test_ai_steps_run_in_order_before_review_and_join_both_evidence_records(self):
-        io = FakeIO()
+        io = legacy_io()
         self.pipeline(io, ("extra-one", "echo first", "ai"), ("extra-two", "echo second", "ai"))
         io.check_results = {"echo first": flow.check_result(0, "first output\n"),
                             "echo second": flow.check_result(0, "second output\n")}
         commands = ["make test", "echo first", "echo second"]
 
-        def review_after_checks(work, previous):
+        original = flow.accepted_review
+        def accepted_after_checks(*args):
             self.assertEqual(io.ran, commands)
-            return report()
+            return original(*args)
 
-        with mock.patch.object(FakeWork, "review", autospec=True, side_effect=review_after_checks):
+        with mock.patch.object(flow, "accepted_review", side_effect=accepted_after_checks):
             result = run(io)
         self.assertEqual(result["result"], "merged", result)
         evidence = next(c["body"] for c in io.comments if "autopilot-evidence:v1" in c["body"])
@@ -410,7 +615,7 @@ class PreMergeTest(unittest.TestCase):
         self.assertIn("second output", evidence)
 
     def test_nonzero_stops_before_later_steps_and_review_and_saves_local_failure(self):
-        io = FakeIO()
+        io = legacy_io()
         self.pipeline(io, ("extra-one", "echo first", "ai"), ("extra-two", "echo second", "ai"))
         io.check_results["echo first"] = flow.check_result(9, "failed output\n")
         result = run(io)
@@ -426,7 +631,7 @@ class PreMergeTest(unittest.TestCase):
     def test_human_external_and_ask_steps_stop_without_running_the_command(self):
         for by, command in (("human", "人工核对"), ("external", "等部署"), ("human", "ask: 你")):
             with self.subTest(by=by, command=command):
-                io = FakeIO()
+                io = legacy_io()
                 self.pipeline(io, ("signoff", command, by))
                 result = run(io)
                 self.assertEqual((result["result"], result["step"]), ("stopped", "pre-merge"), result)
@@ -438,7 +643,7 @@ class PreMergeTest(unittest.TestCase):
     def test_invalid_pipeline_stops_before_review(self):
         for content in ("extends: [", "extends: absent", "extends: plugin\nwrong: true", "", "[]"):
             with self.subTest(content=content):
-                io = FakeIO()
+                io = legacy_io()
                 io.contents[".github/autopr/pipeline.yml"] = content
                 result = run(io)
                 self.assertEqual((result["result"], result["step"]), ("stopped", "pre-merge"), result)
@@ -448,7 +653,7 @@ class PreMergeTest(unittest.TestCase):
 
     def test_absent_or_release_only_pipeline_adds_no_checks(self):
         for content in (None, "extends: plugin"):
-            io = FakeIO()
+            io = legacy_io()
             if content is not None:
                 io.contents[".github/autopr/pipeline.yml"] = content
             result = run(io)
@@ -456,7 +661,7 @@ class PreMergeTest(unittest.TestCase):
             self.assertEqual(io.ran, ["make test"])
 
     def test_core_check_cannot_be_replaced_or_skipped(self):
-        io = FakeIO(check_exit=1)
+        io = legacy_io(check_exit=1)
         self.pipeline(io, ("extra", "true", "ai"))
         with mock.patch.object(FakeWork, "read_pipeline", side_effect=AssertionError("must check first")):
             result = run(io)
@@ -464,7 +669,7 @@ class PreMergeTest(unittest.TestCase):
         self.assertEqual(io.ran, ["make test"])
 
     def test_additional_check_timeout_is_reported_as_pre_merge(self):
-        io = FakeIO()
+        io = legacy_io()
         self.pipeline(io, ("extra", "slow command", "ai"))
         with mock.patch.object(FakeWork, "run_check",
                                side_effect=[flow.check_result(0, "ok"), flow.Stop("check", "检查超过 15 分钟")]):
@@ -694,7 +899,7 @@ class NarrowTest(unittest.TestCase):
         self.assertIn("已是最严", self.issue_comment_posts(io, 3)[0][2]["body"])
 
     def test_non_spec_guard_repo_only_comments(self):
-        io = FakeIO()
+        io = FakeIO(module=None)
         io.degrade = [degrade_block(3)]
         io.issue_comments[3] = []
         run(io)
@@ -960,10 +1165,74 @@ class AdmissionAgreesTest(unittest.TestCase):
                 if method == "POST" and path.endswith("/comments") and "autopilot-evidence" in body["body"]:
                     self.comments[-1]["updated_at"] = "2026-11-22T02:00:00Z"
                 return out
-        io = EditingIO()
+        io = EditingIO(module="m", acceptance=accepted())
         res = run(io)
         self.assertEqual((res["result"], res["step"]), ("stopped", "admission"))
         self.assertEqual(io.merge_calls(), [])
+
+
+class VerificationLocalIOTest(unittest.TestCase):
+    def test_run_case_cleans_checkout_and_removes_tokens(self):
+        from orchestrator import cli
+        import subprocess
+        work = cli.Work.__new__(cli.Work)
+        work.root = 'clone'
+        completed = subprocess.CompletedProcess([], 0, 'ok', '')
+        with mock.patch.dict(os.environ, {'GH_TOKEN': 'secret', 'GIT_CONFIG_COUNT': '1'}), \
+                mock.patch.object(cli.subprocess, 'run', return_value=completed) as process:
+            self.assertEqual(work.run_case('true', HEAD), {'exit': 0, 'timeout': False, 'output': 'ok'})
+        calls = process.call_args_list
+        self.assertEqual(calls[0].args[0][-5:], ['checkout', '-q', '-f', '--detach', HEAD])
+        self.assertEqual(calls[1].args[0][-4:], ['clone', 'clean', '-q', '-ffdx'])
+        for call in calls:
+            self.assertNotIn('GH_TOKEN', call.kwargs['env'])
+            self.assertNotIn('GIT_CONFIG_COUNT', call.kwargs['env'])
+            self.assertEqual(call.kwargs['stdin'], subprocess.DEVNULL)
+
+    def test_timeout_is_a_result(self):
+        from orchestrator import cli
+        import subprocess
+        work = cli.Work.__new__(cli.Work)
+        work.root = 'clone'
+        done = subprocess.CompletedProcess([], 0, '', '')
+        with mock.patch.object(cli.subprocess, 'run', side_effect=[done, done, subprocess.TimeoutExpired('true', 1, output=b'partial')]):
+            result = work.run_case('true', HEAD)
+        self.assertTrue(result['timeout'])
+        self.assertIsNone(result['exit'])
+        self.assertIn('partial', result['output'])
+
+    def test_plugin_commands_and_atomic_files(self):
+        from orchestrator import cli
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        io = cli.LocalIO('secret', None)
+        done = subprocess.CompletedProcess([], 0, '{}', '')
+        with mock.patch.object(cli, 'verification_plugin', return_value='plugin'), \
+                mock.patch.object(cli.subprocess, 'run', return_value=done) as process:
+            io.verification_check('checkout', 'm', 'report')
+            self.assertIn('--json', process.call_args.args[0])
+            io.verification_record('checkout', 'm', 'report')
+            self.assertIn('--confirm', process.call_args.args[0])
+            self.assertEqual(process.call_args.kwargs['cwd'], 'checkout')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'nested'/'report.json'
+            io.write_verification_file(path, '内容')
+            self.assertEqual(path.read_text(), '内容')
+            self.assertFalse(Path(str(path)+'.tmp').exists())
+
+    def test_worktree_rejects_wrong_default_branch(self):
+        from orchestrator import cli
+        import subprocess
+        io = cli.LocalIO('secret', None)
+        done = subprocess.CompletedProcess([], 0, '', '')
+        wrong = subprocess.CompletedProcess([], 0, 'refs/remotes/origin/other\n', '')
+        with mock.patch.object(io, 'checkout_of', return_value='checkout'), \
+                mock.patch.object(cli.os.path, 'isdir', return_value=True), \
+                mock.patch.object(io, '_batch_process', side_effect=[done, done, wrong]):
+            with self.assertRaisesRegex(flow.Stop, '默认分支不是'):
+                with io.verification_worktree(REPO, HEAD, 'main'):
+                    self.fail('wrong default must not be used')
 
 
 if __name__ == "__main__":

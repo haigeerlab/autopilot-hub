@@ -5,11 +5,9 @@ so the flow itself is testable with fakes. Every stop leaves one bot comment say
 is merged unless the local admission -- the same code as the reusable workflow, fed fresh inputs -- says
 "可以自动合并" on the exact head SHA that was checked and reviewed.
 
-Steps: PR guards -> open degrade issues -> takeover (spec-guard projects: effective base-commit map view;
-others: .github/autopr/takeover.yml) -> risk pre-check -> checks in a throwaway clone
--> local check evidence file (read by spec-guard) -> review: spec-guard modules reuse the final-acceptance
-review recorded outside the commit, other repos run delegate (round 2 rechecks against round 1) -> evidence
-comment -> admission -> merge --match-head-commit -> read back -> labels.
+Steps: PR guards -> degradation -> base takeover -> flow v2 module regression verification and recording
+(stops before merge in S2); old-flow modules retain checks -> recorded final acceptance -> evidence ->
+admission -> merge -> readback. Repositories without spec-guard always stop for a human merge.
 """
 import base64
 import hashlib
@@ -29,7 +27,6 @@ from pipeline import model as pipeline_model
 from risk import tiers as risk_tiers
 
 RUN_MARKER = "<!-- autopilot-run:v1 -->"
-MAX_REVIEW_ROUNDS = 2
 TAIL = 40
 AUTHORED = "autopilot:authored"
 AUTO_MERGED = "autopilot:auto-merged"
@@ -259,35 +256,6 @@ def conclusive(report):
         and report.get("review_outcome") in ("findings", "no_findings_in_scope")
 
 
-def review(io, repo, pr, work, notes):
-    """Run (or reuse) the delegate review for this head; returns (report, rounds). Raises Stop."""
-    head = pr["head"]["sha"]
-    prev = io.load_review(repo, pr["number"])  # {"head_sha", "rounds", "report"} or None
-    if prev and prev.get("head_sha") == head and conclusive(prev.get("report")):
-        notes.append("这个提交已经审过，沿用上次的审查报告")
-        report, rounds = prev["report"], prev["rounds"]
-    else:
-        has_prev = bool(prev) and conclusive(prev.get("report"))
-        rounds = prev["rounds"] + 1 if has_prev else 1
-        previous = prev["report"] if has_prev else None
-        started = io.now()
-        report = work.review(previous)
-        if not conclusive(report):
-            status = (report or {}).get("execution_status") or "没有输出"
-            io.ledger({"event": "codex_unavailable", "repo": repo, "pr": pr["number"], "head_sha": head,
-                       "status": status, "outcome": (report or {}).get("review_outcome"),
-                       "started_at": started, "stopped_at": io.now()})
-            raise Stop("review", f"审查没有结论（{status}）。Codex 不可用时一律停下等你，不退回别的审查方式")
-        io.save_review(repo, pr["number"], {"head_sha": head, "rounds": rounds, "report": report})
-    fp = gate_review(report)
-    n = blocking_of(report)
-    if n and rounds >= MAX_REVIEW_ROUNDS:
-        raise Stop("review", f"复审 {rounds} 轮后仍有 {n} 条 blocking，停下交你")
-    if n:
-        raise Stop("review", f"审查有 {n} 条 blocking（第 {rounds} 轮），交作者返工后再运行；下一轮会对照这一轮复审")
-    return report, rounds, fp
-
-
 ACCEPTANCE_MARKERS = ("codex-approved", "approved")
 
 
@@ -359,6 +327,169 @@ def evidence_body(head, command, check, report, rounds, fp, acceptance=None, art
             + block("autopilot-evidence", payload) + "\n")
 
 
+VERIFY_BLOCK = re.compile(r'<!--\s*autopilot-verify:v1\s+(.*?)\s*-->', re.S)
+
+
+def verification_listing(module, groups, payload):
+    lines = [f"模块 {module} 的合并前验证需要你回复。", "", "要确认执行的命令用例："]
+    for case in groups['confirm']:
+        lines.extend([f"{case['id']}：{case['title']}", "```", case['command'], "```"])
+    lines.append("要你测的人工用例（含 ai-operate）：")
+    for case in groups['manual']:
+        lines.extend([f"{case['id']}：{case['title']}", f"步骤：{case['steps']}", f"预期：{case['expected']}"])
+    lines.extend(["", "请逐行回复，例如：确认执行 R5 R6；R2 通过；R3 不通过：说明；意见 R2：文字。",
+                  "只认仓库所有者在最新清单之后、没有编辑过的评论。", block('autopilot-verify', payload)])
+    return '\n'.join(lines)
+
+
+def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
+    bot = io.bot_identity()
+    payload = dict(pr=pr['number'], patchId=patch_id, regressionSha256=document_sha,
+                   confirm=[c['id'] for c in groups['confirm']], manual=[c['id'] for c in groups['manual']])
+    def listings(source):
+        if not d.trusted(rest_comment(source), bot):
+            return []
+        found = []
+        for raw in VERIFY_BLOCK.findall(source.get('body') or ''):
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and item.get('pr') == pr['number']:
+                found.append(item)
+        return found
+    issue = next((i for i in io.api(f'repos/{repo}/issues?labels=autopilot:verify&state=open&per_page=100') or []
+                  if 'pull_request' not in i and listings(i)), None)
+    body = verification_listing(module, groups, payload)
+    if issue is None:
+        issue = io.api(f'repos/{repo}/issues', 'POST', {
+            'title': f"autopilot：PR #{pr['number']} 合并前验证等你确认", 'labels': ['autopilot:verify'], 'body': body})
+        return issue, [], 0
+    comments = io.api(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100") or []
+    latest, after_id = listings(issue)[-1], 0
+    for comment in sorted(comments, key=lambda c: c.get('id', 0)):
+        found = listings(comment)
+        if found:
+            latest, after_id = found[-1], comment['id']
+    if latest != payload:
+        added = io.api(f"repos/{repo}/issues/{issue['number']}/comments", 'POST', {'body': body})
+        after_id = added['id']
+    return issue, comments, after_id
+
+
+def verification_state(view, module):
+    return next((m.get('verification') or {} for m in (view or {}).get('modules', [])
+                 if m.get('id') == module), {})
+
+
+def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
+    from verify.core import select_cases, parse_replies, case_result, build_report, new_executor
+    merge, reason = view_merge(base_view, module)
+    if reason:
+        notes.append(reason)
+    say_takeover(say, module, merge, '/map --json（基础分支）')
+    if merge != 'auto':
+        raise Stop('takeover', f'模块 {module} 的接管档位里合并由人，交你')
+    head = pr['head']['sha']
+    base_code, base_doc = work.regression(module, ref=work.merge_base)
+    code, doc = work.regression(module, ref=head)
+    def problems(data):
+        data = data or {}
+        return '、'.join(str(p.get('code')) for p in data.get('problems', [])) or str(data.get('error') or '输出读不懂')
+    if code != 0 or not isinstance(doc, dict) or doc.get('problems'):
+        raise Stop('verification', 'head 回归文档读不了或有问题：' + problems(doc))
+    if base_code == 3 and (base_doc or {}).get('error') in ('not-at-ref', 'no-document'):
+        base_doc = None
+    elif base_code != 0 or not isinstance(base_doc, dict):
+        raise Stop('verification', '基础提交回归文档读不了：' + problems(base_doc))
+    groups = select_cases(base_doc, doc)
+    if dry_run:
+        notes.append('合并前验证分组：' + json.dumps({k: [c['id'] for c in v] for k, v in groups.items()}, ensure_ascii=False))
+        return dict(result='dry-run', step='verification', reason='预演：已读取回归文档并分组', notes=notes, head_sha=head)
+    patch_id = work.patch_id()
+    report_path, logs, cache_path = io.verification_paths(repo, patch_id)
+    def read_json(path):
+        try:
+            return json.loads(io.read_bytes(path))
+        except (OSError, ValueError):
+            return None
+    def write_json(path, value):
+        io.write_verification_file(path, json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    def evidence(path, text, kind='log', source=None):
+        raw = text.encode('utf-8')
+        io.write_verification_file(path, raw)
+        return dict(type=kind, path=os.path.relpath(path, os.path.dirname(report_path)),
+                    sha256=hashlib.sha256(raw).hexdigest(), source=source)
+    report = read_json(report_path)
+    reused = False
+    if isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']:
+        with io.verification_worktree(repo, head, pr['base']['ref']) as root:
+            state = verification_state(io.verification_view(root), module)
+        digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
+        reused = state.get('current') is True and state.get('reportSha256') == digest
+    if not reused:
+        replies = dict(results={}, confirmed=set(), notes=[])
+        issue = None
+        if groups['confirm'] or groups['manual']:
+            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
+            owner_id = pr['base']['repo']['owner'].get('id')
+            if owner_id is None:
+                owner_id = (io.api(f'repos/{repo}').get('owner') or {}).get('id')
+            replies = parse_replies(comments, owner_id, after_id)
+        cache = read_json(cache_path) or {}
+        results, pending_confirm, pending_manual = [], [], []
+        for case in doc['cases']:
+            cid = case['id']
+            if case in groups['manual']:
+                reply = replies['results'].get(cid)
+                if reply is None:
+                    pending_manual.append(cid)
+                    continue
+                comment = reply['comment']
+                ev = evidence(os.path.join(logs, cid+'-quote.txt'), comment['body'], 'user-quote', comment['html_url'])
+                results.append(case_result(case, evidence=[ev], reply=reply))
+                continue
+            if case in groups['confirm'] and cid not in replies['confirmed']:
+                pending_confirm.append(cid)
+                continue
+            cached = cache.get(cid)
+            if isinstance(cached, dict) and cached.get('sha256') == case['sha256']:
+                results.append(cached['result'])
+                continue
+            execution = work.run_case(case['command'], head)
+            ev = evidence(os.path.join(logs, cid+'.log'), execution['output'])
+            baseline, baseline_ev = None, []
+            if not execution.get('timeout') and execution.get('exit') not in (None, 0):
+                baseline = work.run_case(case['command'], work.merge_base)
+                baseline_ev = [evidence(os.path.join(logs, cid+'-base.log'), baseline['output'])]
+            result = case_result(case, execution, [ev], baseline, baseline_ev, work.merge_base)
+            cache[cid] = dict(sha256=case['sha256'], result=result)
+            write_json(cache_path, cache)
+            results.append(result)
+        if pending_confirm or pending_manual:
+            raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：确认执行 " + ' '.join(pending_confirm)
+                       + '；要你测 ' + ' '.join(pending_manual))
+        report = build_report(module, doc, work.merge_base, head, patch_id, new_executor(), results, replies['notes'])
+        write_json(report_path, report)
+    digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
+    with io.verification_worktree(repo, head, pr['base']['ref']) as root:
+        code, data, text = io.verification_check(root, module, report_path)
+        if code:
+            prefix = 'spec-guard 判报告不成立：' if code == 1 else ('spec-guard 判不了：' if code == 3 else 'spec-guard 校验失败：')
+            raise Stop('verification', prefix + problems(data))
+        code, data, text = io.verification_record(root, module, report_path)
+        if code:
+            raise Stop('verification', 'spec-guard 记录失败：' + problems(data))
+        state = verification_state(io.verification_view(root), module)
+        if not (state.get('current') is True and state.get('reportSha256') == digest and state.get('verdict') == report['verdict']):
+            raise Stop('verification', '记录后 map view 的 verification 与报告对不上（current／reportSha256／verdict）')
+    if report['verdict'] == 'fail':
+        failures = '、'.join(c['id'] + '（' + str(c['failCategory']) + '）' for c in report['cases'] if c['result'] == 'fail')
+        raise Stop('verification', '合并前验证不通过：' + failures)
+    raise Stop('verification', f"合并前验证已成立并记录（结论 {report['verdict']}，补丁 {patch_id[:12]}）。"
+               '证据评论 v2 和硬卡在 S3 接上，在那之前新流程模块交你合')
+
+
 def default_merge_method(repo_info):
     if repo_info.get("allow_squash_merge"):
         return "squash"
@@ -415,16 +546,22 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
         sg_project = base_file(io, repo, SG_CAPABILITY_MAP, base_ref) is not None
         if not sg_project:
             takeover = read_takeover(io, repo, base_ref, notes)
-            say_takeover(say, None, takeover["merge"], takeover["source"])
-            if takeover["merge"] != "auto":
-                raise Stop("takeover", "接管档位里合并由人，autopilot 不合并，交你")
+            say_takeover(say, None, "human", takeover["source"])
+            raise Stop("takeover", "本仓库不是 spec-guard 项目，没有回归文档；按已批方案一律交你合")
 
         changed = [f.get("filename") for f in io.api(f"repos/{repo}/pulls/{number}/files?per_page=100") or []]
         with io.checkout(repo, pr) as work:
             base_view = None
+            new_modules = []
             if sg_project:
                 base_view = work.base_view()
                 modules = base_view.get("modules") if isinstance(base_view, dict) else None
+                new_modules = [m['id'] for m in modules or [] if isinstance(m, dict) and m.get('tier') is not None
+                               and any(p == f"spec/{m['id']}.md" or p.startswith(f"tasks/{m['id']}/") for p in changed)]
+                if len(new_modules) > 1:
+                    raise Stop('verification', '这个 PR 改到了多个新流程模块（' + '、'.join(new_modules) + '），拿不准属于哪个')
+                if new_modules and extra is not None and extra.get('module') != new_modules[0]:
+                    raise Stop('batch', 'batch 的模块与新流程识别结果不符')
                 merges = [view_merge(base_view, m.get("id")) for m in modules if isinstance(m, dict)] \
                     if isinstance(modules, list) else []
                 if not any(merge == "auto" for merge, _ in merges):
@@ -469,6 +606,10 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if result["exit"] != 0:
                     raise Stop("pre-merge", "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"]))
             acceptance = artifacts = None
+            if new_modules:
+                # Flow v2: risk pre-check, the core check and pre-merge steps have passed; verify against the
+                # regression document instead of the Codex final acceptance.
+                return verify_module(io, repo, pr, work, new_modules[0], base_view, notes, dry_run, say)
             if sg_project:
                 modules = io.find_modules(repo, head)
                 if not modules:
@@ -489,8 +630,6 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                     raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
                 notes.append(f"模块 {module} 沿用 spec-guard 的验收审查报告，不另审")
                 artifacts = {"module": module, "verified": verify_artifacts(work.module_view(), module, changed)}
-            else:
-                report, rounds, fp = review(io, repo, pr, work, notes)
 
         if dry_run:
             return {"result": "dry-run", "step": "evidence", "reason": "预演：检查和审查都过了，没有发证据、没有合并",
