@@ -73,9 +73,26 @@ def find_map_view():
     return os.environ.get("AUTOPILOT_SPEC_GUARD_MAP") or _newest(SPEC_GUARD_CACHE, (0, 91, 0), "hooks/map_view.py")
 
 
-def find_spec_guard_root():
-    """The batch acceptance contract requires spec-guard 0.92.0 or newer."""
-    return os.environ.get("AUTOPILOT_SPEC_GUARD_ROOT") or _newest(SPEC_GUARD_CACHE, (0, 92, 0), "")
+def find_spec_guard_root(minimum=(0, 92, 0)):
+    """Find the installed plugin satisfying the requested minimum version."""
+    root = os.environ.get("AUTOPILOT_SPEC_GUARD_ROOT")
+    if root and minimum >= (0, 96, 0):
+        try:
+            metadata = json.loads((Path(root) / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            version = tuple(int(part) for part in metadata["version"].split("."))
+            if version < minimum:
+                return None
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+    return root or _newest(SPEC_GUARD_CACHE, minimum, "")
+
+
+def verification_plugin():
+    root = find_spec_guard_root((0, 96, 0))
+    if not root or any(not os.path.isfile(os.path.join(root, "hooks", name))
+                       for name in ("regression_view.py", "verification.py", "map_view.py")):
+        raise flow.Stop("verification", "找不到 spec-guard 0.96.0 以上版本，可设 AUTOPILOT_SPEC_GUARD_ROOT")
+    return root
 
 
 def _git_env(token):
@@ -130,6 +147,54 @@ class Work:
         except subprocess.TimeoutExpired:
             raise flow.Stop("check", "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60))
         return flow.check_result(r.returncode, r.stdout + "\n" + r.stderr)
+
+    def regression(self, module, ref):
+        plugin = verification_plugin()
+        try:
+            result = subprocess.run(["python3", "-B", os.path.join(plugin, "hooks", "regression_view.py"),
+                                     "--json", "--project", self.root, "--module", module, "--ref", ref],
+                                    cwd=self.root, env=_clean_env(), capture_output=True, text=True,
+                                    stdin=subprocess.DEVNULL, timeout=120)
+            try:
+                data = json.loads(result.stdout)
+            except ValueError:
+                data = None
+            return result.returncode, data
+        except (OSError, subprocess.TimeoutExpired):
+            return 4, {"error": "unreadable"}
+
+    def patch_id(self):
+        try:
+            diff = self.git("diff", self.merge_base, self.head)
+            result = subprocess.run(["git", "patch-id", "--stable"], input=diff, cwd=self.root,
+                                    env=_clean_env(), capture_output=True, text=True, timeout=120)
+            value = result.stdout.split()[0] if result.stdout.split() else ""
+            if result.returncode or not re.fullmatch(r"[0-9a-f]{40}", value):
+                raise flow.Stop("verification", "算不出补丁指纹")
+            return value
+        except (OSError, subprocess.TimeoutExpired, flow.Stop) as error:
+            raise flow.Stop("verification", "算不出补丁指纹") from error
+
+    def run_case(self, command, sha):
+        env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
+        try:
+            # Checkout and cleanup also receive no inherited Git authentication.
+            for args in (("checkout", "-q", "-f", "--detach", sha), ("clean", "-q", "-ffdx")):
+                result = subprocess.run(["git", "-C", self.root] + list(args), env=env,
+                                        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+                if result.returncode:
+                    return {"exit": None, "timeout": False, "output": "准备验证检出失败"}
+            result = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    errors="replace", stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT)
+            return {"exit": result.returncode, "timeout": False, "output": result.stdout}
+        except subprocess.TimeoutExpired as error:
+            output = error.output or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            return {"exit": None, "timeout": True, "output": output + "\n执行超时"}
+        except OSError:
+            return {"exit": None, "timeout": False, "output": "验证命令无法启动"}
 
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
@@ -195,26 +260,6 @@ class Work:
             return json.loads(r.stdout) if r.returncode == 0 else None
         except ValueError:
             return None
-
-    def review(self, previous):
-        args = ["bash", self.delegate, "review", "--repo", self.root, "--base", self.merge_base, "--head", self.head]
-        with tempfile.TemporaryDirectory() as tmp:
-            if previous is not None:
-                prev = os.path.join(tmp, "previous.json")
-                with open(prev, "w", encoding="utf-8") as fh:
-                    json.dump(previous, fh)
-                r = self._delegate(args + ["--previous-report", prev])
-                if r.returncode != 127:
-                    return self._parse(r)
-                # 127 = previous report's scope does not match (files added/removed): review afresh
-            return self._parse(self._delegate(args))
-
-    def _delegate(self, args):
-        try:
-            return subprocess.run(args, cwd=self.root, env=_clean_env(), capture_output=True, text=True,
-                                  stdin=subprocess.DEVNULL, timeout=REVIEW_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(args, 124, "", "timeout")
 
     @staticmethod
     def _parse(r):
@@ -327,6 +372,89 @@ class LocalIO:
                 result = self._batch_process(["git", "-C", root, "worktree", "remove", "--force", target], timeout=300)
                 if result.returncode != 0 and added:
                     raise flow.Stop("acceptance", "清理验收 worktree 失败：" + (result.stdout + result.stderr).strip()[:300])
+
+    @contextlib.contextmanager
+    def verification_worktree(self, repo, head, base_ref):
+        root = self.checkout_of(repo)
+        if not root or not os.path.isdir(root):
+            raise flow.Stop("verification", "用户检出不存在，请配置 checkouts")
+        def git(*args, authenticated=False):
+            try:
+                return self._batch_process(["git", "-C", root] + list(args), timeout=300,
+                                           env=_git_env(self.token) if authenticated else None)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise flow.Stop("verification", "准备验证 worktree 失败") from error
+        result = git("fetch", "-q", "--no-tags", "https://github.com/" + repo,
+                     "+refs/heads/%s:refs/remotes/origin/%s" % (base_ref, base_ref), authenticated=True)
+        if result.returncode:
+            raise flow.Stop("verification", "获取 PR 基础分支失败")
+        if git("cat-file", "-e", head + "^{commit}").returncode:
+            if git("fetch", "-q", "--no-tags", "https://github.com/" + repo, head, authenticated=True).returncode:
+                raise flow.Stop("verification", "获取 PR head 失败")
+        default = git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        if not ((default.returncode == 0 and default.stdout.strip() == "refs/remotes/origin/" + base_ref)
+                or (default.returncode == 1 and base_ref == "main")):
+            raise flow.Stop("verification", "用户检出的默认分支不是 PR 的基础分支，spec-guard 算的补丁会对不上")
+        with tempfile.TemporaryDirectory(prefix="autopilot-verification-") as tmp:
+            target = os.path.join(tmp, "checkout")
+            if git("worktree", "add", "--detach", target, head).returncode:
+                raise flow.Stop("verification", "建立验证 worktree 失败")
+            failed = True
+            try:
+                yield target
+                failed = False
+            finally:
+                removed = git("worktree", "remove", "--force", target).returncode == 0
+                if not removed:
+                    git("worktree", "prune")
+                    if not failed:  # never mask the stop raised inside the block
+                        raise flow.Stop("verification", "清理验证 worktree 失败")
+
+    def _verification_command(self, root, module, report, action):
+        plugin = verification_plugin()
+        args = ["python3", "-B", os.path.join(plugin, "hooks", "verification.py"), action,
+                "--project", root, "--module", module, "--report", str(report)]
+        args += ["--json"] if action == "check" else ["--confirm"]
+        try:
+            result = self._batch_process(args, cwd=root)
+            try:
+                data = json.loads(result.stdout)
+            except ValueError:
+                data = None
+            return result.returncode, data, result.stdout + result.stderr
+        except (OSError, subprocess.TimeoutExpired):
+            return 4, None, "验证脚本无法执行或超时"
+
+    def verification_check(self, root, module, report):
+        return self._verification_command(root, module, report, "check")
+
+    def verification_record(self, root, module, report):
+        return self._verification_command(root, module, report, "record")
+
+    def verification_view(self, root):
+        plugin = verification_plugin()
+        try:
+            result = self._batch_process(["python3", "-B", os.path.join(plugin, "hooks", "map_view.py"),
+                                          "--json", "--project", root], cwd=root)
+            data = json.loads(result.stdout) if result.returncode == 0 else None
+            return data if isinstance(data, dict) else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+
+    @staticmethod
+    def verification_paths(repo, patch_id):
+        directory = os.path.join(STATE, "evidence", repo.replace("/", "__"))
+        prefix = os.path.join(directory, patch_id)
+        return prefix + ".verification.json", prefix + ".logs", prefix + ".cases.json"
+
+    @staticmethod
+    def write_verification_file(path, content):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        temporary = str(path) + ".tmp"
+        Path(temporary).write_bytes(raw)
+        os.replace(temporary, path)
 
     def acceptance_map(self, root):
         plugin = find_spec_guard_root()
@@ -442,23 +570,6 @@ class LocalIO:
                 raise ApiError("读不到发布 issue 的正文编辑时间，无法验证开始块") from error
             issue = dict(issue, updated_at=edited_at or issue.get("created_at"))
         return issue
-
-    @staticmethod
-    def _review_path(repo, number):
-        return os.path.join(STATE, "reviews", repo.replace("/", "__"), "%d.json" % number)
-
-    def load_review(self, repo, number):
-        try:
-            with open(self._review_path(repo, number), encoding="utf-8") as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
-            return None
-
-    def save_review(self, repo, number, data):
-        path = self._review_path(repo, number)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
 
     def open_narrow_pr(self, repo, base_ref, module, issue_number, reason):
         """Slice 11: in a throwaway clone of the base branch run spec-guard's `narrow`, commit as the bot, push
@@ -724,10 +835,7 @@ def main(argv=None):
                       a.repo, out["auto_merged"], out["reverted_or_reworked"], out["reverted"], out["reworked"],
                       out["codex_unavailable_stops"], out["codex_unavailable_minutes"]))
         return 0
-    delegate = find_delegate()
-    if not delegate or not os.path.exists(delegate):
-        print("autopilot: 找不到 delegate 0.10.0 以上的 delegate-exec.sh（可设 AUTOPILOT_DELEGATE）", file=sys.stderr)
-        return 2
+    delegate = None
     try:
         token = tokens.mint(a.repo, READ if a.dry_run else WRITE)
     except tokens.TokenError as e:
