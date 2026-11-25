@@ -43,6 +43,7 @@ class FakeWork:
     def __init__(self, io):
         self.io = io
         self.merge_base = "b" * 40
+        self.base_tip = "t" * 40
 
     def regression(self, module, ref):
         return self.io.regression_head if ref == HEAD else self.io.regression_base
@@ -184,12 +185,6 @@ class FakeIO:
     def verification_view(self, root):
         return self.verification_map
 
-    def load_review(self, repo, number):
-        return self.stored
-
-    def save_review(self, repo, number, data):
-        self.stored = data
-
     def ledger(self, event):
         self.events.append(event)
 
@@ -292,7 +287,9 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(len(io.verify_issues), 1)
         self.assertEqual(len(io.case_runs), 1)
         self.reply(io, '确认执行 R2')
+        io.verify_issues[0]['updated_at'] = '2026-11-26T10:00:00Z'  # GitHub bumps it on every comment
         self.assertIn('已成立并记录', run(io)['reason'])
+        self.assertEqual(len(io.verify_issues), 1)
         self.assertEqual(len(io.case_runs), 2)
         self.assertEqual(io.verify_calls, ['check', 'record'])
 
@@ -343,6 +340,33 @@ class VerificationTest(unittest.TestCase):
         with mock.patch('orchestrator.batch.batch_payload', return_value={'module': 'other'}):
             io.batch_pr = lambda *a, **k: io.pr
             self.assertEqual(run(io)['step'], 'batch')
+
+    def test_flow_v2_module_with_acceptance_record_still_verifies(self):
+        io = self.io()
+        io.files[:] = [{'filename': 'docs/a.md', 'status': 'modified', 'additions': 1, 'deletions': 0, 'patch': '@@'}]
+        io.acceptance_record = accepted()
+        result = run(io)
+        self.assertEqual(result['step'], 'verification', result)
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_failures_are_not_cached_and_org_repos_stop(self):
+        io = self.io()
+        original = io.case_runs
+        outputs = iter([{'exit': 1, 'timeout': False, 'output': 'x'}, {'exit': 0, 'timeout': False, 'output': 'ok'},
+                        {'exit': 0, 'timeout': False, 'output': 'ok'}])
+        work_run = FakeWork.run_case
+        def run_case(self_, command, sha):
+            original.append((command, sha))
+            return next(outputs)
+        with mock.patch.object(FakeWork, 'run_case', run_case):
+            self.assertIn('不通过', run(io)['reason'])
+            self.assertIn('已成立并记录', run(io)['reason'])
+        self.assertEqual(len(original), 3)  # head fail + baseline pass, then a fresh run
+        from test_verify import case
+        io = self.io([case('R3', 'manual')])
+        io.pr['base']['repo']['owner']['type'] = 'Organization'
+        self.assertIn('组织', run(io)['reason'])
 
     def test_risk_and_core_check_run_before_cases(self):
         io = self.io()
@@ -469,64 +493,11 @@ class StopTest(unittest.TestCase):
         self.assertStops(io, "check", "退出码 1")
         self.assertEqual(io.reviews, [])
 
-    def test_codex_unavailable_stops_and_is_recorded(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=0)])
+    def test_non_spec_guard_auto_takeover_still_goes_to_human(self):
+        """Q-A1: without a regression document nothing merges itself, whatever takeover.yml says."""
+        io = FakeIO(module=None, merge="auto")
         self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_inconclusive_is_unavailable_too(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=1)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_blocking_round_one_asks_for_rework_and_saves_report(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=2)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_round_two_rechecks_against_round_one(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=3)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_round_two_still_blocking_goes_to_human(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=4)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_same_head_reuses_conclusive_review(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=5)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_suggestions_do_not_block(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=6)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_missing_severity_counts_as_blocking(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=7)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_unreviewed_files(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=8)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
-
-    def test_missing_fingerprint(self):
-        io = FakeIO(module=None, reports=[report(status="conditions_missing", blocking=9)])
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertEqual(io.reviews, [])
+        self.assertIn('"merge": "human"', io.comments[0]["body"])
         self.assertEqual(io.ran, [])
 
     def test_readback_not_merged(self):

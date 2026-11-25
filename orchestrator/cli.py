@@ -399,11 +399,16 @@ class LocalIO:
             target = os.path.join(tmp, "checkout")
             if git("worktree", "add", "--detach", target, head).returncode:
                 raise flow.Stop("verification", "建立验证 worktree 失败")
+            failed = True
             try:
                 yield target
+                failed = False
             finally:
-                if git("worktree", "remove", "--force", target).returncode:
-                    raise flow.Stop("verification", "清理验证 worktree 失败")
+                removed = git("worktree", "remove", "--force", target).returncode == 0
+                if not removed:
+                    git("worktree", "prune")
+                    if not failed:  # never mask the stop raised inside the block
+                        raise flow.Stop("verification", "清理验证 worktree 失败")
 
     def _verification_command(self, root, module, report, action):
         plugin = verification_plugin()

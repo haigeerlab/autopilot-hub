@@ -346,8 +346,15 @@ def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
     bot = io.bot_identity()
     payload = dict(pr=pr['number'], patchId=patch_id, regressionSha256=document_sha,
                    confirm=[c['id'] for c in groups['confirm']], manual=[c['id'] for c in groups['manual']])
-    def listings(source):
-        if not d.trusted(rest_comment(source), bot):
+    def listings(source, issue_body=False):
+        # REST updated_at of an issue moves on every comment, so the issue body is identified by its bot
+        # author and app only; listing comments must also be unedited.
+        if issue_body:
+            user = source.get('user') or {}
+            if not (bot and user.get('type') == 'Bot' and user.get('id') == bot['id']
+                    and (source.get('performed_via_github_app') or {}).get('slug') == bot['app_slug']):
+                return []
+        elif not d.trusted(rest_comment(source), bot):
             return []
         found = []
         for raw in VERIFY_BLOCK.findall(source.get('body') or ''):
@@ -359,14 +366,14 @@ def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
                 found.append(item)
         return found
     issue = next((i for i in io.api(f'repos/{repo}/issues?labels=autopilot:verify&state=open&per_page=100') or []
-                  if 'pull_request' not in i and listings(i)), None)
+                  if 'pull_request' not in i and listings(i, True)), None)
     body = verification_listing(module, groups, payload)
     if issue is None:
         issue = io.api(f'repos/{repo}/issues', 'POST', {
             'title': f"autopilot：PR #{pr['number']} 合并前验证等你确认", 'labels': ['autopilot:verify'], 'body': body})
         return issue, [], 0
     comments = io.api(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100") or []
-    latest, after_id = listings(issue)[-1], 0
+    latest, after_id = listings(issue, True)[-1], 0
     for comment in sorted(comments, key=lambda c: c.get('id', 0)):
         found = listings(comment)
         if found:
@@ -391,7 +398,7 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
     if merge != 'auto':
         raise Stop('takeover', f'模块 {module} 的接管档位里合并由人，交你')
     head = pr['head']['sha']
-    base_code, base_doc = work.regression(module, ref=work.merge_base)
+    base_code, base_doc = work.regression(module, ref=work.base_tip)
     code, doc = work.regression(module, ref=head)
     def problems(data):
         data = data or {}
@@ -426,13 +433,18 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
         digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
-        reused = state.get('current') is True and state.get('reportSha256') == digest
+        # A failed verdict is never reused: the next run re-executes (failures may be flaky).
+        reused = (state.get('current') is True and state.get('reportSha256') == digest
+                  and report.get('verdict') != 'fail')
     if not reused:
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:
             issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
-            owner_id = pr['base']['repo']['owner'].get('id')
+            owner = pr['base']['repo']['owner']
+            if owner.get('type') == 'Organization':
+                raise Stop('verification', '仓库属于组织，跟踪 issue 只认仓库所有者本人的答复，组织仓库还不支持，交你处理')
+            owner_id = owner.get('id')
             if owner_id is None:
                 owner_id = (io.api(f'repos/{repo}').get('owner') or {}).get('id')
             replies = parse_replies(comments, owner_id, after_id)
@@ -463,8 +475,9 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
                 baseline = work.run_case(case['command'], work.merge_base)
                 baseline_ev = [evidence(os.path.join(logs, cid+'-base.log'), baseline['output'])]
             result = case_result(case, execution, [ev], baseline, baseline_ev, work.merge_base)
-            cache[cid] = dict(sha256=case['sha256'], result=result)
-            write_json(cache_path, cache)
+            if result['result'] != 'fail':  # a failure (possibly flaky) is re-run next time
+                cache[cid] = dict(sha256=case['sha256'], result=result)
+                write_json(cache_path, cache)
             results.append(result)
         if pending_confirm or pending_manual:
             raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：确认执行 " + ' '.join(pending_confirm)
@@ -618,6 +631,11 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
                 if len(modules) > 1:
                     raise Stop("acceptance", "当前提交有多条验收记录（" + "、".join(sorted(modules)) + "），拿不准属于哪个模块")
                 module = modules[0]
+                base_mod = next((m for m in (base_view or {}).get("modules") or []
+                                 if isinstance(m, dict) and m.get("id") == module), None)
+                if base_mod is not None and base_mod.get("tier") is not None:
+                    # Flow v2 modules never use the Codex final acceptance, even if a record exists.
+                    return verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say)
                 merge, reason = view_merge(base_view, module)
                 if reason:
                     notes.append(reason)
