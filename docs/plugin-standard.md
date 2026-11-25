@@ -1,4 +1,4 @@
-# haigeerlab 插件开发规范（v1.7，2026-11-24 用户批准）
+# haigeerlab 插件开发规范（v1.7.1，2026-11-25 用户批准）
 
 > 本文件是规范的正式存放处（hub 副本），由 autopr-design 维护；改动要用户批准，走 hub 的 PR（T4，由用户合并）。原稿与审查记录在 plugin-ecosystem 总账 `research/2026-11-23-插件开发规范/`。文末附「条目与 hub 检查的对应表」。
 
@@ -179,8 +179,9 @@
   - 发版提交也按这个格式写，例如 `chore(release): 发布 v0.94.0`，不另设豁免。
 - 放行：
   - 有两个及以上父提交的合并提交；
-  - `git revert` 生成的标准格式 `Revert "…"`。
-- 查什么范围：PR 相对 merge-base 新增的提交。机器人的提交同样适用。hub 的现有检查还会查 PR 标题和正文，这部分照旧运行，不算本条的卡。
+  - `git revert` 生成的标准格式 `Revert "…"`；
+  - PR 作者和提交作者都是 `dependabot[bot]` 的提交，按 GitHub 返回的账号判断，不看提交说明的文字。只看提交作者能被伪造，所以两个条件都要满足。这类 PR 的标题和正文也不做中文检查。
+- 查什么范围：PR 相对 merge-base 新增的提交。机器人的提交同样适用，Dependabot 按上面的放行条处理。hub 的现有检查还会查 PR 标题和正文，这部分照旧运行，不算本条的卡。
 - 在哪拦：PR 的检查，调用 hub 的 `rules/chinese_commit.py`。这个检查现在只查中文，类型前缀的检查要由 autopr-design 补上。
 - 为什么：用户读提交历史和 PR 列表要一眼看懂改了什么；类型前缀让发版说明可以按类型归类。
 
@@ -273,6 +274,7 @@
 - v1.5.1（2026-11-24）：用户「同意这样改」：F3 第 3 步补一种情况——必需检查已全部通过（CLEAN）时直接 `gh pr merge`，否则 `--auto`。条目数不变。
 - v1.6（2026-11-24）：用户「同意加这一步」：F3 加第 0 步——开完 PR 会话自己后台等 CI，通过后主动问用户合并、不通过自己修；用户不用提醒。条目数不变。
 - v1.7（2026-11-24）：用户「同意改成 v1.7」：撤掉 v1.6 第 0 步（后台 `gh pr checks --watch` 违反桌面版「不得自己轮询 CI」的规则，spec-guard 指出）；改为开完 PR 就问用户合并，`--auto` 让 GitHub 等 CI，Auto-fix 在失败时叫醒会话修。条目数不变。
+- v1.7.1（2026-11-25）：用户「同意改成 v1.7.1」（此前在 hub 会话定「放行 dependabot」）：F1 放行 PR 作者和提交作者都是 `dependabot[bot]` 的提交，按账号判断不看文字，这类 PR 的标题和正文也不查中文；解决 C9 的 Dependabot 升级 PR 必被 F1 拦下的冲突（影子运行重跑发现，agent-relay #198、#199）。hub 实现见 hub #68（b34560f）。条目数不变。
 
 ## 附：条目与 hub 检查的对应表
 
@@ -289,6 +291,28 @@
 | C7 插件清单与元信息 | 卡 | `claude plugin validate --strict`（模板钉 claude-code 版本；插件在仓库根目录的，对去掉根目录 CLAUDE.md、AGENTS.md 的 git archive 导出副本运行）＋ hub 脚本真正解析 frontmatter YAML：skill、agent 要 `name`、`description`，command 只要 `description`（名字取自文件名） | 模板与 `rules/frontmatter.py` 已写（hub 严格 YAML 子集解析器，只用标准库；`claude plugin validate --strict` 在 CI 模板里，钉 2.1.321） |
 | C8 workflow 安全审计 | 卡 | 本次 PR 新增或改动的 workflow：`rules/workflow_audit.py` 查顶层 `permissions: {}`、checkout `persist-credentials: false`（`true` 须同行注明原因）；zizmor 1.32.0（按哈希安装、离线、只报高危） | 已写，影子运行中（检查 `autopilot/rule/workflow-audit`、`autopilot/rule/zizmor`） |
 | F1 提交说明中文加类型前缀 | 卡 | `rules/commit_format.py`（只看第一行；两个以上父提交和标准 `Revert "…"` 放行；另有 `--message-file` 供 commit-msg 钩子用）。PR 标题和正文仍由 `rules/chinese_commit.py` 查，不算卡 | 已写，影子运行中（检查 `autopilot/rule/commit-format`） |
-| 其余 23 条提醒（含 C9、C10、F3） | 提醒 | 体检项，列在体检报告里 | 「规范C9」「规范C10」已写；其余待写 |
+| B2 统一发版命令 | 提醒 | 体检项「规范B2」统一发版命令 | 已写 |
+| B3 发版证据统一放 | 提醒 | 体检项「规范B3」发版证据统一放 | 已写 |
+| B4 CHANGELOG 统一格式 | 提醒 | 体检项「规范B4」CHANGELOG 统一格式 | 已写 |
+| C2 统一本地检查入口 | 提醒 | 体检项「规范C2」统一本地检查入口 | 已写 |
+| C3 临时 git 仓库关闭后台维护 | 提醒 | 体检项「规范C3」临时 git 仓库关闭后台维护 | 已写 |
+| C4 Python 3.9 兼容 | 提醒 | 体检项「规范C4」Python 3.9 与新版本兼容 | 已写 |
+| C5 Bash 3.2 兼容 | 提醒 | 体检项「规范C5」Bash 3.2 兼容（扫描 .sh，不扫描 workflow 的 run） | 已写 |
+| C6 Actions 引用钉完整 SHA | 提醒 | 体检项「规范C6」Actions 引用钉完整 SHA | 已写 |
+| C9 Dependabot 冷却 | 提醒 | 体检项「规范C9」Dependabot 只升级 Actions、冷却 7 天 | 已写 |
+| C10 CI 检查工作区干净 | 提醒 | 体检项「规范C10」CI 最后检查工作区干净 | 已写 |
+| D1 插件目录 | 提醒 | 体检项「规范D1」插件放在 plugins/<名>/（module-crew 为规范例外） | 已写 |
+| D2 两份清单 | 提醒 | 体检项「规范D2」Claude 和 Codex 两份清单 | 已写 |
+| D3 统一命名 | 提醒 | 体检项「规范D3」测试文件统一命名 | 已写 |
+| E1 interface.json | 提醒 | 体检项「规范E1」interface.json 两段版本 | 已写 |
+| E2 按接口版本判断依赖 | 提醒 | — | 不做成体检项（行为规则） |
+| F2 PR 模板 | 提醒 | 体检项「规范F2」PR 模板 | 已写 |
+| F3 合并方式 | 提醒 | — | 不做成体检项（行为规则） |
+| G1 必备文档 | 提醒 | 体检项「规范G1」必备文档 | 已写 |
+| G2 共享段一致 | 提醒 | 体检项「规范G2」共享段一致 | 已写 |
+| H1 hub 引用统一 | 提醒 | 体检项「规范H1」引用 hub 的版本统一（目标取 hub 根目录 standard-target.json） | 已写 |
+| H2 风险配置用 yml | 提醒 | 体检项「规范H2」风险配置使用 yml | 已写 |
+| H3 CI workflow 名称 | 提醒 | 随体检项「规范C1」检查 CI workflow 名称 | 已写 |
+| H4 rules.json | 提醒 | 体检项「规范H4」rules.json 合法对象 | 已写 |
 
 各仓库接入方式：照 `examples/caller-ci-standard.yml` 写自己的 `CI` workflow（其中 `rules` 任务调用 hub 的规则 workflow，影子运行期 `mode: report`，开拦后改 `enforce`），由汇总任务 `CI required` 依赖全部任务；照 `examples/caller-release-tag.yml` 加推送标签检查；按 H1 钉 hub 的目标基线提交；用 `.github/autopr/rules.json` 声明启用哪些规则（H4）。落地先经过影子运行（只报告、不拦），用户看过结果后再逐仓开拦。
