@@ -31,6 +31,8 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 - 合规监测的 Plan 审批检查跳过新流程模块（`tier` 不为空）：spec-guard 1.21 起它们的 Plan 写完即自动批准，原检查会误报"Plan 未批就开工"。
 
+- `scripts/validate.sh`（规范 C2）：全量检查入口，按 `unittest discover` 的规则逐个跑测试文件并打印最慢 5 个；`--quick` 只跑改动涉及的测试（按导入关系追到间接依赖，对应不上退回全量，有文档改动时加跑扫全仓的测试）。CI 的测试步骤改为调用它。
+
 ### Changed
 - CI workflow 改名为 `CI`，在 macOS 系统 Python 3.9 与 3.13 上各跑一遍测试；新增汇总任务 `CI required`（规范 C1），顶层权限改为 `permissions: {}`、按任务放权（规范 C8）。
 
