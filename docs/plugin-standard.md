@@ -1,4 +1,4 @@
-# haigeerlab 插件开发规范（v1.7.1，2026-11-25 用户批准）
+# haigeerlab 插件开发规范（v1.7.2，2026-11-25 用户批准）
 
 > 本文件是规范的正式存放处（hub 副本），由 autopr-design 维护；改动要用户批准，走 hub 的 PR（T4，由用户合并）。原稿与审查记录在 plugin-ecosystem 总账 `research/2026-11-23-插件开发规范/`。文末附「条目与 hub 检查的对应表」。
 
@@ -217,8 +217,8 @@
 
 **H1 引用 hub 的版本统一升级（提醒）**
 - 规则：各仓库调用 hub 的地方，钉同一个目标基线提交。
-  - 目标基线当前是 `713a3d8`。
-  - 现状：agent-relay 已在这个基线；kb-plugin 仍是 `3081e7b`；spec-guard、module-crew、delegate 尚未接入 hub 的 workflow。
+  - 目标基线记在 hub 根目录的 `standard-target.json`（字段 `hub_target`）。改它要走 hub PR，由用户合并。当前是 `b34560f`（2026-11-25 起）。
+  - 以后升基线只改这个文件，规范正文不跟着改。
 - 只有 hub 改到以下几处时，才发「需要升钉」的通知，各仓库统一升级：
   - `.github/workflows/`、`admission/`、`degrade/`、`rules/`；
   - 共享检查代码；
@@ -275,6 +275,7 @@
 - v1.6（2026-11-24）：用户「同意加这一步」：F3 加第 0 步——开完 PR 会话自己后台等 CI，通过后主动问用户合并、不通过自己修；用户不用提醒。条目数不变。
 - v1.7（2026-11-24）：用户「同意改成 v1.7」：撤掉 v1.6 第 0 步（后台 `gh pr checks --watch` 违反桌面版「不得自己轮询 CI」的规则，spec-guard 指出）；改为开完 PR 就问用户合并，`--auto` 让 GitHub 等 CI，Auto-fix 在失败时叫醒会话修。条目数不变。
 - v1.7.1（2026-11-25）：用户「同意改成 v1.7.1」（此前在 hub 会话定「放行 dependabot」）：F1 放行 PR 作者和提交作者都是 `dependabot[bot]` 的提交，按账号判断不看文字，这类 PR 的标题和正文也不查中文；解决 C9 的 Dependabot 升级 PR 必被 F1 拦下的冲突（影子运行重跑发现，agent-relay #198、#199）。hub 实现见 hub #68（b34560f）。条目数不变。
+- v1.7.2（2026-11-25）：用户「同意改成 v1.7.2」：H1 目标基线改为以 hub 根目录 `standard-target.json` 为准（hub #69，4248dae），当前 `b34560f`；删去已过时的「现状」行（各仓进度见总账）。起因：正文仍写 `713a3d8`，与 hub 体检项判断依据不一致（autopr-design 指出）。条目数不变。
 
 ## 附：条目与 hub 检查的对应表
 
