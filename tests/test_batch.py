@@ -473,6 +473,29 @@ class BatchLocalIOTest(unittest.TestCase):
 
 
 class ExtraEvidenceTest(unittest.TestCase):
+    def test_new_flow_batch_merges_without_record_acceptance(self):
+        from test_orchestrator import VerificationTest
+        io = VerificationTest().io()
+        io.pr.update(pull(entry()))
+        io.pr['base']['repo'] = {'owner': {'login': 'haigeerlab', 'id': 1}}
+        io.extra_evidence = entry()
+        io.batch_pr = lambda *args, **kwargs: io.pr
+        io.first_stage = lambda repo: json.dumps(first_stage())
+        original = io.api
+        def api(path, method='GET', body=None):
+            if '/compare/' in path:
+                return {'status': 'ahead'}
+            return original(path, method, body)
+        io.api = api
+        with mock.patch.object(batch, 'choose', return_value=(entry(), io.pr)), \
+                mock.patch.object(batch, 'record_acceptance', side_effect=AssertionError('legacy acceptance')):
+            result = batch.run(io, REPO)
+        self.assertEqual(result['code'], 0, result)
+        self.assertEqual(result['result'], 'merged', result)
+        self.assertEqual(io.merge_calls()[0][2], {'sha': HEAD, 'merge_method': 'merge'})
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+        self.assertEqual(io.reviews, [])
+
     def test_only_trusted_unedited_batch_pr_gets_readable_extra_check(self):
         from test_orchestrator import FakeIO
         for trusted, edited, matching in ((True, False, True), (False, False, True),

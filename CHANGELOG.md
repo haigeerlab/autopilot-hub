@@ -7,6 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
+- S110 切片 S3：新流程模块的证据评论 `autopilot-evidence:v2`（补丁指纹、merge-base、模块、检查、合并前验证结论与报告／回归文档 sha256、已核对产物）；硬卡 `admission/gate.py` 同时认 v1 与 v2，v2 要求结论为 pass／pass-with-notes、模块与接管评论一致、仍绑定当前 head（工作流不重算补丁指纹，rebase 后由编排复用验证结论、重发绑定新 head 的证据）。编排在合并前验证成立后发 v2 证据、过本地准入并合并。切片 12 改档对新流程模块改为：需求由用户确认，且技术方案已批（用户或审查方）、不需要审或没有技术方案。**需要升钉**（改到 `admission/`；升钉前各仓库远端硬卡读不懂 v2，新流程模块只能人合）。
 - S110 切片 S2 合并前验证（⑦）：spec-guard 新流程模块（`tier` 不为 null）由本机编排照回归文档执行用例、写 `spec-guard.verification/v1` 报告，交 spec-guard 0.96.0 校验并记录（`verify/core.py`、`orchestrator/flow.py` 的 `verify_module`）。与基础分支一致的命令用例自动执行，新增或改过的命令要你在跟踪 issue（`autopilot:verify`）回复「确认执行」后才跑；人工与 ai-operate 用例由你在跟踪 issue 回复结果。验证成立并记录后停下交你合，证据评论 v2 与硬卡在 S3 接上。老流程模块仍走 Codex 最终验收。不需要升钉（只改本机编排）。
 - `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.7.3），附条目与 hub 检查的对应表。
 - `.github/dependabot.yml`：只升级 GitHub Actions，每月一次，冷却 7 天（规范 C9）。

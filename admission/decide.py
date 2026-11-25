@@ -95,7 +95,7 @@ def takeover_item(comments, bot, notes):
 
 
 def verified_artifacts(comments, bot, head_sha):
-    """spec/** and tasks/** paths the latest trusted evidence on `head_sha` lists as verified (slice 12)."""
+    """spec/** and tasks/** paths the latest trusted v1/v2 evidence on `head_sha` lists as verified (slice 12)."""
     from admission.gate import current_evidence  # local: gate imports helpers from this module
     if bot is None or not isinstance(head_sha, str) or len(head_sha) != 40:
         return set()
