@@ -71,24 +71,66 @@ PLUGIN = Path.home()/'.claude/plugins/cache/spec-guard-marketplace/spec-guard/0.
 
 @unittest.skipUnless((PLUGIN/'hooks/verification.py').is_file(), '本机没有 spec-guard 0.96.0 插件缓存（CI 不安装插件）')
 class RealContractTest(unittest.TestCase):
-    def test_generated_report_stands(self):
+    """Reports built by verify/core.py, with evidence laid out like ~/.autopilot/evidence (outside the project,
+    paths relative to the report), must stand under spec-guard 0.96.0's own `verification.py check`."""
+
+    def setUp(self):
         # Reuse the official fixture to match the plugin's complete document grammar.
         sys.path.insert(0, str(PLUGIN/'hooks'))
         from test_verification import Repo, run, patch_id
-        repo = Repo()
-        self.addCleanup(repo.close)
-        self.assertEqual(run(repo.root, 'author', '--module', 'a', session='author-test').returncode, 0)
-        done = subprocess.run([sys.executable, '-B', str(PLUGIN/'hooks/regression_view.py'), '--json', '--project', str(repo.root), '--module', 'a'], capture_output=True, text=True)
+        self.run_sg, self.repo = run, Repo()
+        self.addCleanup(self.repo.close)
+        self.assertEqual(run(self.repo.root, 'author', '--module', 'a', session='author-test').returncode, 0)
+        done = subprocess.run([sys.executable, '-B', str(PLUGIN/'hooks/regression_view.py'), '--json', '--project',
+                               str(self.repo.root), '--module', 'a'], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        doc = json.loads(done.stdout)
+        self.doc = json.loads(done.stdout)
+        self.patch = patch_id(self.repo.root, self.repo.base, self.repo.head)
+        self.folder = Path(tempfile.mkdtemp(prefix='autopilot-evidence-'))
+        self.addCleanup(lambda: __import__('shutil').rmtree(self.folder, ignore_errors=True))
+        self.report_path = self.folder/(self.patch + '.verification.json')
+
+    def evidence(self, name, text, kind='log', source=None):
+        path = self.folder/(self.patch + '.logs')/name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode('utf-8'))
+        return dict(type=kind, path=os.path.relpath(path, self.folder),
+                    sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(), source=source)
+
+    def check(self, head_exit, base_exit, reply_word):
+        comment = dict(id=5, body='', user={'id': 1}, html_url='https://example.test/c/5', created_at='t', updated_at='t')
+        comment['body'] = 'R1 通过\nR2 %s\n意见 R2：列名可以更清楚' % reply_word
+        replies = parse_replies([comment], 1, 0)
         cases = []
-        for entry in doc['cases']:
-            ev = repo.evidence(entry['id']+'.txt')
-            if entry['method'] == 'manual':
-                ev.update(type='user-quote', source='https://example.test/comment')
-            cases.append(case_result(entry, {'exit': 0}, [ev], reply={'result': 'pass'}))
-        report = build_report('a', doc, repo.base, repo.head, patch_id(repo.root, repo.base, repo.head), new_executor(), cases, [])
-        path = Path(repo.tmp.name+'-evidence')/'generated.json'
-        path.write_text(json.dumps(report), encoding='utf-8')
-        checked = run(repo.root, 'check', '--module', 'a', '--report', str(path), '--json')
+        for entry in self.doc['cases']:
+            cid = entry['id']
+            if entry['method'] in ('manual', 'ai-operate'):
+                quote = self.evidence(cid + '-quote.txt', comment['body'], 'user-quote', comment['html_url'])
+                cases.append(case_result(entry, evidence=[quote], reply=replies['results'][cid]))
+                continue
+            ev = self.evidence(cid + '.log', 'head run\n')
+            base_ev = [self.evidence(cid + '-base.log', 'base run\n')] if head_exit else []
+            baseline = {'exit': base_exit, 'timeout': False} if head_exit else None
+            cases.append(case_result(entry, {'exit': head_exit, 'timeout': False}, [ev], baseline, base_ev, self.repo.base))
+        report = build_report('a', self.doc, self.repo.base, self.repo.head, self.patch, new_executor(), cases,
+                              replies['notes'])
+        self.report_path.write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
+        checked = self.run_sg(self.repo.root, 'check', '--module', 'a', '--report', str(self.report_path), '--json')
         self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        out = json.loads(checked.stdout)
+        self.assertEqual((out['established'], out['unverified']), (True, []), out)
+        return report
+
+    def test_pass_with_notes_and_baseline_fail_stand(self):
+        report = self.check(1, 1, '通过')
+        self.assertEqual(report['verdict'], 'pass-with-notes')
+        self.assertIn('baseline-fail', [c['result'] for c in report['cases']])
+
+    def test_fail_report_stands(self):
+        report = self.check(1, 0, '不通过：页面打不开')
+        self.assertEqual(report['verdict'], 'fail')
+        self.assertEqual(sorted(c['failCategory'] for c in report['cases'] if c['result'] == 'fail'),
+                         ['check-failure', 'user-bug'])
+
+    def test_all_pass_stands(self):
+        self.assertEqual(self.check(0, None, '通过')['verdict'], 'pass-with-notes')
