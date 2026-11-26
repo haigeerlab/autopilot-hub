@@ -71,6 +71,10 @@ class FakeWork:
     def module_view(self):
         return self.io.view
 
+    def in_scope(self, module):
+        self.io.scope_queries = getattr(self.io, 'scope_queries', []) + [module]
+        return module in getattr(self.io, 'in_scope', ())
+
     def review(self, previous):
         self.io.reviews.append(previous)
         return self.io.reports.pop(0)
@@ -464,6 +468,43 @@ class VerificationTest(unittest.TestCase):
         with mock.patch('orchestrator.batch.batch_payload', return_value={'module': 'other'}):
             io.batch_pr = lambda *a, **k: io.pr
             self.assertEqual(run(io)['step'], 'batch')
+
+    def unticked(self, owners=(), status='in_progress'):
+        io = self.io()
+        io.base['modules'][0]['status'] = status
+        io.files[:] = [{'filename': 'docs/b.md', 'status': 'modified', 'additions': 1, 'deletions': 0, 'patch': '@@'}]
+        io.in_scope = set(owners)
+        return io
+
+    def test_unticked_implementation_names_its_module(self):
+        io = self.unticked(owners=['m'])
+        result = run(io)
+        self.assertEqual(result['step'], 'acceptance', result)
+        self.assertIn('模块 m 的范围', result['reason'])
+        self.assertIn('tasks/m/todo.md', result['reason'])
+        self.assertEqual(io.verify_calls, [])
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_unticked_implementation_in_several_scopes(self):
+        io = self.unticked(owners=['m', 'n'])
+        io.base['modules'].append(dict(id='n', tier='normal', status='in_progress', takeover=effective()))
+        reason = run(io)['reason']
+        self.assertIn('m、n', reason)
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_outside_every_scope_explains_how_modules_are_recognised(self):
+        io = self.unticked()
+        reason = run(io)['reason']
+        self.assertIn('没有最终验收记录', reason)
+        self.assertIn('tasks/<id>/', reason)
+        self.assertIn('m', reason)
+        self.assertEqual(io.scope_queries, ['m'])
+
+    def test_done_modules_are_not_scope_candidates(self):
+        io = self.unticked(owners=['m'], status='done')
+        reason = run(io)['reason']
+        self.assertIn('没有最终验收记录', reason)
+        self.assertEqual(getattr(io, 'scope_queries', []), [])
 
     def test_flow_v2_module_with_acceptance_record_still_verifies(self):
         io = self.io()
@@ -1316,6 +1357,30 @@ class VerificationLocalIOTest(unittest.TestCase):
             io.write_verification_file(path, '内容')
             self.assertEqual(path.read_text(), '内容')
             self.assertFalse(Path(str(path)+'.tmp').exists())
+
+    def test_in_scope_reads_spec_guard_scope_check_on_head(self):
+        from orchestrator import cli
+        import subprocess
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.head, work.merge_base = 'clone', HEAD, 'b' * 40
+        work.git = mock.Mock()
+        inside = subprocess.CompletedProcess([], 0, '{"outside": 0, "files": [{"path": "src/a.py"}]}', '')
+        outside = subprocess.CompletedProcess([], 0, '{"outside": 1, "files": []}', '')
+        refused = subprocess.CompletedProcess([], 4, 'flow-scope-unknown', '')
+        broken = subprocess.CompletedProcess([], 0, 'not json', '')
+        with mock.patch.dict(os.environ, {'GH_TOKEN': 'secret'}), \
+                mock.patch.object(cli, 'find_spec_guard_root', return_value='plugin'), \
+                mock.patch.object(cli.os.path, 'isfile', return_value=True), \
+                mock.patch.object(cli.subprocess, 'run', side_effect=[inside, outside, refused, broken]) as process:
+            self.assertEqual([work.in_scope('m') for _ in range(4)], [True, False, False, False])
+        args = process.call_args_list[0].args[0]
+        self.assertIn('module_scope.py', args[2])
+        self.assertEqual(args[args.index('--base') + 1], 'b' * 40)
+        self.assertEqual(args[args.index('--module') + 1], 'm')
+        self.assertNotIn('GH_TOKEN', process.call_args_list[0].kwargs['env'])
+        work.git.assert_called_with('checkout', '-q', '--detach', HEAD)
+        with mock.patch.object(cli, 'find_spec_guard_root', return_value=None):
+            self.assertFalse(work.in_scope('m'))
 
     def test_worktree_rejects_wrong_default_branch(self):
         from orchestrator import cli
