@@ -5,7 +5,7 @@
 - [x] Task 1：风险分级按 R4
   - 验证：`tests.test_risk`、`tests.test_admission`
   - 文件：`risk/templates.json`、`risk/tiers.py`、`admission/decide.py`、`.github/autopr/risk-tiers.json`、对应测试
-- [ ] Task 2：`orchestrator/state.py`
+- [x] Task 2：`orchestrator/state.py`
   - 验证：R13（`tests.test_state`）
   - 文件：`orchestrator/state.py`、`tests/test_state.py`
 - [ ] Task 3：run 的路线与 `autopilot/verified`
