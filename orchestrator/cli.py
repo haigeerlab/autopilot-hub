@@ -291,8 +291,8 @@ class Work:
         return isinstance(data, dict) and data.get("outside") == 0 and bool(data.get("files"))
 
     def changed_existing_files(self, module):
-        """Return the baseline and paths that existed there and changed on the pinned head."""
-        base, source = self.merge_base, "merge-base"
+        """Return baseline evidence and changed paths already present at that baseline."""
+        baseline = {"sha": self.merge_base, "source": "merge-base"}
         root = find_spec_guard_root((0, 96, 0)) if module else None
         hooks = os.path.join(root, "hooks") if root else None
         if hooks and os.path.isfile(os.path.join(hooks, "module_scope.py")):
@@ -300,19 +300,24 @@ class Work:
             code = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
                     "from module_scope import scope_base\nprint(scope_base(Path(sys.argv[2]), sys.argv[3]) or '')")
             try:
-                self.git("checkout", "-q", "--detach", self.head)
+                self.git("checkout", "-q", "--detach", self.base_tip)
                 result = subprocess.run([sys.executable, "-I", "-B", "-c", code, hooks, self.root, module],
                                         cwd=self.root, env=_clean_env(), capture_output=True, text=True,
                                         stdin=subprocess.DEVNULL, timeout=120)
                 candidate = result.stdout.strip()
                 if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", candidate):
-                    base = self.git("rev-parse", "--verify", candidate + "^{commit}").strip()
-                    source = "scope_base"
+                    try:
+                        candidate = self.git("rev-parse", "--verify", candidate + "^{commit}").strip()
+                        self.git("merge-base", "--is-ancestor", candidate, self.merge_base)
+                    except flow.Stop:
+                        baseline["fallbackReason"] = "scope-base-not-ancestor"
+                    else:
+                        baseline = {"sha": candidate, "source": "scope_base"}
             except (OSError, subprocess.TimeoutExpired, UnicodeError, flow.Stop):
                 pass
         # Disabling rename detection treats a moved test as a deletion of the existing path.
-        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", base, self.head, "--")
-        return base, source, [path for path in paths.split("\0") if path]
+        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", baseline["sha"], self.head, "--")
+        return baseline, [path for path in paths.split("\0") if path]
 
     @staticmethod
     def _parse(r):
@@ -393,11 +398,8 @@ class LocalIO:
         try:
             token = tokens.mint(repo, {"administration": "read"})
         except tokens.TokenError as error:
-            if need_all:
-                raise ApiError("读不到旧版分支保护的必需检查与来源") from error
-            # Without Administration: read the App ID cannot be confirmed: fail closed to the manual route
-            # (the projection has no app_id, so the source check is unmet) instead of failing the whole run.
-            return checks
+            raise flow.ChecksUnconfirmed(
+                "无法确认旧版分支保护的必需检查及来源，需要 hub App 的 Administration: read 权限") from error
         try:
             details = LocalIO(token, None).api_optional(path + "/protection/required_status_checks")
         finally:
@@ -411,7 +413,7 @@ class LocalIO:
         try:
             token = tokens.mint(repo, {"checks": "read"})
         except tokens.TokenError as error:
-            raise ApiError("读不到必需检查，需要 hub App 的 Checks: read 权限") from error
+            raise flow.ChecksUnconfirmed("无法确认必需检查的结论，需要 hub App 的 Checks: read 权限") from error
         path = f"repos/{repo}/commits/{head}"
         try:
             run_pages = LocalIO(token, None).api(f"{path}/check-runs")
@@ -1080,11 +1082,13 @@ def main(argv=None):
     try:
         result = flow.run(LocalIO(token, None), a.repo, a.pr, dry_run=a.dry_run,
                           state=state, notify=a.notify, author_host=a.author_host)
-    except ApiError as e:
-        summary = " ".join(str(e).replace(token, "[redacted]").split())[:350]
-        print("autopilot: GitHub 接口失败：%s" % summary, file=sys.stderr)
+    except (ApiError, OSError, StateCorruptError, StateLockedError) as error:
+        summary = " ".join(str(error).replace(token, "[redacted]").split())[:350]
+        source, recovery_check = (("GitHub 接口", "GitHub 接口和 App 权限") if isinstance(error, ApiError)
+                                  else ("本机运行", "本机运行环境和 watch 状态"))
+        print(f"autopilot: {source}失败：{summary}", file=sys.stderr)
         if not a.dry_run:
-            recovery = f"{summary}。核对 GitHub 接口和 App 权限后，重新运行 autopilot run。"
+            recovery = f"{summary}。核对{recovery_check}后，重新运行 autopilot run。"
             key = hashlib.sha256(summary.encode("utf-8")).hexdigest()
             try:
                 with state.lock(wait_seconds=flow.RUN_LOCK_WAIT):
@@ -1093,9 +1097,6 @@ def main(argv=None):
                                                f"{a.repo}:{a.pr}:run-failed:{key}")
             except (OSError, StateCorruptError, StateLockedError) as error:
                 print("autopilot: 暂停记录或通知未写入：%s" % error, file=sys.stderr)
-        return 2
-    except (OSError, StateCorruptError, StateLockedError) as error:
-        print("autopilot: 本机运行失败：%s" % error, file=sys.stderr)
         return 2
     finally:
         tokens.revoke(token)
