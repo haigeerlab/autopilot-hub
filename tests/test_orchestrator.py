@@ -1463,6 +1463,29 @@ class RepairLimitTest(RunRouteFixture):
             self.assertEqual(work.changed_existing_files('m'), ({'sha': work.merge_base, 'source': 'merge-base'},
                              ['scope', 'tasks/m/regression.md', 'tests/test_existing.py', 'tests/test_old.py']))
 
+    def test_main_changes_after_scope_base_are_not_blamed_on_the_pr(self):
+        # Review finding: diffing scope_base..head blamed the PR for test edits that reached main later.
+        root = make_repo(self, {'tests/test_main_only.py': 'old\n', 'tests/test_pr.py': 'old\n'})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.git_env = root, dict(os.environ)
+        scope_base = work.git('rev-parse', 'HEAD').strip()
+        write_files(root, {'tests/test_main_only.py': 'edited on main\n', 'scope': scope_base})
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'someone else edits a test on main')
+        work.base_tip = work.merge_base = work.git('rev-parse', 'HEAD').strip()
+        commit_on_branch(root, {'tests/test_pr.py': 'changed by the PR\n'})
+        work.head = work.git('rev-parse', 'HEAD').strip()
+        git(root, 'checkout', '-q', 'main')
+        with tempfile.TemporaryDirectory() as plugin:
+            write_files(plugin, {'hooks/module_scope.py': (
+                'def scope_base(root, module):\n'
+                '    return (root / "scope").read_text().strip()\n'
+            )})
+            with mock.patch.object(cli, 'find_spec_guard_root', return_value=plugin):
+                baseline, paths = work.changed_existing_files('m')
+        self.assertEqual(baseline, {'sha': scope_base, 'source': 'scope_base'})
+        self.assertEqual(paths, ['tests/test_pr.py'])
+
     def test_scope_base_from_base_checkout_must_be_an_ancestor_of_the_merge_base(self):
         root = make_repo(self, {'tests/test_old.py': 'old\n'})
         work = cli.Work.__new__(cli.Work)

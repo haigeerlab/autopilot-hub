@@ -315,9 +315,12 @@ class Work:
                         baseline = {"sha": candidate, "source": "scope_base"}
             except (OSError, subprocess.TimeoutExpired, UnicodeError, flow.Stop):
                 pass
+        # Only the PR's own changes count (merge base -> head): changes that reached main after the
+        # baseline are not the PR's doing. Of those, keep paths that already existed at the baseline.
         # Disabling rename detection treats a moved test as a deletion of the existing path.
-        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", baseline["sha"], self.head, "--")
-        return baseline, [path for path in paths.split("\0") if path]
+        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", self.merge_base, self.head, "--")
+        existing = set(self.git("ls-tree", "-r", "--name-only", "-z", baseline["sha"]).split("\0"))
+        return baseline, [path for path in paths.split("\0") if path and path in existing]
 
     @staticmethod
     def _parse(r):
