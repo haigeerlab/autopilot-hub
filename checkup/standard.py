@@ -69,7 +69,27 @@ MAX_FILE_BYTES = 1024 * 1024
 
 
 def _read(root, rel):
-    """Read bounded regular files only, including checking directory symlinks."""
+    """Read bounded regular UTF-8 files only, including checking directory symlinks."""
+    data = _read_bytes(root, rel)
+    try:
+        return None if data is None else data.decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+SNIFF_BYTES = 8192
+
+
+def _binary(sample):
+    """A NUL byte in the first block marks binary content; UTF-16 text (with a BOM) is not binary."""
+    head = sample[:SNIFF_BYTES]
+    return b"\0" in head and not head.startswith((b"\xff\xfe", b"\xfe\xff"))
+
+
+def _read_bytes(root, rel, sniff=False):
+    """Bytes of a bounded regular file reached without symlinks, or None.
+
+    With sniff, return only the first SNIFF_BYTES and ignore the size limit (for the binary check)."""
     try:
         path = os.path.abspath(os.path.join(root, rel))
         parent = path
@@ -77,7 +97,7 @@ def _read(root, rel):
             info = os.lstat(parent)
             if stat.S_ISLNK(info.st_mode):
                 return None
-            if parent == path and (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES):
+            if parent == path and (not stat.S_ISREG(info.st_mode) or (info.st_size > MAX_FILE_BYTES and not sniff)):
                 return None
             ancestor = os.path.dirname(parent)
             if parent == os.path.abspath(root) or ancestor == parent:
@@ -87,11 +107,13 @@ def _read(root, rel):
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as fh:
             info = os.fstat(fh.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            if not stat.S_ISREG(info.st_mode) or (info.st_size > MAX_FILE_BYTES and not sniff):
                 return None
+            if sniff:
+                return fh.read(SNIFF_BYTES)
             data = fh.read(MAX_FILE_BYTES + 1)
-        return data.decode("utf-8") if len(data) <= MAX_FILE_BYTES else None
-    except (OSError, ValueError, UnicodeError):
+        return data if len(data) <= MAX_FILE_BYTES else None
+    except (OSError, ValueError):
         return None
 
 
@@ -345,7 +367,14 @@ def c3(root):
         is_settings = rel == "scripts/validate.sh" or (rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml")))
         if not (is_test or is_settings):
             continue
-        text = _read(root, rel)
+        data = _read_bytes(root, rel)
+        sample = data if data is not None else _read_bytes(root, rel, sniff=True)
+        if is_test and sample is not None and _binary(sample):
+            continue  # binary fixture (any size): cannot create a git repository
+        try:
+            text = None if data is None else data.decode("utf-8")
+        except UnicodeError:
+            text = None
         if text is None:
             unreadable.append(rel)
             continue

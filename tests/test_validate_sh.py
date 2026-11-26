@@ -139,6 +139,22 @@ class ValidateRuntimeTest(unittest.TestCase):
             "tests/test_direct.py", "tests/test_indirect.py", "tests/test_transitive.py"})
         self.assertNotIn("退回全量", result.stderr)
 
+    def test_quick_selects_tests_that_import_by_name_from_a_subdirectory(self):
+        tool = self.root / "tool"
+        tool.mkdir()
+        (tool / "engine.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (tool / "cli.py").write_text("import engine\n", encoding="utf-8")
+        self.write_test("tests/test_package.py", "import tool.cli")
+        self.write_test("tests/test_by_name.py",
+                        "import os, sys\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tool'))\n"
+                        "import engine")
+        self.write_test("tests/test_unrelated.py")
+        self.env["VALIDATE_CHANGED"] = "tool/engine.py"
+        result = self.run_script("--quick", "--list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(result.stdout.splitlines()), {"tests/test_package.py", "tests/test_by_name.py"})
+        self.assertNotIn("退回全量", result.stderr)
+
     def test_full_discovery_includes_test_prefix_and_package_tests(self):
         self.write_test("tests/testlegacy.py")
         self.write_test("tests/test_shared.py")

@@ -4,6 +4,7 @@ Two inputs: the PR file list from the GitHub API (`[{filename, status, patch}]`,
 local unified diff (`git diff`), so the same check runs in CI and before a local commit or push.
 Stdlib only; supports Python 3.9.
 """
+import ast
 import json
 import re
 
@@ -27,25 +28,78 @@ def added_lines(f):
             line += 1
 
 
+def _unquote(name):
+    """Git C-quotes paths with special or non-ASCII characters; undo that when possible."""
+    if len(name) >= 2 and name[0] == name[-1] == '"':
+        try:
+            value = ast.literal_eval(name)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            value = None
+        if isinstance(value, str):
+            try:
+                return value.encode("latin-1").decode("utf-8")  # octal escapes are UTF-8 bytes
+            except UnicodeError:
+                return value  # core.quotePath=false keeps non-ASCII characters as they are
+        return name[1:-1]
+    return name
+
+
+def _binary_name(raw):
+    """The new-side path of `Binary files A and B differ` (the old side when the file was deleted)."""
+    rest = raw[len("Binary files "):-len(" differ")]
+    if rest.endswith(" and /dev/null"):
+        name, prefix = rest[:-len(" and /dev/null")], "a/"
+    else:
+        cut = max(rest.rfind(" and b/"), rest.rfind(' and "b/'))
+        if cut < 0:
+            return None
+        name, prefix = rest[cut + len(" and "):], "b/"
+    name = _unquote(name)
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
 def files_from_diff(text):
     """A local unified diff -> the same shape as the API file list (status added/modified/removed)."""
     files, cur, body = [], None, []
 
     def flush():
         if cur is not None:
-            cur["patch"] = "\n".join(body)
+            header_name, header_raw = cur.pop("header_name", None), cur.pop("header_raw")
+            rename_to, binary_name = cur.pop("rename_to", None), cur.pop("binary_name", None)
+            if cur.pop("binary", False):
+                # Never drop a binary change: fall back to the raw header so it is still listed as unchecked.
+                cur["filename"] = cur["filename"] or rename_to or header_name or binary_name or header_raw
+                cur["patch"] = None  # like the API: binary content cannot be checked
+            else:
+                cur["patch"] = "\n".join(body)
             files.append(cur)
 
     for raw in text.splitlines():
         if raw.startswith("diff --git "):
             flush()
-            cur, body = {"filename": None, "status": "modified", "patch": ""}, []
+            cur, body = {"filename": None, "status": "modified", "patch": "", "header_raw": raw[len("diff --git "):]}, []
+            # Binary diffs have no ---/+++ lines; take the name from the header when it is unambiguous.
+            rest = raw[len("diff --git "):]
+            half = (len(rest) - len("a/ b/")) // 2
+            quoted = (len(rest) - len('"a/" "b/"')) // 2
+            if half > 0 and rest == "a/" + rest[2:2 + half] + " b/" + rest[2:2 + half]:
+                cur["header_name"] = rest[2:2 + half]
+            elif quoted > 0 and rest == '"a/' + rest[3:3 + quoted] + '" "b/' + rest[3:3 + quoted] + '"':
+                cur["header_name"] = _unquote('"' + rest[3:3 + quoted] + '"')
         elif cur is not None and raw.startswith("new file mode"):
             cur["status"] = "added"
+        elif cur is not None and raw.startswith("deleted file mode"):
+            cur["status"] = "removed"
+        elif cur is not None and not body and raw.startswith("rename to "):
+            cur["rename_to"] = _unquote(raw[len("rename to "):])
+        elif cur is not None and not body and raw == "GIT binary patch":
+            cur["binary"] = True
+        elif cur is not None and not body and raw.startswith("Binary files ") and raw.endswith(" differ"):
+            cur["binary"], cur["binary_name"] = True, _binary_name(raw)
         elif cur is not None and raw.startswith("--- ") and not body:
             continue
         elif cur is not None and raw.startswith("+++ ") and not body:
-            name = raw[4:].strip()
+            name = _unquote(raw[4:].strip())
             if name == "/dev/null":
                 cur["status"] = "removed"
             else:
