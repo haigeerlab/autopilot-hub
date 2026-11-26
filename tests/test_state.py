@@ -1,5 +1,6 @@
 """Tests for the local state shared by run and watch (R13)."""
 
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -59,6 +60,27 @@ class WatchStateTest(unittest.TestCase):
         with other.lock():
             other.set_frozen(False)
         self.assertFalse(self.state.is_frozen())
+
+    def test_waiting_lock_times_out_with_the_original_holder_still_active(self):
+        other = self.open_state()
+        with self.state.lock():
+            with mock.patch('orchestrator.state.time.monotonic', side_effect=[0, 0, 0.5]), \
+                    mock.patch('orchestrator.state.time.sleep') as wait:
+                with self.assertRaises(StateLockedError):
+                    with other.lock(wait_seconds=0.5):
+                        self.fail('The second holder acquired the lock')
+                wait.assert_called_once_with(0.5)
+
+    def test_waiting_lock_recovers_if_the_holder_releases_before_the_deadline(self):
+        other = self.open_state()
+        with ExitStack() as holder:
+            holder.enter_context(self.state.lock())
+            with mock.patch('orchestrator.state.time.monotonic', side_effect=[0, 0, 0.5]), \
+                    mock.patch('orchestrator.state.time.sleep', side_effect=lambda _: holder.close()) as wait:
+                with other.lock(wait_seconds=1):
+                    other.set_frozen(True)
+                wait.assert_called_once_with(0.5)
+        self.assertTrue(self.state.is_frozen())
 
     def test_atomic_replace_writes_a_complete_file_in_the_same_directory(self):
         self.state.set_frozen(True)

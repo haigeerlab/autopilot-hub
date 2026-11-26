@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 from threading import get_ident
+import time
 
 
 class StateLockedError(RuntimeError):
@@ -35,16 +36,22 @@ class WatchState:
         self._lock_owner = None
 
     @contextmanager
-    def lock(self):
-        """Hold the shared lock across updates or raise StateLockedError immediately."""
+    def lock(self, wait_seconds=0):
+        """Hold the shared lock across updates, optionally retrying for up to wait_seconds."""
         self.lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        deadline = time.monotonic() + wait_seconds if wait_seconds > 0 else None
         with self.lock_path.open("a") as lock_file:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise StateLockedError(f"Watch lock is held: {self.lock_path}") from exc
-                raise
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    remaining = deadline - time.monotonic() if deadline is not None else 0
+                    if remaining <= 0:
+                        raise StateLockedError(f"Watch lock is held: {self.lock_path}") from exc
+                    time.sleep(min(0.5, remaining))
             self._lock_owner = (os.getpid(), get_ident())
             try:
                 yield self

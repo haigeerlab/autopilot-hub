@@ -8,7 +8,7 @@
 - [x] Task 2：`orchestrator/state.py`
   - 验证：R13（`tests.test_state`）
   - 文件：`orchestrator/state.py`、`tests/test_state.py`
-- [ ] Task 3：run 的路线与 `autopilot/verified`
+- [x] Task 3：run 的路线与 `autopilot/verified`
   - 验证：R2、R3、R4、R11（RunFailureRecordTest）、R12（DirectModeTest）
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
 - [ ] Task 4：automerge 路线与回退

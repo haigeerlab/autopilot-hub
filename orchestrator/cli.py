@@ -1,13 +1,14 @@
 """`autopilot run`: drive one PR with the local orchestrator (slice 10). See orchestrator/flow.py.
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
+        [--notify SESSION] [--author-host claude-code|codex]
     python3 -B orchestrator/cli.py followups --repo haigeerlab/autopilot-sandbox --pr 1 [--json]
     python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --resume 9 [--confirm "..."]
 
-Exit codes: 0 merged (or dry run passed); 1 stopped (the reason is on the PR and printed); 2 bad
-invocation or environment (no token, no delegate). Release also uses 0 for completed and 1 for waiting.
+Run exit codes: 0 merged, auto-merge enabled, handed to the user, or successful dry run;
+1 stopped or paused; 2 bad invocation or environment. Release uses 0 for completed and 1 for waiting.
 """
 import argparse
 import base64
@@ -30,6 +31,7 @@ from checkup import workflow
 from checkup import yamlsub
 from degrade.run import ApiError, NotFound, parse_pages
 from orchestrator import batch, flow, token as tokens
+from orchestrator.state import StateCorruptError, StateLockedError, WatchState
 from pipeline import engine, model as pipeline_model
 from risk.tiers import REPO_CONFIGS
 
@@ -42,6 +44,7 @@ CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
+RUN_WRITE = dict(WRITE, statuses="write")
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
 
@@ -314,6 +317,28 @@ class LocalIO:
             return self.api(path)
         except NotFound:
             return None
+
+    def legacy_status_checks(self, repo, branch, *, need_source, need_sync):
+        path = f"repos/{repo}/branches/{branch}"
+        # The ordinary branch response can tell us whether a classic check is relevant.
+        protection = (self.api_optional(path) or {}).get("protection") or {}
+        checks = protection.get("required_status_checks") or {}
+        contexts = set(checks.get("contexts") or []) | {c.get("context") for c in checks.get("checks") or []}
+        if protection.get("enabled") is False:
+            return None
+        if not ((need_source and flow.VERIFIED in contexts) or (need_sync and contexts)):
+            return checks
+        # GitHub requires Administration: read for the classic details, including the pinned App ID.
+        try:
+            token = tokens.mint(repo, {"administration": "read"})
+        except tokens.TokenError:
+            # Without Administration: read the App ID cannot be confirmed: fail closed to the manual route
+            # (the projection has no app_id, so the source check is unmet) instead of failing the whole run.
+            return checks
+        try:
+            return LocalIO(token, None).api_optional(path + "/protection/required_status_checks")
+        finally:
+            tokens.revoke(token)
 
     @staticmethod
     def bot_identity():
@@ -697,13 +722,19 @@ class LocalIO:
         return sorted(found)
 
     @staticmethod
-    def checkout_of(repo):
-        """The user's own checkout of `repo`, from ~/.autopilot/config.json {"checkouts": {"owner/name": path}}."""
+    def local_config():
         try:
             with open(os.path.join(STATE, "config.json"), encoding="utf-8") as fh:
-                path = (json.load(fh).get("checkouts") or {}).get(repo)
-        except (OSError, ValueError, AttributeError):
-            return None
+                config = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return config if isinstance(config, dict) else {}
+
+    @staticmethod
+    def checkout_of(repo):
+        """The user's own checkout of `repo`, from ~/.autopilot/config.json {"checkouts": {"owner/name": path}}."""
+        checkouts = LocalIO.local_config().get("checkouts")
+        path = checkouts.get(repo) if isinstance(checkouts, dict) else None
         return os.path.expanduser(path) if isinstance(path, str) and path else None
 
     def acceptance(self, repo, module):
@@ -883,6 +914,8 @@ def main(argv=None):
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
+    r.add_argument("--notify", metavar="SESSION", help="queue handoff notices for this session")
+    r.add_argument("--author-host", choices=("claude-code", "codex"), help="record the author's host in evidence")
     follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
     follow.add_argument('--repo', required=True, help='owner/name')
     follow.add_argument('--pr', required=True, type=int)
@@ -931,16 +964,31 @@ def main(argv=None):
                       a.repo, out["auto_merged"], out["reverted_or_reworked"], out["reverted"], out["reworked"],
                       out["codex_unavailable_stops"], out["codex_unavailable_minutes"]))
         return 0
-    delegate = None
     try:
-        token = tokens.mint(a.repo, READ if a.dry_run else WRITE)
+        token = tokens.mint(a.repo, READ if a.dry_run else RUN_WRITE)
     except tokens.TokenError as e:
         print("autopilot: 换不出机器人令牌：%s" % e, file=sys.stderr)
         return 2
+    state = WatchState(STATE)
     try:
-        result = flow.run(LocalIO(token, delegate), a.repo, a.pr, dry_run=a.dry_run)
+        result = flow.run(LocalIO(token, None), a.repo, a.pr, dry_run=a.dry_run,
+                          state=state, notify=a.notify, author_host=a.author_host)
     except ApiError as e:
-        print("autopilot: GitHub 接口失败：%s" % e, file=sys.stderr)
+        summary = " ".join(str(e).replace(token, "[redacted]").split())[:350]
+        print("autopilot: GitHub 接口失败：%s" % summary, file=sys.stderr)
+        if not a.dry_run:
+            recovery = f"{summary}。核对 GitHub 接口和 App 权限后，重新运行 autopilot run。"
+            key = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+            try:
+                with state.lock(wait_seconds=flow.RUN_LOCK_WAIT):
+                    state.pause_pr(a.repo, a.pr, "run-failed", recovery)
+                    state.enqueue_notification("user", f"{a.repo}#{a.pr} 已暂停。{recovery}",
+                                               f"{a.repo}:{a.pr}:run-failed:{key}")
+            except (OSError, StateCorruptError, StateLockedError) as error:
+                print("autopilot: 暂停记录或通知未写入：%s" % error, file=sys.stderr)
+        return 2
+    except (OSError, StateCorruptError, StateLockedError) as error:
+        print("autopilot: 本机运行失败：%s" % error, file=sys.stderr)
         return 2
     finally:
         tokens.revoke(token)
@@ -948,9 +996,13 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:
         print("autopilot run %s#%d：%s（%s）%s" % (a.repo, a.pr, result["result"], result["step"], result["reason"]))
+        if result.get("route"):
+            print("  route=" + result["route"])
+            for reason in result["routeReasons"]:
+                print("  " + reason)
         for n in result["notes"]:
             print("  说明：" + n)
-    return 0 if result["result"] in ("merged", "dry-run") else 1
+    return 0 if result["result"] in ("merged", "automerge-on", "handed-to-user", "dry-run") else 1
 
 
 if __name__ == "__main__":
