@@ -376,6 +376,71 @@ def evidence_v2_body(head, base, module, command, check, verification, artifacts
 
 
 VERIFY_BLOCK = re.compile(r'<!--\s*autopilot-verify:v1\s+(.*?)\s*-->', re.S)
+FOLLOWUP_BLOCK = re.compile(r'<!--\s*autopilot-followup:v1\s+(.*?)\s*-->', re.S)
+
+
+def bot_issue(issue, bot):
+    """Identify an App-authored issue independently of its moving updated_at."""
+    user = issue.get('user') or {}
+    return bool(bot and user.get('type') == 'Bot' and user.get('id') == bot['id']
+                and (issue.get('performed_via_github_app') or {}).get('slug') == bot['app_slug'])
+
+
+def open_followups(io, repo, pr_number, module, patch_id, notes, bot):
+    """Record each note once per PR and patch, grouping issues by module and title."""
+    result = dict(opened=[], commented=[], skipped=0, failed=[])
+
+    def payloads(body):
+        found = []
+        for raw in FOLLOWUP_BLOCK.findall(body or ''):
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                found.append(value)
+        return found
+
+    for note in notes:
+        try:
+            payload = dict(module=defang(module), title=defang(note['title']), pr=pr_number, patch_id=patch_id)
+            issues = [i for i in io.api(f'repos/{repo}/issues?labels=autopilot:followup&state=open&per_page=100') or []
+                      if 'pull_request' not in i and bot_issue(i, bot)]
+            target, recorded = None, False
+            for issue in issues:
+                body_blocks = payloads(issue.get('body'))
+                blocks = list(body_blocks)
+                for comment in io.api(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100") or []:
+                    if d.trusted(rest_comment(comment), bot):
+                        blocks.extend(payloads(comment.get('body')))
+                if any(all(p.get(k) == payload[k] for k in payload) for p in blocks):
+                    recorded = True
+                    break
+                if target is None and any(p.get('module') == payload['module'] and p.get('title') == payload['title']
+                                          for p in body_blocks):
+                    target = issue['number']
+            if recorded:
+                result['skipped'] += 1
+                continue
+            lines = [f"说明：{defang(note.get('detail') or note['title'])}",
+                     f"位置：{defang(note.get('location') or '未提供')}"]
+            if note.get('evidence'):
+                lines.append(f"证据：{defang(note['evidence'])}")
+            lines.extend([f'来源 PR：https://github.com/{repo}/pull/{pr_number}',
+                          f'补丁指纹：`{patch_id[:12]}`', '', block('autopilot-followup', payload)])
+            body = '\n\n'.join(lines)
+            if target is not None:
+                io.api(f'repos/{repo}/issues/{target}/comments', 'POST', {'body': body})
+                result['commented'].append(target)
+            else:
+                issue = io.api(f'repos/{repo}/issues', 'POST', {
+                    'title': f"[跟进] {defang(module)}：{payload['title']}"[:120],
+                    'labels': ['autopilot:followup'], 'body': body})
+                result['opened'].append(issue['number'])
+        except Exception:
+            # A failed note must not prevent recording the remaining notes.
+            result['failed'].append(note['title'])
+    return result
 
 
 def verification_listing(module, groups, payload):
@@ -398,9 +463,7 @@ def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
         # REST updated_at of an issue moves on every comment, so the issue body is identified by its bot
         # author and app only; listing comments must also be unedited.
         if issue_body:
-            user = source.get('user') or {}
-            if not (bot and user.get('type') == 'Bot' and user.get('id') == bot['id']
-                    and (source.get('performed_via_github_app') or {}).get('slug') == bot['app_slug']):
+            if not bot_issue(source, bot):
                 return []
         elif not d.trusted(rest_comment(source), bot):
             return []
@@ -734,6 +797,31 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
             raise Stop("readback", "已请求合并，但读回 PR 没有显示已合并")
         io.api(f"repos/{repo}/issues/{number}/labels", "POST", {"labels": [AUTHORED, AUTO_MERGED]})
         say(f"{RUN_MARKER}\nautopilot 已合并：提交 `{head[:12]}` → `{after['merge_commit_sha'][:12]}`。")
+        if verification and verification.get('notes'):
+            recovery = f'python3 -B orchestrator/cli.py followups --repo {repo} --pr {number}'
+            try:
+                path = io.verification_paths(repo, verification['patch_id'])[0]
+                raw = io.read_bytes(path)
+                if hashlib.sha256(raw).hexdigest() != verification['report_sha256']:
+                    raise ValueError('报告 sha256 与合并前证据不符')
+                followups = open_followups(io, repo, number, module, verification['patch_id'],
+                                           json.loads(raw)['notes'], bot)
+                for key, label in (('opened', '已开后续 issue '), ('commented', '追加到 ')):
+                    if followups[key]:
+                        notes.append(label + '、'.join(f'#{n}' for n in followups[key]))
+                if followups['skipped']:
+                    notes.append(f"已跳过 {followups['skipped']} 条已记录意见")
+                failed = followups['failed']
+            except Exception:
+                failed = verification['notes']
+            if failed:
+                message = ('已合并，后续意见未开成 issue：' + '、'.join(defang(t) for t in failed)
+                           + f'。补开命令：`{recovery}`')
+                notes.append(message)
+                try:
+                    say(f'{RUN_MARKER}\n{message}')
+                except Exception:
+                    notes.append('PR 补开提醒发送失败，请按上述命令补开')
         return {"result": "merged", "step": "merge", "reason": after["merge_commit_sha"], "notes": notes,
                 "head_sha": head}
     except Stop as s:
