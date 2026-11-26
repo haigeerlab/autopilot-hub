@@ -92,7 +92,7 @@
 - 写进报告：结果写成执行记录 `{"executor":"delegate:<后端>","result","evidence","exit"}`，`case_result`（`verify/core.py:51`）按执行记录判定，报告里列出执行者和证据。
 - 非作者一方：`run --author-host claude-code|codex` 由会话传入，选另一家；没传或另一家不可用 → 该用例转人工组。
 - 不可用（找不到 delegate、版本低于 0.13、后端不可用、输出解析不到）→ 转人工组，跟踪 issue 注明「AI 执行不可用：<原因>」。七个仓库都是个人账号所有，人工组可以开跟踪 issue（`flow.py:580` 只拦组织仓库）。
-- **会动本机全局状态的用例**（例如装插件再试用）：一次性克隆隔离不了 `~/.claude`、`~/.codex`。第一版这类用例标 `manual`；这偏离了总体方案 4.3b「在一次性环境里执行」，已回报 ecosystem-lead 待定（见文末「待定」）。
+- **会动本机全局状态的用例**（例如装插件再试用）：一次性克隆隔离不了 `~/.claude`、`~/.codex`。第一版这类用例标 `manual`，交用户测。这偏离了总体方案 4.3b「在一次性环境里执行」，用户已同意（2026-11-27 在 ecosystem-lead 会话原话「三件都按推荐」，经 #23378 转来）。
 
 ### 5. watch（U4～U7、4.4、4.6）
 
@@ -216,9 +216,11 @@
 - **主干变红由 watch 分类，旧 workflow 按开关退出**：分类要重跑和读 job 详情，放在本机更好控制；用开关而不是去重，避免两边同时处理。
 - **不做 hub 的推送受控入口**：Q6 已定交 A10。
 
-## 待定（回报 ecosystem-lead）
+## 已定的偏离与外部前提
 
-- 会动本机全局状态的 `ai-operate` 用例（例如装插件再试用）第一版标 `manual`，偏离总体方案 4.3b。要真正隔离需要换 HOME 或另开用户，会让 delegate 的后端拿不到登录态。请定：接受第一版的偏离，还是要求本模块做隔离。
+- 动本机全局状态的 `ai-operate` 用例第一版标 `manual`，偏离总体方案 4.3b，用户已同意（见第 4 节）。
+- B 批清单已由 ecosystem-lead 记入模块 1（总账 8c32ddb）：主干「要求分支与主干同步」、`skip_main_red`、`watchMainRed`、App 的 Checks 只读、Actions 读写。
+- Q6：Codex 本机规则已补放行 `git switch -c`、`git add`、`git commit`、`git push -u origin`、`gh pr create`（A10）；用户自己的 Codex 会话复测由用户安排，不在本模块。
 
 ## 审查记录
 
