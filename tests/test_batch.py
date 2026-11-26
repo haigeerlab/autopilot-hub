@@ -249,6 +249,30 @@ class BatchTest(unittest.TestCase):
                 self.assertFalse(any(m == "POST" and p.endswith("/pulls") for m, p, *_ in io.calls))
                 run.assert_not_called()
 
+    def test_manual_merge_github_cannot_compare_counts_as_unpushed(self):
+        from degrade.run import NotFound
+        io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
+        io.local_ancestors.add(("9" * 40, HEAD))
+        original = io.api
+        def api(path, method="GET", body=None):
+            if "/compare/" + "9" * 40 in path:
+                raise NotFound("HTTP 404")
+            return original(path, method, body)
+        io.api = api
+        result, run = self.run_batch(io)
+        self.assertEqual((result["code"], result["step"]), (2, "batch"), result)
+        self.assertEqual(io.pushes, [])
+
+    def test_open_batch_pr_carrying_manual_merge_stops_with_comment(self):
+        io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
+        io.local_ancestors.add(("9" * 40, HEAD))
+        io.prs.append(pull(entry()))
+        result, run = self.run_batch(io)
+        self.assertEqual((result["code"], result["pr"]), (1, 7), result)
+        self.assertIn("已推上去的 autopilot/batch-m 带上了它", result["reason"])
+        self.assertTrue(any("C123（模块 human）" in c for c in io.comments))
+        run.assert_not_called()
+
     def test_manual_ancestor_already_on_remote_base_is_pushed(self):
         io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
         io.local_ancestors.add(("9" * 40, HEAD))
@@ -258,8 +282,8 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(io.pushes, [(REPO, HEAD, "autopilot/batch-m")])
 
     def test_unpushed_manual_merge_off_the_pushed_history_does_not_block(self):
-        # Not an ancestor of the automatic merge commit (e.g. not on its first-parent chain): pushing
-        # the automatic merge cannot carry it, so it does not block.
+        # Not an ancestor of the automatic merge commit at all (through any parent): pushing the
+        # automatic merge cannot carry it, so it does not block.
         io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
         result, run = self.run_batch(io)
         self.assertEqual(result["code"], 0, result)

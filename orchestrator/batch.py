@@ -227,11 +227,13 @@ def run(io, repo, *, dry_run=False):
         item, pr = choose(io, repo, data)
         if item is None:
             return {"code": 0, "result": "idle", "reason": "没有待处理的合并", "pr": None, "notes": []}
+        number = pr["number"] if pr else None
         blocker = carried_manual(io, repo, data, item)
         if blocker is not None:
+            carried = (f"已推上去的 {branch_of(item)} 带上了它，这个 PR 不能自动合并" if pr
+                       else f"推 {branch_of(item)} 会把它一起带上")
             raise flow.Stop("batch", f"前面有人批合并 C{blocker['approval']}（模块 {blocker['module']}）还没推送，"
-                                     f"推 {branch_of(item)} 会把它一起带上；先由你推送或合并它")
-        number = pr["number"] if pr else None
+                                     f"{carried}；先由你推送或合并它")
         if pr is not None:
             source = batch_payload(pr, bot)
             if (not source or any(source.get(k) != item[k] for k in ("module", "mergeCommit", "approval"))
