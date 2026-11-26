@@ -831,7 +831,7 @@ def followups(args):
     except flow.Stop as error:
         print('autopilot: ' + error.reason, file=sys.stderr)
         return 1
-    except (ApiError, OSError, ValueError) as error:
+    except (ApiError, OSError, ValueError, KeyError, TypeError) as error:
         print('autopilot: 补开后续 issue 的环境或调用失败：%s' % error, file=sys.stderr)
         return 2
     finally:

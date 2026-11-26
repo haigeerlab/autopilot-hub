@@ -386,9 +386,20 @@ def bot_issue(issue, bot):
                 and (issue.get('performed_via_github_app') or {}).get('slug') == bot['app_slug'])
 
 
+def note_key(note):
+    """Short fingerprint telling apart notes that share a title (title, detail and location)."""
+    raw = json.dumps([note.get('title'), note.get('detail'), note.get('location')], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]
+
+
 def open_followups(io, repo, pr_number, module, patch_id, notes, bot):
-    """Record each note once per PR and patch, grouping issues by module and title."""
+    """Record each note once per PR, patch and note; group open issues by module and title.
+
+    Recorded notes are looked up in open AND closed bot issues, so a re-run never opens a duplicate; new notes are
+    appended only to an open issue of the same module and title, otherwise a new issue is opened."""
     result = dict(opened=[], commented=[], skipped=0, failed=[])
+    if not notes:
+        return result
 
     def payloads(body):
         found = []
@@ -401,27 +412,31 @@ def open_followups(io, repo, pr_number, module, patch_id, notes, bot):
                 found.append(value)
         return found
 
+    try:
+        issues = [i for i in io.api(f'repos/{repo}/issues?labels=autopilot:followup&state=all&per_page=100') or []
+                  if 'pull_request' not in i and bot_issue(i, bot)]
+        seen = []  # (issue, is_open, body blocks, all trusted blocks)
+        for issue in issues:
+            body_blocks = payloads(issue.get('body'))
+            blocks = list(body_blocks)
+            for comment in io.api(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100") or []:
+                if d.trusted(rest_comment(comment), bot):
+                    blocks.extend(payloads(comment.get('body')))
+            seen.append((issue['number'], issue.get('state') != 'closed', body_blocks, blocks))
+    except Exception:
+        # Without the existing issues nothing can be de-duplicated safely: record every note as failed.
+        result['failed'] = [n.get('title') for n in notes]
+        return result
+
     for note in notes:
         try:
-            payload = dict(module=defang(module), title=defang(note['title']), pr=pr_number, patch_id=patch_id)
-            issues = [i for i in io.api(f'repos/{repo}/issues?labels=autopilot:followup&state=open&per_page=100') or []
-                      if 'pull_request' not in i and bot_issue(i, bot)]
-            target, recorded = None, False
-            for issue in issues:
-                body_blocks = payloads(issue.get('body'))
-                blocks = list(body_blocks)
-                for comment in io.api(f"repos/{repo}/issues/{issue['number']}/comments?per_page=100") or []:
-                    if d.trusted(rest_comment(comment), bot):
-                        blocks.extend(payloads(comment.get('body')))
-                if any(all(p.get(k) == payload[k] for k in payload) for p in blocks):
-                    recorded = True
-                    break
-                if target is None and any(p.get('module') == payload['module'] and p.get('title') == payload['title']
-                                          for p in body_blocks):
-                    target = issue['number']
-            if recorded:
+            payload = dict(module=defang(module), title=defang(note['title']), pr=pr_number, patch_id=patch_id,
+                           note=note_key(note))
+            if any(all(p.get(k) == payload[k] for k in payload) for _, _, _, blocks in seen for p in blocks):
                 result['skipped'] += 1
                 continue
+            target = next((number for number, is_open, body_blocks, _ in seen if is_open and any(
+                p.get('module') == payload['module'] and p.get('title') == payload['title'] for p in body_blocks)), None)
             lines = [f"说明：{defang(note.get('detail') or note['title'])}",
                      f"位置：{defang(note.get('location') or '未提供')}"]
             if note.get('evidence'):
@@ -432,14 +447,17 @@ def open_followups(io, repo, pr_number, module, patch_id, notes, bot):
             if target is not None:
                 io.api(f'repos/{repo}/issues/{target}/comments', 'POST', {'body': body})
                 result['commented'].append(target)
+                entry = next(e for e in seen if e[0] == target)
+                entry[3].append(payload)
             else:
                 issue = io.api(f'repos/{repo}/issues', 'POST', {
                     'title': f"[跟进] {defang(module)}：{payload['title']}"[:120],
                     'labels': ['autopilot:followup'], 'body': body})
                 result['opened'].append(issue['number'])
+                seen.append((issue['number'], True, [payload], [payload]))
         except Exception:
             # A failed note must not prevent recording the remaining notes.
-            result['failed'].append(note['title'])
+            result['failed'].append(note.get('title'))
     return result
 
 
@@ -795,8 +813,13 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
         after = io.api(f"repos/{repo}/pulls/{number}")
         if not after.get("merged") or not after.get("merge_commit_sha"):
             raise Stop("readback", "已请求合并，但读回 PR 没有显示已合并")
-        io.api(f"repos/{repo}/issues/{number}/labels", "POST", {"labels": [AUTHORED, AUTO_MERGED]})
-        say(f"{RUN_MARKER}\nautopilot 已合并：提交 `{head[:12]}` → `{after['merge_commit_sha'][:12]}`。")
+        # The merge is done: a failure from here on must not hide the post-merge follow-ups.
+        for step in (lambda: io.api(f"repos/{repo}/issues/{number}/labels", "POST", {"labels": [AUTHORED, AUTO_MERGED]}),
+                     lambda: say(f"{RUN_MARKER}\nautopilot 已合并：提交 `{head[:12]}` → `{after['merge_commit_sha'][:12]}`。")):
+            try:
+                step()
+            except Exception as error:
+                notes.append(f"已合并，但合并后的标签或评论没写成：{str(error)[:200]}")
         if verification and verification.get('notes'):
             recovery = f'python3 -B orchestrator/cli.py followups --repo {repo} --pr {number}'
             try:

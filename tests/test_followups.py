@@ -63,7 +63,7 @@ class FollowupsTest(unittest.TestCase):
         for text in ('说明文字', 'R3', '截图证据', f'https://github.com/{REPO}/pull/7', PATCH[:12]):
             self.assertIn(text, issue['body'])
         payload = json.loads(issue['body'].split('autopilot-followup:v1 ')[1].split(' -->')[0])
-        self.assertEqual(payload, dict(module='m', title=NOTE['title'], pr=7, patch_id=PATCH))
+        self.assertEqual(payload, dict(module='m', title=NOTE['title'], pr=7, patch_id=PATCH, note=flow.note_key(NOTE)))
         self.assertEqual(self.open(notes), dict(opened=[], commented=[], skipped=2, failed=[]))
 
     def test_same_title_adds_comment_and_comment_is_idempotent(self):
@@ -121,7 +121,44 @@ class FollowupsTest(unittest.TestCase):
         self.assertEqual(self.io.calls, [])
 
 
+    def test_same_title_different_notes_are_both_recorded(self):
+        notes = [dict(NOTE, detail='第一处', location='R2'), dict(NOTE, detail='第二处', location='R3')]
+        self.assertEqual(self.open(notes), dict(opened=[12], commented=[12], skipped=0, failed=[]))
+        self.assertIn('第二处', self.io.followup_comments[12][0]['body'])
+        self.assertEqual(self.open(notes)['skipped'], 2)
+
+    def test_closed_issues_still_count_as_recorded_but_get_no_comments(self):
+        self.open()
+        self.io.followup_issues[0]['state'] = 'closed'
+        self.assertEqual(self.open()['skipped'], 1)
+        result = self.open(pr=8, patch='d' * 40)
+        self.assertEqual((result['opened'], result['commented']), ([13], []))
+
+    def test_listing_failure_fails_every_note_without_writing(self):
+        original = self.io.api
+        def failing(path, method='GET', body=None):
+            if path.startswith(f'repos/{REPO}/issues?labels=autopilot:followup'):
+                raise cli.ApiError('列表失败')
+            return original(path, method, body)
+        self.io.api = failing
+        self.assertEqual(self.open([NOTE, dict(NOTE, title='另一意见')])['failed'], ['按钮间距', '另一意见'])
+        self.assertEqual(self.io.followup_issues, [])
+
+
 class MergeFollowupsTest(unittest.TestCase):
+    def test_label_failure_after_merge_still_opens_followups(self):
+        io = self.with_notes()
+        original = io.api
+        def failing(path, method='GET', body=None):
+            if method == 'POST' and path.endswith('/7/labels'):
+                raise cli.ApiError('标签失败')
+            return original(path, method, body)
+        io.api = failing
+        result = fixtures.run(io)
+        self.assertEqual(result['result'], 'merged', result)
+        self.assertEqual(len(io.followup_issues), 1)
+        self.assertIn('标签或评论没写成', ' '.join(result['notes']))
+
     def with_notes(self):
         from test_verify import case
         helper = fixtures.VerificationTest()
