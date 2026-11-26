@@ -95,6 +95,33 @@ def choose(io, repo, data):
     return None, None
 
 
+def carried_manual(io, repo, data, item):
+    """A human-approved merge that pushing `item` would carry along, or None.
+
+    module-crew stacks merges on the integration branch, so pushing an automatic merge commit also pushes
+    every ancestor the remote lacks. Judged by ancestry, not list order: an `auto=false` merge blocks when it
+    is an ancestor of the merge commit in the user's checkout (the commit is not on GitHub yet) and the
+    remote base does not contain it (GitHub cannot compare an unpushed commit: that also counts as missing)."""
+    base_sha = None
+    for other in data["merges"]:
+        if other["auto"] or other["mergeCommit"] == item["mergeCommit"]:
+            continue
+        if not io.is_ancestor(repo, other["mergeCommit"], item["mergeCommit"]):
+            continue
+        if base_sha is None:
+            base = io.api(f"repos/{repo}/commits/{quote(data['baseBranch'], safe='')}")
+            base_sha = base.get("sha")
+            if not isinstance(base_sha, str) or not SHA.fullmatch(base_sha):
+                raise ValueError("GitHub 基础分支提交读不到")
+        try:
+            status = io.api(f"repos/{repo}/compare/{other['mergeCommit']}...{base_sha}").get("status")
+        except NotFound:
+            status = None
+        if status not in ("ahead", "identical"):
+            return other
+    return None
+
+
 def pr_body(item):
     fingerprint = (item.get("release") or {}).get("fingerprint") or "无（将由 autopilot 补最终验收审查）"
     return (f"来源：module-crew 合并第一段，本机已合进集成分支。\n\n"
@@ -201,6 +228,12 @@ def run(io, repo, *, dry_run=False):
         if item is None:
             return {"code": 0, "result": "idle", "reason": "没有待处理的合并", "pr": None, "notes": []}
         number = pr["number"] if pr else None
+        blocker = carried_manual(io, repo, data, item)
+        if blocker is not None:
+            carried = (f"已推上去的 {branch_of(item)} 带上了它，这个 PR 不能自动合并" if pr
+                       else f"推 {branch_of(item)} 会把它一起带上")
+            raise flow.Stop("batch", f"前面有人批合并 C{blocker['approval']}（模块 {blocker['module']}）还没推送，"
+                                     f"{carried}；先由你推送或合并它")
         if pr is not None:
             source = batch_payload(pr, bot)
             if (not source or any(source.get(k) != item[k] for k in ("module", "mergeCommit", "approval"))

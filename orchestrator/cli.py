@@ -349,6 +349,14 @@ class LocalIO:
         # A non-null edit is disqualifying even when GitHub timestamps share one second.
         return dict(pr, updated_at=pr.get("created_at") if edited is None else None)
 
+    def is_ancestor(self, repo, ancestor, descendant):
+        """Whether `ancestor` is reachable from `descendant` in the user's checkout (module-crew merges there)."""
+        result = self._batch_process(["git", "-C", self.checkout_of(repo), "merge-base", "--is-ancestor",
+                                      ancestor, descendant])
+        if result.returncode not in (0, 1):
+            raise ValueError("本机检出里核对不了提交的祖先关系：" + (result.stdout + result.stderr).strip()[:300])
+        return result.returncode == 0
+
     def push_batch(self, repo, head, branch):
         result = self._batch_process(["git", "-C", self.checkout_of(repo), "push", "--force",
                                       "https://github.com/" + repo, head + ":refs/heads/" + branch],
