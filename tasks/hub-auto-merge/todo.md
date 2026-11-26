@@ -11,7 +11,7 @@
 - [x] Task 3：run 的路线与 `autopilot/verified`
   - 验证：R2、R3、R4、R11（RunFailureRecordTest）、R12（DirectModeTest）
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
-- [ ] Task 4：automerge 路线与回退
+- [x] Task 4：automerge 路线与回退
   - 验证：R1、R6
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
 - [ ] Task 5：修复上限与「不许改裁判」

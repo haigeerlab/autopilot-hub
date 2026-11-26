@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -299,18 +300,51 @@ class LocalIO:
     def __init__(self, token, delegate):
         self.token, self.delegate = token, delegate
 
-    def api(self, path, method="GET", body=None):
+    def api(self, path, method="GET", body=None, *, graphql_rejection=False, paginate=True):
         args = ["gh", "api", path, "--method", method]
-        if method == "GET":
+        if method == "GET" and paginate:
             args.append("--paginate")
         if body is not None:
             args += ["--input", "-"]
-        r = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True,
-                           text=True, timeout=60, env=dict(os.environ, GH_TOKEN=self.token))
+        try:
+            r = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True,
+                               text=True, timeout=60, env=dict(os.environ, GH_TOKEN=self.token))
+        except subprocess.TimeoutExpired as error:
+            raise ApiError(f"{method} {path} 超时") from error
         if r.returncode != 0:
+            # gh reports a GraphQL rejection both as a nonzero exit and in the response body.
+            if graphql_rejection and r.stdout.strip():
+                try:
+                    response = json.loads(r.stdout)
+                except ValueError:
+                    response = None
+                if isinstance(response, dict) and response.get("errors"):
+                    return response
             err = NotFound if "HTTP 404" in r.stderr else ApiError
             raise err("%s %s 失败：%s" % (method, path, r.stderr.strip()[:300]))
-        return parse_pages(r.stdout) if r.stdout.strip() else None
+        try:
+            return parse_pages(r.stdout) if r.stdout.strip() else None
+        except ValueError as error:
+            raise ApiError(f"{method} {path} 返回了无法读取的 JSON") from error
+
+    def enable_automerge(self, pr_id, head, method):
+        """Return the GraphQL rejection message, or None after confirmed success."""
+        query = ("mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!,$mergeMethod:PullRequestMergeMethod!)"
+                 "{enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,"
+                 "expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod}){pullRequest{id}}}")
+        result = self.api("graphql", "POST", {"query": query, "variables": {
+            "pullRequestId": pr_id, "expectedHeadOid": head, "mergeMethod": method.upper(),
+        }}, graphql_rejection=True)
+        try:
+            if result.get("errors"):
+                message = "; ".join(error["message"] for error in result["errors"]).strip()
+                if message:
+                    return message
+            if result["data"]["enablePullRequestAutoMerge"]["pullRequest"]["id"] == pr_id:
+                return None
+        except (AttributeError, KeyError, TypeError):
+            pass
+        raise ApiError("GitHub 未确认已打开 PR 的自动合并")
 
     def api_optional(self, path):
         try:
@@ -318,7 +352,7 @@ class LocalIO:
         except NotFound:
             return None
 
-    def legacy_status_checks(self, repo, branch, *, need_source, need_sync):
+    def legacy_status_checks(self, repo, branch, *, need_source, need_sync, need_all=False):
         path = f"repos/{repo}/branches/{branch}"
         # The ordinary branch response can tell us whether a classic check is relevant.
         protection = (self.api_optional(path) or {}).get("protection") or {}
@@ -326,19 +360,65 @@ class LocalIO:
         contexts = set(checks.get("contexts") or []) | {c.get("context") for c in checks.get("checks") or []}
         if protection.get("enabled") is False:
             return None
-        if not ((need_source and flow.VERIFIED in contexts) or (need_sync and contexts)):
+        if not ((need_source and flow.VERIFIED in contexts) or ((need_sync or need_all) and contexts)):
             return checks
         # GitHub requires Administration: read for the classic details, including the pinned App ID.
         try:
             token = tokens.mint(repo, {"administration": "read"})
-        except tokens.TokenError:
+        except tokens.TokenError as error:
+            if need_all:
+                raise ApiError("读不到旧版分支保护的必需检查与来源") from error
             # Without Administration: read the App ID cannot be confirmed: fail closed to the manual route
             # (the projection has no app_id, so the source check is unmet) instead of failing the whole run.
             return checks
         try:
-            return LocalIO(token, None).api_optional(path + "/protection/required_status_checks")
+            details = LocalIO(token, None).api_optional(path + "/protection/required_status_checks")
         finally:
             tokens.revoke(token)
+        if need_all and details is None:
+            raise ApiError("读不到旧版分支保护的必需检查与来源")
+        return details
+
+    def commit_check_results(self, repo, head):
+        """Read check runs and latest commit statuses across all result pages."""
+        try:
+            token = tokens.mint(repo, {"checks": "read"})
+        except tokens.TokenError as error:
+            raise ApiError("读不到必需检查，需要 hub App 的 Checks: read 权限") from error
+        path = f"repos/{repo}/commits/{head}"
+        try:
+            run_pages = LocalIO(token, None).api(f"{path}/check-runs")
+        finally:
+            tokens.revoke(token)
+
+        def entries(result, field):
+            pages = result if isinstance(result, list) else [result]
+            if not pages or any(not isinstance(page, dict) or not isinstance(page.get(field), list) for page in pages):
+                raise ApiError(f"GitHub 返回的 {field} 数据不完整")
+            return [entry for page in pages for entry in page[field]]
+
+        runs = entries(run_pages, "check_runs")
+        statuses = entries(self.api(f"{path}/status"), "statuses")
+        # The combined response omits creators. Match its status IDs so an older
+        # result from a trusted creator cannot vouch for a newer status.
+        missing = {status["id"] for status in statuses if "id" in status and not status.get("creator")}
+        if missing:
+            history = self.api(f"{path}/statuses")
+            if not isinstance(history, list):
+                raise ApiError("GitHub 返回的提交状态明细数据不完整")
+            creators = {status["id"]: status.get("creator") for status in history if status.get("id") in missing}
+            statuses = [dict(status, creator=creators[status["id"]]) if status.get("id") in creators else status
+                        for status in statuses]
+        return runs, statuses
+
+    def base_is_ancestor(self, repo, base_ref, head):
+        """Compare the live base branch to the validated head regardless of mergeability caching."""
+        ref = quote(base_ref, safe="")
+        comparison = self.api(f"repos/{repo}/compare/{ref}...{head}?per_page=1", paginate=False)
+        status = comparison.get("status") if isinstance(comparison, dict) else None
+        if status not in ("ahead", "identical", "behind", "diverged"):
+            raise ApiError("GitHub 返回的主干提交比较数据不完整")
+        return status in ("ahead", "identical")
 
     @staticmethod
     def bot_identity():

@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from urllib.parse import quote
 
 if __package__ in (None, ""):
@@ -681,54 +682,39 @@ def default_merge_method(repo_info):
     return "rebase"
 
 
-def verified_requirements(io, repo, base_ref, app_id):
+def hub_app_id(config, bot):
+    return next((value for value in (bot.get("app_id"), config.get("appId"), config.get("app_id"))
+                 if type(value) is int and value > 0), None)
+
+
+def verified_requirements(io, repo, base_ref, app_id, *, all_checks=False):
     """Read effective rulesets and, when needed, classic branch protection."""
+    def contexts(checks, source_field):
+        return {(c["context"], c[source_field] if type(c.get(source_field)) is int and c[source_field] > 0 else None)
+                for c in checks if c.get("context")}
+
     branch = quote(base_ref, safe="")
     rules = io.api_optional(f"repos/{repo}/rules/branches/{branch}") or []
     parameters = [rule.get("parameters") or {} for rule in rules if rule.get("type") == "required_status_checks"]
-    checks = [check for rule in parameters for check in rule.get("required_status_checks", [])
-              if check.get("context") == VERIFIED]
-    pinned = app_id is not None and any(type(c.get("integration_id")) is int and c["integration_id"] == app_id
-                                       for c in checks)
+    checks = contexts((c for rule in parameters for c in rule.get("required_status_checks", [])), "integration_id")
+    pinned = app_id is not None and (VERIFIED, app_id) in checks
     strict = any(rule.get("strict_required_status_checks_policy") is True and rule.get("required_status_checks")
                  for rule in parameters)
-    if pinned and strict:
-        return True, True, True
+    if pinned and strict and not all_checks:
+        return True, True, True, checks
     legacy = io.legacy_status_checks(repo, branch, need_source=app_id is not None and not pinned,
-                                     need_sync=pinned and not strict) or {}
-    legacy_checks = [check for check in legacy.get("checks", []) if check.get("context") == VERIFIED]
-    pinned = pinned or (app_id is not None and any(type(c.get("app_id")) is int and c["app_id"] == app_id
-                                                  for c in legacy_checks))
-    required = bool(checks or legacy_checks or VERIFIED in legacy.get("contexts", []))
+                                     need_sync=pinned and not strict, need_all=all_checks) or {}
+    classic_checks = contexts(legacy.get("checks") or [], "app_id")
+    classic_names = {name for name, _ in classic_checks}
+    checks |= classic_checks | {(name, None) for name in legacy.get("contexts") or [] if name not in classic_names}
+    required = any(name == VERIFIED for name, _ in checks)
+    pinned = app_id is not None and (VERIFIED, app_id) in checks
     classic_strict = legacy.get("strict") is True and bool(legacy.get("contexts") or legacy.get("checks"))
-    return required, pinned, strict or classic_strict
+    return required, pinned, strict or classic_strict, checks
 
 
-def choose_route(io, repo, base_ref, state, config, bot, *, direct, dependabot, flow_v2, decision, reasons):
-    """Select a route, collecting unmet preconditions in the order they are checked."""
-    if direct:
-        return "direct", ["mergeMode=direct", *reasons]
-    reasons = list(reasons)
-    snapshot = state.read()
-    frozen, narrowed = snapshot["frozen"], "narrowed" in snapshot["repos"].get(repo, {})
-    if frozen:
-        reasons.append("watch 已冻结")
-    if narrowed:
-        reasons.append("仓库已收紧")
-    if dependabot:
-        return "manual", [*reasons, "Dependabot 依赖更新由人合并"]
-    if not flow_v2:
-        reasons.append("老流程模块由人合并")
-    if decision is None:
-        reasons.append("预演未执行完整验证，未判定准入")
-    elif not decision["auto_merge"]:
-        failures = [item["detail"] for item in decision["items"] if not item["ok"] and item["detail"] not in reasons]
-        reasons.append("准入未通过" + ("：" + "；".join(failures) if failures else ""))
-    if frozen or narrowed or not flow_v2:
-        return "manual", reasons
-    app_id = next((value for value in (bot.get("app_id"), config.get("appId"), config.get("app_id"))
-                   if type(value) is int and value > 0), None)
-    required, pinned, strict = verified_requirements(io, repo, base_ref, app_id)
+def verified_rule_reasons(required, pinned, strict, app_id):
+    reasons = []
     if not required:
         reasons.append(f"主干未要求 {VERIFIED}")
     if app_id is None:
@@ -737,6 +723,37 @@ def choose_route(io, repo, base_ref, state, config, bot, *, direct, dependabot, 
         reasons.append(f"{VERIFIED} 的来源未限定为 hub App")
     if not strict:
         reasons.append("主干规则未要求分支与主干同步")
+    return reasons
+
+
+def automerge_hold_reasons(state, repo):
+    snapshot = state.read()
+    reasons = []
+    if snapshot["frozen"]:
+        reasons.append("watch 已冻结")
+    if "narrowed" in snapshot["repos"].get(repo, {}):
+        reasons.append("仓库已收紧")
+    return reasons
+
+
+def choose_route(io, repo, base_ref, state, config, bot, *, direct, dependabot, flow_v2, decision, reasons):
+    """Select a route, collecting unmet preconditions in the order they are checked."""
+    if direct:
+        return "direct", ["mergeMode=direct", *reasons]
+    holds = automerge_hold_reasons(state, repo)
+    reasons = [*reasons, *holds]
+    if dependabot:
+        return "manual", [*reasons, "Dependabot 依赖更新由人合并"]
+    if not flow_v2:
+        reasons.append("老流程模块由人合并")
+    if decision is not None and not decision["auto_merge"]:
+        failures = [item["detail"] for item in decision["items"] if not item["ok"] and item["detail"] not in reasons]
+        reasons.append("准入未通过" + ("：" + "；".join(failures) if failures else ""))
+    if holds or not flow_v2:
+        return "manual", reasons
+    app_id = hub_app_id(config, bot)
+    required, pinned, strict, _ = verified_requirements(io, repo, base_ref, app_id)
+    reasons.extend(verified_rule_reasons(required, pinned, strict, app_id))
     if not state.heartbeat_is_fresh(15):
         reasons.append("watch 心跳不在 15 分钟内")
     return ("manual" if reasons else "automerge"), reasons
@@ -793,11 +810,146 @@ def hand_to_user(io, repo, number, head, base, notify, state, bot, say, reasons)
             state.enqueue_notification(notify, f"{repo}#{number} {message}", key)
 
 
-def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notify=None, author_host=None):
+def record_automerge_intent(io, repo, pr, base, notify, state, evidence_url, bot):
+    """Reuse a confirmed request or persist an intent for a new one."""
+    number, head = pr["number"], pr["head"]["sha"]
+    prefix = f"{repo}:{number}:{head}:{base}:automerge:"
+    fields = dict(validatedHeadOid=head, validatedBaseOid=base, notify=notify, since=io.now())
+    with state.lock(wait_seconds=RUN_LOCK_WAIT):
+        pending = next((k for k in state.pending_intents() if k.startswith(prefix)), None)
+        previous = state.get_pr(repo, number) or {}
+        if (previous.get("state") == "automerge-on" and previous.get("validatedHeadOid") == head
+                and previous.get("validatedBaseOid") == base and pr.get("auto_merge") is not None):
+            fresh = io.api(f"repos/{repo}/pulls/{number}")
+            queue = fresh.get("auto_merge") or {}
+            if ((fresh.get("head") or {}).get("sha") == head and (fresh.get("base") or {}).get("ref") == pr["base"]["ref"]
+                    and (queue.get("enabled_by") or {}).get("id") == bot["id"]):
+                if notify and notify != previous.get("notify"):
+                    state.set_pr(repo, number, notify=notify)
+                if pending is not None:
+                    state.mark_done(pending)
+                return None
+        key = pending or prefix + evidence_url
+        state.intend(key, dict(action="enable-automerge", repo=repo, pr=number, **fields))
+        state.set_pr(repo, number, state="automerge-requested", pause=None, **fields)
+    return key
+
+
+def require_automerge_available(state, repo):
+    holds = automerge_hold_reasons(state, repo)
+    if holds:
+        raise Stop("merge", "；".join(holds))
+
+
+def require_same_pr_target(pr, base_ref):
+    if (pr.get("base") or {}).get("ref") != base_ref:
+        raise Stop("merge", "PR 的目标分支被改了")
+    if pr.get("state") != "open" or pr.get("draft") or pr.get("merged"):
+        raise Stop("merge", "PR 已关闭、合并或改为草稿")
+
+
+def try_enable_automerge(io, repo, pr, head, method, sleep, state):
+    pr_id = pr.get("node_id")
+    if not pr_id:
+        raise ApiError("读不到 PR 节点 ID，无法打开自动合并")
+    number, base_ref = pr["number"], pr["base"]["ref"]
+    path = f"repos/{repo}/pulls/{number}"
+    require_same_pr_target(io.api(path), base_ref)
+    # The additive label endpoint also succeeds when the PR already has the label.
+    labels = io.api(f"repos/{repo}/issues/{number}/labels", "POST", {"labels": [AUTHORED]})
+    if not any(label.get("name") == AUTHORED for label in labels or []):
+        raise ApiError(f"GitHub 未确认已添加 {AUTHORED} 标签")
+    for attempt in range(5):
+        if attempt:
+            sleep(2)
+        require_automerge_available(state, repo)
+        rejection = io.enable_automerge(pr_id, head, method)
+        if not rejection or not any(text in rejection.lower() for text in ("expected head oid", "does not match")):
+            return rejection
+    fresh = io.api(path)
+    if (fresh.get("head") or {}).get("sha") != head:
+        raise Stop("merge", "head 被改了")
+    require_same_pr_target(fresh, base_ref)
+    require_automerge_available(state, repo)
+    return io.enable_automerge(pr_id, head, method)
+
+
+def required_check_failures(checks, runs, statuses, bot, app_id):
+    reasons = []
+    for name, source in sorted(checks, key=lambda check: (check[0], check[1] or 0)):
+        candidates = [run for run in runs if run.get("name") == name]
+        contexts = [status for status in statuses if status.get("context") == name]
+        source = app_id if name == VERIFIED and source is None else source
+        if source is not None:
+            matching = [run for run in candidates if (run.get("app") or {}).get("id") == source]
+            # A status creator's user ID is distinct from the App ID.
+            trusted = [status for status in contexts if source == app_id
+                       and (status.get("creator") or {}).get("id") == bot["id"]]
+            if name == VERIFIED and (source != app_id or ((candidates or contexts) and not (matching or trusted))):
+                reasons.append(f"{VERIFIED} 的来源不是 hub App")
+                continue
+            candidates, contexts = matching, trusted
+        if not (candidates or contexts):
+            reasons.append(f"缺少必需检查 {name} 的结果")
+        elif (any(run.get("status") != "completed" or run.get("conclusion") != "success" for run in candidates)
+              or any(status.get("state") != "success" for status in contexts)):
+            reasons.append(f"必需检查 {name} 未成功")
+    return list(dict.fromkeys(reasons))
+
+
+def check_automerge_fallback(io, repo, number, head, base_ref, app_id, bot):
+    pr = io.api(f"repos/{repo}/pulls/{number}")
+    if (pr.get("head") or {}).get("sha") != head:
+        raise Stop("merge", "head 被改了")
+    require_same_pr_target(pr, base_ref)
+    decision = evaluate(io, repo, pr, bot)
+    if not decision["auto_merge"]:
+        raise Stop("admission", decision["headline"])
+    required, pinned, strict, checks = verified_requirements(io, repo, base_ref, app_id, all_checks=True)
+    reasons = verified_rule_reasons(required, pinned, strict, app_id)
+    if reasons:
+        raise Stop("merge", "；".join(reasons))
+    runs, statuses = io.commit_check_results(repo, head)
+    reasons = required_check_failures(checks, runs, statuses, bot, app_id)
+    if reasons:
+        raise Stop("merge", "；".join(reasons))
+    if pr.get("mergeable_state") == "behind" or not io.base_is_ancestor(repo, base_ref, head):
+        raise Stop("merge", "PR 落后主干")
+
+
+def pause_automerge(repo, number, head, reason, notify, state):
+    recovery = "重新 run 通过"
+    with state.lock(wait_seconds=RUN_LOCK_WAIT):
+        state.pause_pr(repo, number, reason, recovery)
+        if notify:
+            digest = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+            state.enqueue_notification(notify, f"{repo}#{number} 已暂停：{reason}。恢复条件：{recovery}。",
+                                       f"{repo}:{number}:{head}:automerge-paused:{digest}:{notify}")
+
+
+def record_automerge_on(io, repo, number, head, key, state, bot, say, notes):
+    message = f"已打开自动合并，绑定提交 `{head[:12]}`"
+    marker = block("autopilot-automerge", {"head": head})
+    with state.lock(wait_seconds=RUN_LOCK_WAIT):
+        if key is not None:
+            state.set_pr(repo, number, state="automerge-on")
+            state.mark_done(key)
+        try:
+            path = f"repos/{repo}/issues/{number}/comments?per_page=100"
+            if not any(d.trusted(rest_comment(c), bot) and marker in c["body"] for c in io.api(path) or []):
+                say(f"{RUN_MARKER}\n{message}\n\n{marker}")
+        except ApiError as error:
+            notes.append(f"已打开自动合并，但 PR 评论没写成：{str(error)[:200]}")
+    return message
+
+
+def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notify=None, author_host=None,
+        sleep=time.sleep):
     """Check one PR and return its result, route, and evidence context."""
     notes, pr = [], None
     result_info, manual_reasons = {}, []
     checking = False
+    automerge_key = None
     queue_check = None
     bot = io.bot_identity()
     # Batch uses the existing explicit direct-merge path and its existing token permissions.
@@ -966,6 +1118,11 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             route, reasons = choose_route(io, repo, base_ref, state, config, bot, direct=direct,
                                           dependabot=dependabot, flow_v2=flow_v2, decision=None, reasons=manual_reasons)
             result_info.update(route=route, routeReasons=reasons)
+            if route == "automerge":
+                notes.append("预演：验证和准入通过后，写入 automerge-requested，添加 autopilot:authored，"
+                             f"再调用 enablePullRequestAutoMerge（expectedHeadOid={head}）。"
+                             "成功后记录 automerge-on 并在 PR 评论。被拒后复核 head、必需检查与主干同步，"
+                             "符合条件才直接合并并收尾，否则暂停。")
             if flow_v2:
                 return finish("dry-run", "verification", verification["reason"])
             return finish("dry-run", "evidence", "预演：已跑完仓库检查，没有发证据、没有合并")
@@ -1022,20 +1179,27 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 live = evaluate(io, repo, pr, bot)
                 if not live["auto_merge"]:
                     raise Stop("admission", live["headline"])
-                return finish("automerge-pending", "merge", "Task 4 实现")
+                method = default_merge_method(io.api(f"repos/{repo}"))
+                automerge_key = record_automerge_intent(io, repo, pr, base_tip, notify, state, evidence_url, bot)
+                if automerge_key is None or try_enable_automerge(io, repo, pr, head, method, sleep, state) is None:
+                    message = record_automerge_on(io, repo, number, head, automerge_key, state, bot, say, notes)
+                    return finish("automerge-on", "merge", message)
+                check_automerge_fallback(io, repo, number, head, base_ref, hub_app_id(config, bot), bot)
+                require_automerge_available(state, repo)
         else:
             say(body)
 
-        decision = evaluate(io, repo, pr, bot)
-        if not decision["auto_merge"]:
-            raise Stop("admission", decision["headline"])
-        if manual_reasons:
-            raise Stop("admission", "；".join(manual_reasons))
+        if automerge_key is None:
+            decision = evaluate(io, repo, pr, bot)
+            if not decision["auto_merge"]:
+                raise Stop("admission", decision["headline"])
+            if manual_reasons:
+                raise Stop("admission", "；".join(manual_reasons))
 
-        repo_info = io.api(f"repos/{repo}")
-        if merge_method == "merge" and not repo_info.get("allow_merge_commit"):
-            raise Stop("merge", "仓库不允许 merge commit，module-crew 的合并是叠起来的，不能压平或变基，交你在仓库设置里打开 Allow merge commits")
-        method = default_merge_method(repo_info) if merge_method is None else merge_method
+            repo_info = io.api(f"repos/{repo}")
+            if merge_method == "merge" and not repo_info.get("allow_merge_commit"):
+                raise Stop("merge", "仓库不允许 merge commit，module-crew 的合并是叠起来的，不能压平或变基，交你在仓库设置里打开 Allow merge commits")
+            method = default_merge_method(repo_info) if merge_method is None else merge_method
         io.api(f"repos/{repo}/pulls/{number}/merge", "PUT", {"sha": head, "merge_method": method})
         after = io.api(f"repos/{repo}/pulls/{number}")
         if not after.get("merged") or not after.get("merge_commit_sha"):
@@ -1072,8 +1236,15 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                     say(f'{RUN_MARKER}\n{message}')
                 except Exception:
                     notes.append('PR 补开提醒发送失败，请按上述命令补开')
+        if automerge_key is not None:
+            with state.lock(wait_seconds=RUN_LOCK_WAIT):
+                state.set_pr(repo, number, state="post-merge-done")
+                state.mark_done(automerge_key)
         return finish("merged", "merge", after["merge_commit_sha"])
     except Stop as s:
+        if automerge_key is not None:
+            pause_automerge(repo, number, head, s.reason, notify, state)
+            return finish("paused", s.step, s.reason)
         if checking and not (dry_run or batch_merge):
             try:
                 verification_status(io, repo, head, "failure", "合并前验证未通过")
