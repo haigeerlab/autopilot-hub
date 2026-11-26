@@ -245,8 +245,9 @@ class VerificationTest(unittest.TestCase):
                 return io.verify_issues
             if path == f'repos/{REPO}/issues' and method == 'POST':
                 io.calls.append((method, path, body))
+                # GitHub leaves performed_via_github_app empty on App-created issues.
                 issue = dict(number=10, id=100, body=body['body'], user=BOT_USER,
-                             performed_via_github_app={'slug': BOT['app_slug']}, created_at=T0, updated_at=T0)
+                             performed_via_github_app=None, created_at=T0, updated_at=T0)
                 io.verify_issues.append(issue)
                 return issue
             if path.startswith(f'repos/{REPO}/issues/10/comments'):
@@ -415,7 +416,11 @@ class VerificationTest(unittest.TestCase):
         run(io)
         self.reply(io, 'R3 通过', owner=9)
         self.reply(io, 'R3 通过', edited=True)
-        self.assertIn('要你测 R3', run(io)['reason'])
+        reason = run(io)['reason']
+        self.assertIn('要你测 R3', reason)
+        self.assertNotIn('确认执行', reason)  # nothing to confirm: no empty "确认执行" part
+        self.assertEqual(len(io.verify_issues), 1)  # reruns reuse the tracking issue
+        self.assertNotIn('要确认执行的命令用例', io.verify_issues[0]['body'])
         self.assertEqual(io.verify_calls, [])
         self.reply(io, 'R3 不通过：页面打不开')
         result = run(io)

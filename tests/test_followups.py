@@ -26,8 +26,9 @@ def attach(io):
             io.calls.append((method, path, body))
             if body['title'] in io.fail_titles:
                 raise cli.ApiError('创建失败')
+            # GitHub leaves performed_via_github_app empty on App-created issues.
             issue = dict(number=12 + len(io.followup_issues), **body, user=fixtures.BOT_USER,
-                         performed_via_github_app={'slug': BOT['app_slug']}, updated_at='changed')
+                         performed_via_github_app=None, updated_at='changed')
             io.followup_issues.append(issue)
             return issue
         for issue in io.followup_issues:

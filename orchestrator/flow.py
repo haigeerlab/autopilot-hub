@@ -380,10 +380,14 @@ FOLLOWUP_BLOCK = re.compile(r'<!--\s*autopilot-followup:v1\s+(.*?)\s*-->', re.S)
 
 
 def bot_issue(issue, bot):
-    """Identify an App-authored issue independently of its moving updated_at."""
+    """Identify an App-authored issue independently of its moving updated_at.
+
+    GitHub leaves performed_via_github_app empty on App-created issues (same rule as pipeline/engine.py and
+    audit/run.py); when it is present it must still name our App."""
     user = issue.get('user') or {}
+    app = issue.get('performed_via_github_app')
     return bool(bot and user.get('type') == 'Bot' and user.get('id') == bot['id']
-                and (issue.get('performed_via_github_app') or {}).get('slug') == bot['app_slug'])
+                and (app is None or (isinstance(app, dict) and app.get('slug') == bot['app_slug'])))
 
 
 def note_key(note):
@@ -462,10 +466,13 @@ def open_followups(io, repo, pr_number, module, patch_id, notes, bot):
 
 
 def verification_listing(module, groups, payload):
-    lines = [f"模块 {module} 的合并前验证需要你回复。", "", "要确认执行的命令用例："]
+    lines = [f"模块 {module} 的合并前验证需要你回复。", ""]
+    if groups['confirm']:
+        lines.append("要确认执行的命令用例：")
     for case in groups['confirm']:
         lines.extend([f"{case['id']}：{case['title']}", "```", case['command'], "```"])
-    lines.append("要你测的人工用例（含 ai-operate）：")
+    if groups['manual']:
+        lines.append("要你测的人工用例（含 ai-operate）：")
     for case in groups['manual']:
         lines.extend([f"{case['id']}：{case['title']}", f"步骤：{case['steps']}", f"预期：{case['expected']}"])
     lines.extend(["", "请逐行回复，例如：确认执行 R5 R6；R2 通过；R3 不通过：说明；意见 R2：文字。",
@@ -609,8 +616,9 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
                 write_json(cache_path, cache)
             results.append(result)
         if pending_confirm or pending_manual:
-            raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：确认执行 " + ' '.join(pending_confirm)
-                       + '；要你测 ' + ' '.join(pending_manual))
+            wanted = (["确认执行 " + ' '.join(pending_confirm)] if pending_confirm else []) \
+                + (["要你测 " + ' '.join(pending_manual)] if pending_manual else [])
+            raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：" + '；'.join(wanted))
         report = build_report(module, doc, work.merge_base, head, patch_id, new_executor(), results, replies['notes'])
         write_json(report_path, report)
     digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
