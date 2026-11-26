@@ -25,7 +25,7 @@ from audit import config_check as cc
 from audit import run as ar
 from degrade.run import parse_pages
 from orchestrator import token as tokens
-from orchestrator.cli import HUB, _clean_env, _git_env, find_map_view
+from orchestrator.cli import HUB, LocalIO, _clean_env, _git_env, find_map_view
 
 REPO_READ = {"contents": "read", "issues": "read"}
 HUB_WRITE = {"issues": "write"}
@@ -86,6 +86,41 @@ class LiveIO:
 
     def hub_api(self, path, method="GET", body=None):
         return _api(self.hub_token, path, method, body)
+
+    @staticmethod
+    def verification_records(repo, module_ids):
+        """Read verification records from the configured checkout's common git directory."""
+        root = LocalIO.checkout_of(repo)
+        if not root or not os.path.isdir(root):
+            return None
+        # Inherited GIT_DIR/GIT_WORK_TREE would override -C; and the checkout must be the repository root itself,
+        # not a folder inside some other repository.
+        env = {k: v for k, v in _clean_env().items()
+               if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")}
+        try:
+            r = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel", "--git-common-dir"], env=env,
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        lines = r.stdout.splitlines()
+        if r.returncode != 0 or len(lines) != 2 or os.path.realpath(lines[0]) != os.path.realpath(root):
+            return None
+        common = lines[1].strip()
+        if not os.path.isabs(common):
+            common = os.path.join(root, common)
+        records = {}
+        for mid in module_ids:
+            records[mid] = None
+            if not isinstance(mid, str) or not re.fullmatch(r"[\w.-]+", mid) or mid in (".", ".."):
+                continue
+            try:
+                with open(os.path.join(common, "spec-guard", "verification", mid + ".json"), encoding="utf-8") as fh:
+                    record = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict):
+                records[mid] = record
+        return records
 
     def snapshot(self, repo, ref):
         token = self._token(repo)
