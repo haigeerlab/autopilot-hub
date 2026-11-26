@@ -369,7 +369,7 @@ def c3(root):
             continue
         data = _read_bytes(root, rel)
         sample = data if data is not None else _read_bytes(root, rel, sniff=True)
-        if sample is not None and _binary(sample):
+        if is_test and sample is not None and _binary(sample):
             continue  # binary fixture (any size): cannot create a git repository
         try:
             text = None if data is None else data.decode("utf-8")

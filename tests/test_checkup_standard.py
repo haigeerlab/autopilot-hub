@@ -166,6 +166,7 @@ class StandardItemsTest(unittest.TestCase):
         self.assertEqual(self.run_on(files)["规范C3"]["status"], "ok")
         files["tests/fixtures/large.bin"] = b"\x00" + b"x" * (st.MAX_FILE_BYTES + 10)
         self.assertEqual(self.run_on(files)["规范C3"]["status"], "ok")
+        self.assertEqual(self.run_on(dict(files, **{"scripts/validate.sh": b"\x00"}))["规范C3"]["status"], "unknown")
         for name, data in (("latin1.txt", b"caf\xe9\n"), ("utf16.py", "git init\n".encode("utf-16"))):
             with self.subTest(name=name):
                 self.assertEqual(self.run_on(dict(files, **{"tests/fixtures/" + name: data}))["规范C3"]["status"], "unknown")
