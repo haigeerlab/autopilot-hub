@@ -81,6 +81,14 @@ class AddedLinesTest(unittest.TestCase):
                 'Binary files "a/x and b/\\303\\251.png" and "b/x and b/\\303\\251.png" differ\n')
         self.assertEqual(unchecked(lp.files_from_diff(diff)), ["x and b/é.png"])
 
+    def test_quoted_text_file_name_is_unquoted(self):
+        for header, name in (('"b/caf\\303\\251.md"', "café.md"), ('"b/caf\u00e9 \\"x\\".md"', 'café "x".md')):
+            with self.subTest(header=header):
+                diff = "diff --git x y\n--- a/z\n+++ " + header + "\n@@ -0,0 +1 @@\n+hi\n"
+                files = lp.files_from_diff(diff)
+                self.assertEqual([f["filename"] for f in files], [name])
+                self.assertEqual(list(lp.added_lines(files[0])), [(1, "hi")])
+
     def test_unparseable_binary_header_is_still_listed(self):
         diff = 'diff --git a/x b/y and b/z\nindex 1..2 100644\nGIT binary patch\nliteral 1\nIcmZ?wWB>p\n'
         self.assertEqual(unchecked(lp.files_from_diff(diff)), ["a/x b/y and b/z"])

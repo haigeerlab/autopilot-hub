@@ -33,10 +33,13 @@ def _unquote(name):
     if len(name) >= 2 and name[0] == name[-1] == '"':
         try:
             value = ast.literal_eval(name)
-            if isinstance(value, str):
-                return value.encode("latin-1").decode("utf-8")
-        except (ValueError, SyntaxError, UnicodeError, MemoryError, RecursionError):
-            pass
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            value = None
+        if isinstance(value, str):
+            try:
+                return value.encode("latin-1").decode("utf-8")  # octal escapes are UTF-8 bytes
+            except UnicodeError:
+                return value  # core.quotePath=false keeps non-ASCII characters as they are
         return name[1:-1]
     return name
 
@@ -96,7 +99,7 @@ def files_from_diff(text):
         elif cur is not None and raw.startswith("--- ") and not body:
             continue
         elif cur is not None and raw.startswith("+++ ") and not body:
-            name = raw[4:].strip()
+            name = _unquote(raw[4:].strip())
             if name == "/dev/null":
                 cur["status"] = "removed"
             else:
