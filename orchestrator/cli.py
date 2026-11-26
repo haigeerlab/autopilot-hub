@@ -271,13 +271,15 @@ class Work:
         script = os.path.join(root, "hooks", "module_scope.py") if root else None
         if not script or not os.path.isfile(script):
             return False
-        self.git("checkout", "-q", "--detach", self.head)
         try:
+            # scopeCheck also counts uncommitted and untracked files, so drop what the checks left behind.
+            self.git("checkout", "-q", "-f", "--detach", self.head)
+            self.git("clean", "-q", "-ffdx")
             r = subprocess.run(["python3", "-B", script, "check", "--project", self.root, "--module", module,
                                 "--base", self.merge_base, "--format", "json"], cwd=self.root, env=_clean_env(),
                                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
             data = json.loads(r.stdout) if r.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired, ValueError):
+        except (OSError, subprocess.TimeoutExpired, ValueError, flow.Stop):
             return False
         return isinstance(data, dict) and data.get("outside") == 0 and bool(data.get("files"))
 

@@ -497,7 +497,7 @@ class VerificationTest(unittest.TestCase):
         reason = run(io)['reason']
         self.assertIn('没有最终验收记录', reason)
         self.assertIn('tasks/<id>/', reason)
-        self.assertIn('m', reason)
+        self.assertIn('正在做的新流程模块有 m，', reason)
         self.assertEqual(io.scope_queries, ['m'])
 
     def test_done_modules_are_not_scope_candidates(self):
@@ -1378,7 +1378,13 @@ class VerificationLocalIOTest(unittest.TestCase):
         self.assertEqual(args[args.index('--base') + 1], 'b' * 40)
         self.assertEqual(args[args.index('--module') + 1], 'm')
         self.assertNotIn('GH_TOKEN', process.call_args_list[0].kwargs['env'])
-        work.git.assert_called_with('checkout', '-q', '--detach', HEAD)
+        work.git.assert_any_call('checkout', '-q', '-f', '--detach', HEAD)
+        work.git.assert_called_with('clean', '-q', '-ffdx')
+        work.git.side_effect = flow.Stop('clone', 'git checkout 失败')
+        with mock.patch.object(cli, 'find_spec_guard_root', return_value='plugin'), \
+                mock.patch.object(cli.os.path, 'isfile', return_value=True):
+            self.assertFalse(work.in_scope('m'))
+        work.git.side_effect = None
         with mock.patch.object(cli, 'find_spec_guard_root', return_value=None):
             self.assertFalse(work.in_scope('m'))
 
