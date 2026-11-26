@@ -640,6 +640,31 @@ def verify_module(io, repo, pr, work, module, base_view, notes, dry_run, say):
                 patch_id=patch_id, notes=[note['title'] for note in report.get('notes', [])])
 
 
+def unrecognised_reason(work, base_view):
+    """Why a spec-guard PR with no acceptance record stopped, naming the unfinished flow v2 modules whose scope holds it.
+
+    Flow v2 modules are recognised only by `spec/<id>.md` or `tasks/<id>/` in the diff; an implementation PR that ticks
+    nothing would otherwise get the old-flow message. The scope only explains the stop; it never selects a module.
+    """
+    pending = [m["id"] for m in (base_view or {}).get("modules") or []
+               if isinstance(m, dict) and m.get("tier") is not None and m.get("status") != "done"]
+    owners = [module for module in pending if work.in_scope(module)]
+    if len(owners) == 1:
+        module = owners[0]
+        return (f"改动都在新流程模块 {module} 的范围里，但这个 PR 没改 spec/{module}.md 或 tasks/{module}/，"
+                f"编排只按这两处认新流程模块。如果它是 {module} 的实现，在 tasks/{module}/todo.md 勾上完成的任务再运行；"
+                "本机检查证据已写好")
+    if owners:
+        return ("改动同时在新流程模块 " + "、".join(owners) + " 的范围里，这个 PR 又没改任何一个模块的 spec/<id>.md "
+                "或 tasks/<id>/，拿不准属于哪个；勾上所属模块 tasks/<id>/todo.md 里完成的任务再运行；本机检查证据已写好")
+    reason = ("这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
+              "本机检查证据已写好，等 spec-guard 验收后再运行")
+    if pending:
+        reason += ("。新流程模块按 PR 是否改了 spec/<id>.md 或 tasks/<id>/ 来认；正在做的新流程模块有 "
+                   + "、".join(pending) + "，如果这是它的实现，要同时勾上 tasks/<id>/todo.md")
+    return reason
+
+
 def default_merge_method(repo_info):
     if repo_info.get("allow_squash_merge"):
         return "squash"
@@ -761,8 +786,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None):
             else:
                 modules = io.find_modules(repo, head)
                 if not modules:
-                    raise Stop("acceptance", "这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
-                                             "本机检查证据已写好，等 spec-guard 验收后再运行")
+                    raise Stop("acceptance", unrecognised_reason(work, base_view))
                 if len(modules) > 1:
                     raise Stop("acceptance", "当前提交有多条验收记录（" + "、".join(sorted(modules)) + "），拿不准属于哪个模块")
                 module = modules[0]

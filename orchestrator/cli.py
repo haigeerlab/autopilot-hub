@@ -262,6 +262,27 @@ class Work:
         except ValueError:
             return None
 
+    def in_scope(self, module):
+        """True when spec-guard's scopeCheck puts every file changed since the merge base inside the module's scope.
+
+        Only used to explain a stop; any failure (no plugin, refused, unreadable) is simply False.
+        """
+        root = find_spec_guard_root((0, 96, 0))
+        script = os.path.join(root, "hooks", "module_scope.py") if root else None
+        if not script or not os.path.isfile(script):
+            return False
+        try:
+            # scopeCheck also counts uncommitted and untracked files, so drop what the checks left behind.
+            self.git("checkout", "-q", "-f", "--detach", self.head)
+            self.git("clean", "-q", "-ffdx")
+            r = subprocess.run(["python3", "-B", script, "check", "--project", self.root, "--module", module,
+                                "--base", self.merge_base, "--format", "json"], cwd=self.root, env=_clean_env(),
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+            data = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError, flow.Stop):
+            return False
+        return isinstance(data, dict) and data.get("outside") == 0 and bool(data.get("files"))
+
     @staticmethod
     def _parse(r):
         try:
