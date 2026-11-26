@@ -78,8 +78,11 @@ def files_from_diff(text):
             # Binary diffs have no ---/+++ lines; take the name from the header when it is unambiguous.
             rest = raw[len("diff --git "):]
             half = (len(rest) - len("a/ b/")) // 2
+            quoted = (len(rest) - len('"a/" "b/"')) // 2
             if half > 0 and rest == "a/" + rest[2:2 + half] + " b/" + rest[2:2 + half]:
                 cur["header_name"] = rest[2:2 + half]
+            elif quoted > 0 and rest == '"a/' + rest[3:3 + quoted] + '" "b/' + rest[3:3 + quoted] + '"':
+                cur["header_name"] = _unquote('"' + rest[3:3 + quoted] + '"')
         elif cur is not None and raw.startswith("new file mode"):
             cur["status"] = "added"
         elif cur is not None and raw.startswith("deleted file mode"):
