@@ -125,12 +125,22 @@ class RunTest(unittest.TestCase):
         self.assertEqual(io.verification_calls, [])
 
     def test_done_flow_with_local_record_is_clean(self):
-        io = self.flow_io(status="done", records={"flow": {"verdict": "pass"}})
+        io = self.flow_io(status="done", records={"flow": {"schema": "spec-guard.verification/v1", "module": "flow", "patchId": "c" * 40, "verdict": "pass"}})
         res = r.run(io)
         self.assertEqual(res["repos"][0]["status"], "合规")
         self.assertEqual(res["code"], 0)
         self.assertEqual(io.created(r.VIOLATION_LABEL), [])
         self.assertEqual(io.verification_calls, [(REPO, ["flow"])])
+
+    def test_unjudged_verification_is_not_reported_as_resolved(self):
+        io = self.flow_io(status="done", records={})
+        r.run(io)
+        violation = next(i for i in io.issues if r.VIOLATION_LABEL in i["labels"])
+        self.assertEqual(r.payload(violation["body"], r.VIOLATION)["kind"], "merged-without-verification")
+        io.records = None  # the local checkout became unavailable: this kind cannot be judged this run
+        res = r.run(io)
+        self.assertIn("判不了", " ".join(res["repos"][0]["notes"]))
+        self.assertFalse(any("未再发现" in c["body"] for c in violation["comments"]))
 
     def test_verification_only_reads_done_flow_modules(self):
         for io in (FakeIO(), self.flow_io(), FakeIO(snapshots={REPO: snapshot(spec_guard=False)})):

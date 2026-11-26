@@ -31,7 +31,7 @@ class FlowTest(unittest.TestCase):
     def test_unstarted_and_legacy_modules_are_ignored(self):
         result = check(module(progress={"done": 0}, requirementConfirm=None),
                        module(tier=None, status="done", requirementConfirm=None), records={})
-        self.assertEqual(result, {"problems": [], "notes": []})
+        self.assertEqual(result, {"problems": [], "notes": [], "unjudged": []})
 
     def test_confirmed_by_user_is_clean(self):
         for tier in ("bug", "small", "normal"):
@@ -39,7 +39,8 @@ class FlowTest(unittest.TestCase):
                 self.assertEqual(check(module(tier=tier))["problems"], [])
 
     def test_unconfirmed_requirement_is_severe(self):
-        for confirmation in (None, [], {"status": "pending"}, {"status": "invalid"},
+        for confirmation in (None, [], {}, {"status": None}, {"by": "user"}, {"status": "unknown-new", "by": "user"},
+                             {"status": "pending"}, {"status": "invalid"},
                              {"status": "confirmed", "by": "reviewer"}, {"status": "confirmed"}):
             with self.subTest(confirmation=confirmation):
                 problems = check(module(requirementConfirm=confirmation))["problems"]
@@ -68,10 +69,12 @@ class FlowTest(unittest.TestCase):
         for verdict in ("pass", "pass-with-notes"):
             with self.subTest(verdict=verdict):
                 self.assertEqual(check(module(status="done", progress={"done": 0}),
-                                       records={"m": {"verdict": verdict}})["problems"], [])
+                                       records={"m": {"schema": "spec-guard.verification/v1", "module": "m", "patchId": "c" * 40, "verdict": verdict}})["problems"], [])
 
     def test_done_without_passing_record_is_severe(self):
-        for records in ({}, {"m": None}, {"m": {"verdict": "fail"}}, {"m": {}}):
+        good = {"schema": "spec-guard.verification/v1", "module": "m", "patchId": "c" * 40, "verdict": "pass"}
+        for records in ({}, {"m": None}, {"m": dict(good, verdict="fail")}, {"m": {}}, {"m": {"verdict": "pass"}},
+                        {"m": dict(good, module="other")}, {"m": dict(good, schema="x")}, {"m": dict(good, patchId=None)}):
             with self.subTest(records=records):
                 problems = check(module(status="done"), records=records)["problems"]
                 self.assertEqual([(p["kind"], p["severity"]) for p in problems],
@@ -158,6 +161,21 @@ class VerificationRecordsTest(unittest.TestCase):
             (records / (mid + ".json")).write_text(text, encoding="utf-8")
         ids = ["missing", "broken", "list", "null"]
         self.assertEqual(self.io.verification_records("owner/repo", ids), dict.fromkeys(ids))
+
+    def test_folder_inside_another_repository_and_inherited_git_dir_are_refused(self):
+        records = self.init_checkout()
+        good = {"schema": "spec-guard.verification/v1", "module": "m", "patchId": "c" * 40, "verdict": "pass"}
+        (records / "m.json").write_text(json.dumps(good), encoding="utf-8")
+        inner = self.checkout / "sub"
+        inner.mkdir()
+        self.configure(inner)
+        self.assertIsNone(self.io.verification_records("owner/repo", ["m"]))
+        self.configure(self.checkout)
+        other = self.root / "other"
+        other.mkdir()
+        subprocess.check_call(["git", "-C", str(other), "init", "-q"])
+        with patch.dict("os.environ", {"GIT_DIR": str(other / ".git")}):
+            self.assertEqual(self.io.verification_records("owner/repo", ["m"]), {"m": good})
 
     def test_missing_configuration_checkout_or_git_directory_is_unavailable(self):
         self.assertIsNone(self.io.verification_records("owner/repo", ["m"]))

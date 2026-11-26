@@ -93,14 +93,19 @@ class LiveIO:
         root = LocalIO.checkout_of(repo)
         if not root or not os.path.isdir(root):
             return None
+        # Inherited GIT_DIR/GIT_WORK_TREE would override -C; and the checkout must be the repository root itself,
+        # not a folder inside some other repository.
+        env = {k: v for k, v in _clean_env().items()
+               if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")}
         try:
-            r = subprocess.run(["git", "-C", root, "rev-parse", "--git-common-dir"],
+            r = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel", "--git-common-dir"], env=env,
                                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
             return None
-        if r.returncode != 0 or not r.stdout.strip():
+        lines = r.stdout.splitlines()
+        if r.returncode != 0 or len(lines) != 2 or os.path.realpath(lines[0]) != os.path.realpath(root):
             return None
-        common = r.stdout.strip()
+        common = lines[1].strip()
         if not os.path.isabs(common):
             common = os.path.join(root, common)
         records = {}

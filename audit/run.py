@@ -83,6 +83,7 @@ def audit_repo(io, repo, base, ref=None):
             flow = fc.check_flow(view, records)
             problems += flow["problems"]
             out["notes"] += flow["notes"]
+            out["unjudged"] = flow.get("unjudged", [])
     else:
         out["notes"].append("不是 spec-guard 项目，Plan 审批不查")
     problems.sort(key=lambda p: p["severity"] != "严重")
@@ -152,6 +153,7 @@ def _grouped(results):
 def post_violations(io, bot, results, date):
     judged = {r["repo"] for r in results if r["status"] in ("合规", "提醒", "违规")}
     groups = _grouped(results)
+    unjudged = {(r["repo"], kind) for r in results for kind in r.get("unjudged", [])}
     existing = {}
     for issue in _open_issues(io, VIOLATION_LABEL, bot):
         key = payload(issue.get("body"), VIOLATION)
@@ -173,8 +175,8 @@ def post_violations(io, bot, results, date):
             _comment(io, issue["number"], "%s 复查：仍存在。\n\n%s\n" % (date, details))
             touched.append(issue["number"])
     for (repo, kind), issue in sorted(existing.items()):
-        if repo not in judged or (repo, kind) in groups:
-            continue
+        if repo not in judged or (repo, kind) in groups or (repo, kind) in unjudged:
+            continue  # a kind this run could not judge is neither "still there" nor "gone"
         comments = io.hub_api("/repos/%s/issues/%d/comments?per_page=100" % (HUB_REPO, issue["number"])) or []
         mine = [c for c in comments if trusted_comment(c, bot)]
         if mine and payload(mine[-1].get("body"), RESOLVED) is not None:
