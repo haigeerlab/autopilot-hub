@@ -66,7 +66,17 @@ class AddedLinesTest(unittest.TestCase):
         files = lp.files_from_diff(diff)
         self.assertEqual(unchecked(files), ["moved é.png", "café.bin", "my file.png", "new.png"])
 
-    def test_unparseable_binary_header_is_still_listed(self):
+    def test_binary_name_containing_and_b_uses_the_exact_header_name(self):
+        diff = ("diff --git a/x and b/y.png b/x and b/y.png\nindex 1..2 100644\n"
+                "Binary files a/x and b/y.png and b/x and b/y.png differ\n")
+        self.assertEqual(unchecked(lp.files_from_diff(diff)), ["x and b/y.png"])
+
+    def test_odd_quoted_names_do_not_crash(self):
+        for name in ('"a", "b"', '"\\777"', '"unterminated'):
+            with self.subTest(name=name):
+                self.assertIsInstance(lp.files_from_diff("diff --git a/q b/q\nrename to " + name + "\nGIT binary patch\n"), list)
+
+
         diff = 'diff --git a/x b/y and b/z\nindex 1..2 100644\nGIT binary patch\nliteral 1\nIcmZ?wWB>p\n'
         self.assertEqual(unchecked(lp.files_from_diff(diff)), ["a/x b/y and b/z"])
 

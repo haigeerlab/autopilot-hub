@@ -32,9 +32,12 @@ def _unquote(name):
     """Git C-quotes paths with special or non-ASCII characters; undo that when possible."""
     if len(name) >= 2 and name[0] == name[-1] == '"':
         try:
-            return ast.literal_eval(name).encode("latin-1").decode("utf-8")
-        except (ValueError, SyntaxError, UnicodeError):
-            return name[1:-1]
+            value = ast.literal_eval(name)
+            if isinstance(value, str):
+                return value.encode("latin-1").decode("utf-8")
+        except (ValueError, SyntaxError, UnicodeError, MemoryError, RecursionError):
+            pass
+        return name[1:-1]
     return name
 
 
@@ -62,7 +65,7 @@ def files_from_diff(text):
             rename_to, binary_name = cur.pop("rename_to", None), cur.pop("binary_name", None)
             if cur.pop("binary", False):
                 # Never drop a binary change: fall back to the raw header so it is still listed as unchecked.
-                cur["filename"] = cur["filename"] or rename_to or binary_name or header_name or header_raw
+                cur["filename"] = cur["filename"] or rename_to or header_name or binary_name or header_raw
                 cur["patch"] = None  # like the API: binary content cannot be checked
             else:
                 cur["patch"] = "\n".join(body)
@@ -73,9 +76,10 @@ def files_from_diff(text):
             flush()
             cur, body = {"filename": None, "status": "modified", "patch": "", "header_raw": raw[len("diff --git "):]}, []
             # Binary diffs have no ---/+++ lines; take the name from the header when it is unambiguous.
-            m = re.match(r"diff --git a/(.+) b/(.+)\Z", raw)
-            if m and m.group(1) == m.group(2):
-                cur["header_name"] = m.group(2)
+            rest = raw[len("diff --git "):]
+            half = (len(rest) - len("a/ b/")) // 2
+            if half > 0 and rest == "a/" + rest[2:2 + half] + " b/" + rest[2:2 + half]:
+                cur["header_name"] = rest[2:2 + half]
         elif cur is not None and raw.startswith("new file mode"):
             cur["status"] = "added"
         elif cur is not None and raw.startswith("deleted file mode"):
