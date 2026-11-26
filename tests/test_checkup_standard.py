@@ -164,8 +164,11 @@ class StandardItemsTest(unittest.TestCase):
         files = {"tests/test_git.py": 'run(["git", "init"])\n"maintenance.auto"\n"gc.auto"\n',
                  "tests/fixtures/logo.png": b"\x89PNG\r\n\x1a\n\x00\x00\xff\xfe"}
         self.assertEqual(self.run_on(files)["规范C3"]["status"], "ok")
-        files["tests/fixtures/latin1.txt"] = b"caf\xe9\n"
-        self.assertEqual(self.run_on(files)["规范C3"]["status"], "unknown")
+        files["tests/fixtures/large.bin"] = b"\x00" + b"x" * (st.MAX_FILE_BYTES + 10)
+        self.assertEqual(self.run_on(files)["规范C3"]["status"], "ok")
+        for name, data in (("latin1.txt", b"caf\xe9\n"), ("utf16.py", "git init\n".encode("utf-16"))):
+            with self.subTest(name=name):
+                self.assertEqual(self.run_on(dict(files, **{"tests/fixtures/" + name: data}))["规范C3"]["status"], "unknown")
 
     def test_c4_python_matrix(self):
         workflow = ('name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n'

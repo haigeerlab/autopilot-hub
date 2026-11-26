@@ -52,6 +52,24 @@ class AddedLinesTest(unittest.TestCase):
         self.assertEqual(unchecked(files), ["logo.png", "new.bin"])
         self.assertEqual(list(lp.added_lines(files[2])), [(2, "added")])
 
+    def test_binary_rename_and_quoted_names_from_real_git_output(self):
+        # Copied from `git diff --cached -M` (git quotes non-ASCII names; renames have no ---/+++ lines).
+        diff = ('diff --git a/big.png "b/moved \\303\\251.png"\nsimilarity index 99%\nrename from big.png\n'
+                'rename to "moved \\303\\251.png"\nindex c97f4c5..c54798c 100644\n'
+                'Binary files a/big.png and "b/moved \\303\\251.png" differ\n'
+                'diff --git "a/caf\\303\\251.bin" "b/caf\\303\\251.bin"\nindex a903574..00ffac9 100644\n'
+                'Binary files "a/caf\\303\\251.bin" and "b/caf\\303\\251.bin" differ\n'
+                "diff --git a/my file.png b/my file.png\nindex 8835708..d0c3599 100644\n"
+                "Binary files a/my file.png and b/my file.png differ\n"
+                "diff --git a/new.png b/new.png\nnew file mode 100644\nindex 0000000..47c2dd5\n"
+                "Binary files /dev/null and b/new.png differ\n")
+        files = lp.files_from_diff(diff)
+        self.assertEqual(unchecked(files), ["moved é.png", "café.bin", "my file.png", "new.png"])
+
+    def test_unparseable_binary_header_is_still_listed(self):
+        diff = 'diff --git a/x b/y and b/z\nindex 1..2 100644\nGIT binary patch\nliteral 1\nIcmZ?wWB>p\n'
+        self.assertEqual(unchecked(lp.files_from_diff(diff)), ["a/x b/y and b/z"])
+
     def test_removed_binary_file_in_a_local_diff_is_not_unchecked(self):
         diff = ("diff --git a/old.png b/old.png\ndeleted file mode 100644\nindex 1111111..0000000\n"
                 "Binary files a/old.png and /dev/null differ\n")

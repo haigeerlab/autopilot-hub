@@ -4,6 +4,7 @@ Two inputs: the PR file list from the GitHub API (`[{filename, status, patch}]`,
 local unified diff (`git diff`), so the same check runs in CI and before a local commit or push.
 Stdlib only; supports Python 3.9.
 """
+import ast
 import json
 import re
 
@@ -27,15 +28,41 @@ def added_lines(f):
             line += 1
 
 
+def _unquote(name):
+    """Git C-quotes paths with special or non-ASCII characters; undo that when possible."""
+    if len(name) >= 2 and name[0] == name[-1] == '"':
+        try:
+            return ast.literal_eval(name).encode("latin-1").decode("utf-8")
+        except (ValueError, SyntaxError, UnicodeError):
+            return name[1:-1]
+    return name
+
+
+def _binary_name(raw):
+    """The new-side path of `Binary files A and B differ` (the old side when the file was deleted)."""
+    rest = raw[len("Binary files "):-len(" differ")]
+    if rest.endswith(" and /dev/null"):
+        name, prefix = rest[:-len(" and /dev/null")], "a/"
+    else:
+        cut = max(rest.rfind(" and b/"), rest.rfind(' and "b/'))
+        if cut < 0:
+            return None
+        name, prefix = rest[cut + len(" and "):], "b/"
+    name = _unquote(name)
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
 def files_from_diff(text):
     """A local unified diff -> the same shape as the API file list (status added/modified/removed)."""
     files, cur, body = [], None, []
 
     def flush():
         if cur is not None:
-            header_name = cur.pop("header_name", None)
+            header_name, header_raw = cur.pop("header_name", None), cur.pop("header_raw")
+            rename_to, binary_name = cur.pop("rename_to", None), cur.pop("binary_name", None)
             if cur.pop("binary", False):
-                cur["filename"] = cur["filename"] or header_name
+                # Never drop a binary change: fall back to the raw header so it is still listed as unchecked.
+                cur["filename"] = cur["filename"] or rename_to or binary_name or header_name or header_raw
                 cur["patch"] = None  # like the API: binary content cannot be checked
             else:
                 cur["patch"] = "\n".join(body)
@@ -44,7 +71,7 @@ def files_from_diff(text):
     for raw in text.splitlines():
         if raw.startswith("diff --git "):
             flush()
-            cur, body = {"filename": None, "status": "modified", "patch": ""}, []
+            cur, body = {"filename": None, "status": "modified", "patch": "", "header_raw": raw[len("diff --git "):]}, []
             # Binary diffs have no ---/+++ lines; take the name from the header when it is unambiguous.
             m = re.match(r"diff --git a/(.+) b/(.+)\Z", raw)
             if m and m.group(1) == m.group(2):
@@ -53,9 +80,12 @@ def files_from_diff(text):
             cur["status"] = "added"
         elif cur is not None and raw.startswith("deleted file mode"):
             cur["status"] = "removed"
-        elif cur is not None and not body and (raw == "GIT binary patch" or
-                                               (raw.startswith("Binary files ") and raw.endswith(" differ"))):
+        elif cur is not None and not body and raw.startswith("rename to "):
+            cur["rename_to"] = _unquote(raw[len("rename to "):])
+        elif cur is not None and not body and raw == "GIT binary patch":
             cur["binary"] = True
+        elif cur is not None and not body and raw.startswith("Binary files ") and raw.endswith(" differ"):
+            cur["binary"], cur["binary_name"] = True, _binary_name(raw)
         elif cur is not None and raw.startswith("--- ") and not body:
             continue
         elif cur is not None and raw.startswith("+++ ") and not body:

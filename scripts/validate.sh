@@ -109,8 +109,12 @@ def quick_tests():
         return tests
     # A test or module may put a subdirectory on sys.path and import a file by its bare name;
     # also count any repository file whose path ends with the imported name (over-selects, never misses).
+    by_name = {}
+    for path in imports:
+        by_name.setdefault(path.rsplit("/", 1)[-1], []).append(path)
     for deps in imports.values():
-        deps.update(path for path in imports for dep in list(deps) if path.endswith("/" + dep))
+        deps.update(path for dep in list(deps) for path in by_name.get(dep.rsplit("/", 1)[-1], ())
+                    if path.endswith("/" + dep))
     if any(source.startswith("docs/") or source.lower().endswith(".md") for source in changed):
         for test, text in texts.items():
             if "ls-files" in text:
