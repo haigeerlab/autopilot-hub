@@ -6,6 +6,9 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 ## [Unreleased]
 
+### Removed
+- 删掉 `correction/cli.py` 里没人用的 `CANDIDATE_BLOCK` 正则（候选块照常写入）。`pipeline/engine.py` 写进本机账本的 `release_done` 是切片 14 Spec 定的发布完成记录，保留并在代码里注明暂无读取方。不需要升钉。
+
 ### Added
 - S110 切片 S5 剩余：合规监测对已开工的 spec-guard 新流程模块查三项（`audit/flow_check.py`）——需求没有经你确认（严重；确认后又改过为提醒）、重要需求的技术方案不是你批的（严重）、模块已完成却没有成立的合并前验证记录（严重；验证记录只在你本机检出的公共 git 目录里，从 `~/.autopilot/config.json` 的 `checkouts` 读，没配检出时只写「判不了」）。老流程模块仍由 `audit/plan_check.py` 检查（方案原写退役，因老模块仍在用而保留）。不需要升钉。
 - S110 切片 S4：新流程模块合并后，把合并前验证报告里的每条意见开成后续 issue（标签 `autopilot:followup`，标题「[跟进] 模块：意见」，带来源 PR 与补丁指纹）；同模块同标题已有机器人开的 issue 只追加评论，同一 PR 同一补丁重跑一律跳过。开失败不回滚合并，在 PR 上留补开命令 `orchestrator/cli.py followups --repo <owner/name> --pr <n>`（只认机器人 v2 证据与 sha256 对得上的本机报告）。不需要升钉。

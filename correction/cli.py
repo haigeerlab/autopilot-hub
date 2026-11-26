@@ -25,7 +25,6 @@ from degrade.run import ApiError, gh_api
 SLUG = re.compile(r"\A[a-z0-9]+(-[a-z0-9]+)*\Z")
 REPO = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 EVENT_BLOCK = re.compile(r"<!--\s*autopilot-correction:v1\s+(\{.*?\})\s*-->", re.S)
-CANDIDATE_BLOCK = re.compile(r"<!--\s*autopilot-correction-candidate:v1\s+(\{.*?\})\s*-->", re.S)
 LABEL = "correction"
 CANDIDATE = "correction:candidate"
 PROMOTE_AT = 2

@@ -276,6 +276,8 @@ def run(io, repo, version=None, *, resume=None, confirm=None, dry_run=False):
         summary = "发布全部完成。\n\n" + "\n".join(f"{s}：{records[s]['status']}" for s in identifiers)
         io.api(f"repos/{repo}/issues/{issue}/comments", "POST", {"body": summary})
         io.api(f"repos/{repo}/issues/{issue}", "PATCH", {"state": "closed"})
+        # Local completion record defined by docs/spec/slice-14.md; no code reads it yet.
+        # Kept as the per-machine release history next to codex_unavailable.
         io.ledger({"event": "release_done", "repo": repo, "version": version, "issue": issue, "at": io.now()})
         return outcome(0, "done", "发布全部完成")
     except Stop as error:
