@@ -42,14 +42,14 @@ def load_risk_config(yml_path, json_path, notes):
         try:
             yml = risk_tiers.read_repo_config_yml(yml_path)
         except (OSError, ValueError):
-            notes.append("risk-tiers.yml 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
+            notes.append("risk-tiers.yml 读不懂，按通用规则定风险档（没匹配到的路径算 T2）")
             return None
     if json_exists:
         try:
             js = risk_tiers.read_repo_config(json_path)
         except (OSError, ValueError):
             if not yml_exists:
-                notes.append("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T3）")
+                notes.append("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T2）")
                 return None
     if yml_exists:
         if json_exists and js is not None and js != yml:

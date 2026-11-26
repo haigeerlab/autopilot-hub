@@ -2,7 +2,7 @@
 
 测试命令：`scripts/validate.sh --quick`（日常）；`scripts/validate.sh && PYTHON=/usr/bin/python3 scripts/validate.sh`（推送前）
 
-- [ ] Task 1：风险分级按 R4
+- [x] Task 1：风险分级按 R4
   - 验证：`tests.test_risk`、`tests.test_admission`
   - 文件：`risk/templates.json`、`risk/tiers.py`、`admission/decide.py`、`.github/autopr/risk-tiers.json`、对应测试
 - [ ] Task 2：`orchestrator/state.py`

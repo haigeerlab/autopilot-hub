@@ -226,6 +226,15 @@ def legacy_io(**kw):
     return FakeIO(module="m", acceptance=accepted(), **kw)
 
 
+def assert_artifact_blocks_merge(test, io, result, reason, step="admission"):
+    test.assertEqual((result["result"], result["step"]), ("stopped", step), result)
+    test.assertIn(reason, result["reason"])
+    risk = flow.evaluate(io, REPO, io.pr, BOT)["risk"]
+    test.assertTrue(risk["human_only"], risk)
+    test.assertFalse(risk["auto_merge_eligible"], risk)
+    test.assertEqual(io.merge_calls(), [])
+
+
 class VerificationTest(unittest.TestCase):
     def io(self, cases=None, base_cases=None):
         from test_verify import case
@@ -336,10 +345,9 @@ class VerificationTest(unittest.TestCase):
             io = self.io()
             io.view['modules'][0][field] = bad
             result = run(io)
-            self.assertEqual(result['step'], 'admission', result)
-            self.assertIn('T4', result['reason'])
+            # R4 preserves the slice 12 approval guard as human_only.
+            assert_artifact_blocks_merge(self, io, result, 'spec-guard 产物没核对到有效的批准：tasks/m/regression.md')
             self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
-            self.assertEqual(io.merge_calls(), [])
 
     def test_degrade_appearing_after_verification_blocks_merge(self):
         io = self.io()
@@ -384,7 +392,8 @@ class VerificationTest(unittest.TestCase):
         io = self.io()
         del io.view['modules'][0]['designApproval']
         result = run(io)
-        self.assertEqual(result['step'], 'admission', result)
+        # The slice 12 approval guard requires human approval when the design approval key is absent.
+        assert_artifact_blocks_merge(self, io, result, 'spec-guard 产物没核对到有效的批准：tasks/m/regression.md')
         self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
 
     def test_user_note_cannot_forge_a_machine_block(self):
@@ -943,27 +952,35 @@ class ModuleArtifactsTest(unittest.TestCase):
         io = self.io()
         io.view["modules"][0]["review"]["spec"] = "revised"
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "admission"))
-        self.assertIn("T4", res["reason"])
+        # R4 preserves the slice 12 approval guard for revised specs as human_only.
+        assert_artifact_blocks_merge(self, io, res, "spec-guard 产物没核对到有效的批准：spec/m.md")
         self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
     def test_codex_approval_not_counted_by_takeover_is_not_verified(self):
         io = self.io()
         io.view["modules"][0]["reviewApprovedBy"]["spec"] = None
-        self.assertEqual(run(io)["step"], "admission")
+        # The slice 12 approval guard keeps an approval without a recognized approver human_only.
+        assert_artifact_blocks_merge(self, io, run(io), "spec-guard 产物没核对到有效的批准：spec/m.md")
+        self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
-    def test_other_modules_artifacts_and_capability_map_stay_T4(self):
-        for f in ("spec/other.md", "spec/CAPABILITY-MAP.md", "tasks/other/plan.md"):
-            io = self.io(files=("spec/m.md", f))
-            res = run(io)
-            self.assertEqual(res["result"], "stopped", f)
-            self.assertIn(res["step"], ("risk", "admission"), f)  # the capability map never gets past the pre-check
-            self.assertEqual(io.merge_calls(), [], f)
+    def test_other_modules_artifacts_and_capability_map_require_human_approval(self):
+        cases = (
+            ("spec/other.md", "admission", "spec-guard 产物没核对到有效的批准：spec/other.md"),
+            ("spec/CAPABILITY-MAP.md", "risk", "能力图改动要用户批"),
+            ("tasks/other/plan.md", "admission", "spec-guard 产物没核对到有效的批准：tasks/other/plan.md"),
+        )
+        for path, step, reason in cases:
+            with self.subTest(path=path):
+                io = self.io(files=("spec/m.md", path))
+                # R4 keeps the slice 12 approval guard, with the capability map blocked at the risk pre-check.
+                assert_artifact_blocks_merge(self, io, run(io), reason, step)
 
     def test_no_map_view_verifies_nothing(self):
         io = self.io()
         io.view = None
-        self.assertEqual(run(io)["step"], "admission")
+        # The slice 12 approval guard leaves artifacts human_only when the map view is unavailable.
+        assert_artifact_blocks_merge(self, io, run(io), "spec-guard 产物没核对到有效的批准：spec/m.md")
+        self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
     def test_verify_artifacts_unit(self):
         view = {"modules": [{"id": "m", "review": {"spec": "approved", "plan": "codex-approved"},

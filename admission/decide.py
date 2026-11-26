@@ -36,9 +36,14 @@ def glob_match(pattern, path):
 
 
 def risk_item(risk):
-    verdict = "停下交你" if risk["stop"] else ("可自动合" if risk["auto_merge_eligible"] else "要你合")
-    detail = f"风险档 {risk['tier']}，{verdict}：{'；'.join(risk['reasons'])}"
-    return {"id": "risk", "ok": bool(risk["auto_merge_eligible"]), "detail": detail}, f"风险档 {risk['tier']}"
+    ok = bool(risk["auto_merge_eligible"]) and not risk.get("human_only", False)
+    verdict = "停下交你" if risk["stop"] else ("可自动合" if ok else "要你合")
+    human_reasons = risk.get("human_reasons", [])
+    summary = f"风险档 {risk['tier']}"
+    detail = f"{summary}，{verdict}：{'；'.join(risk['reasons'] + human_reasons)}"
+    if human_reasons:
+        summary += f"（{'；'.join(human_reasons)}）"
+    return {"id": "risk", "ok": ok, "detail": detail}, summary
 
 
 def load_bot_identity(path):

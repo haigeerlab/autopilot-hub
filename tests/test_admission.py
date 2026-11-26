@@ -85,6 +85,25 @@ class RiskItemTest(unittest.TestCase):
         self.assertIn("停下交你", item(res, "risk")["detail"])
         self.assertIn("风险档 T4", res["headline"])
 
+    def test_human_only_blocks_auto_merge_and_reports_every_reason(self):
+        risk = risk_of("skills/x.py")
+        self.assertTrue(risk["auto_merge_eligible"])
+        risk.update(human_only=True, human_reasons=["能力图改动要用户批", "压制注释净增加"])
+        res = run(risk, comments=[takeover("auto"), bot(evidence_body())])
+        self.assertFalse(res["auto_merge"])
+        entry = item(res, "risk")
+        self.assertFalse(entry["ok"])
+        self.assertIn("要你合", entry["detail"])
+        for reason in risk["human_reasons"]:
+            self.assertIn(reason, entry["detail"])
+            self.assertIn(reason, res["headline"])
+
+    def test_capability_map_risk_flows_through_to_admission(self):
+        res = run(risk_of("spec/CAPABILITY-MAP.md"), comments=[takeover("auto"), bot(evidence_body())])
+        self.assertFalse(res["auto_merge"])
+        self.assertIn("风险档 T2", item(res, "risk")["detail"])
+        self.assertIn("能力图改动要用户批", item(res, "risk")["detail"])
+
 
 class TakeoverItemTest(unittest.TestCase):
     def test_auto_is_ok(self):
