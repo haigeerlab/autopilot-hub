@@ -28,7 +28,7 @@
     },
     "haigeerlab/autopilot-sandbox": {
       "since": "2026-11-23",
-      "approval": "演练仓库；档位按用户原话设定（drill-mul 合并自动、drill-div 合并自动后经降级收窄为 plan、发布 auto-confirm），见 autopilot-sandbox 配置 PR",
+      "approval": "演练仓库；档位按用户原话设定（drill-mul 合并自动、drill-div 合并自动后经降级收窄为 plan、发布 auto-confirm），见 autopilot-sandbox 配置 PR；drill-pow 接管到合并（用户原话「对，drill-pow 接管到合并」，2026-11-26，S110 S6 演练）",
       "hub_pin": "9704e516f4fc3b7369f506ac66a50f074978e896",
       "takeover": {
         "project": {
@@ -36,7 +36,8 @@
         },
         "modules": {
           "drill-mul": "merge",
-          "drill-div": "plan"
+          "drill-div": "plan",
+          "drill-pow": "merge"
         }
       },
       "checkup": {
