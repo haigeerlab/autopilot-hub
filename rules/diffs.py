@@ -33,15 +33,29 @@ def files_from_diff(text):
 
     def flush():
         if cur is not None:
-            cur["patch"] = "\n".join(body)
+            header_name = cur.pop("header_name", None)
+            if cur.pop("binary", False):
+                cur["filename"] = cur["filename"] or header_name
+                cur["patch"] = None  # like the API: binary content cannot be checked
+            else:
+                cur["patch"] = "\n".join(body)
             files.append(cur)
 
     for raw in text.splitlines():
         if raw.startswith("diff --git "):
             flush()
             cur, body = {"filename": None, "status": "modified", "patch": ""}, []
+            # Binary diffs have no ---/+++ lines; take the name from the header when it is unambiguous.
+            m = re.match(r"diff --git a/(.+) b/(.+)\Z", raw)
+            if m and m.group(1) == m.group(2):
+                cur["header_name"] = m.group(2)
         elif cur is not None and raw.startswith("new file mode"):
             cur["status"] = "added"
+        elif cur is not None and raw.startswith("deleted file mode"):
+            cur["status"] = "removed"
+        elif cur is not None and not body and (raw == "GIT binary patch" or
+                                               (raw.startswith("Binary files ") and raw.endswith(" differ"))):
+            cur["binary"] = True
         elif cur is not None and raw.startswith("--- ") and not body:
             continue
         elif cur is not None and raw.startswith("+++ ") and not body:

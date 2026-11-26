@@ -69,7 +69,16 @@ MAX_FILE_BYTES = 1024 * 1024
 
 
 def _read(root, rel):
-    """Read bounded regular files only, including checking directory symlinks."""
+    """Read bounded regular UTF-8 files only, including checking directory symlinks."""
+    data = _read_bytes(root, rel)
+    try:
+        return None if data is None else data.decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def _read_bytes(root, rel):
+    """Bytes of a bounded regular file reached without symlinks, or None."""
     try:
         path = os.path.abspath(os.path.join(root, rel))
         parent = path
@@ -90,8 +99,8 @@ def _read(root, rel):
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
                 return None
             data = fh.read(MAX_FILE_BYTES + 1)
-        return data.decode("utf-8") if len(data) <= MAX_FILE_BYTES else None
-    except (OSError, ValueError, UnicodeError):
+        return data if len(data) <= MAX_FILE_BYTES else None
+    except (OSError, ValueError):
         return None
 
 
@@ -345,6 +354,9 @@ def c3(root):
         is_settings = rel == "scripts/validate.sh" or (rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml")))
         if not (is_test or is_settings):
             continue
+        data = _read_bytes(root, rel)
+        if data is not None and b"\0" in data:
+            continue  # binary fixture: cannot create a git repository
         text = _read(root, rel)
         if text is None:
             unreadable.append(rel)

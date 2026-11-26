@@ -28,6 +28,10 @@ PLUGIN = '{"name": "x", "version": "1.2.3"}'
 def write(root, rel, text):
     path = os.path.join(root, rel)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if isinstance(text, bytes):
+        with open(path, "wb") as fh:
+            fh.write(text)
+        return
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
 
@@ -155,6 +159,13 @@ class StandardItemsTest(unittest.TestCase):
         out = self.run_on({"src/app.py": "git init"})["规范C3"]
         self.assertEqual(out["status"], "ok")
         self.assertIn("测试没有创建 git 仓库", out["detail"])
+
+    def test_c3_skips_binary_test_fixtures(self):
+        files = {"tests/test_git.py": 'run(["git", "init"])\n"maintenance.auto"\n"gc.auto"\n',
+                 "tests/fixtures/logo.png": b"\x89PNG\r\n\x1a\n\x00\x00\xff\xfe"}
+        self.assertEqual(self.run_on(files)["规范C3"]["status"], "ok")
+        files["tests/fixtures/latin1.txt"] = b"caf\xe9\n"
+        self.assertEqual(self.run_on(files)["规范C3"]["status"], "unknown")
 
     def test_c4_python_matrix(self):
         workflow = ('name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n'

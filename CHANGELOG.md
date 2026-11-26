@@ -6,6 +6,11 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 ## [Unreleased]
 
+### Fixed
+- 体检规范 C3：测试目录里的二进制文件（含 NUL 字节）直接跳过，不再让整项变成「判断不了」；超过 1 MiB 或不是 UTF-8 的文本仍算读不了。
+- 规范 A1/A2 的本机 diff 模式：二进制文件的改动不再被悄悄丢掉，和 GitHub 接口模式一样列为「没法检查」；删除二进制文件不列。
+- `scripts/validate.sh --quick`：测试或模块把子目录加进搜索路径、再按名字导入时也能选中（按路径后缀补依赖，宁可多选）。hub 自己的选择结果不变。
+
 ### Removed
 - 删掉 `correction/cli.py` 里没人用的 `CANDIDATE_BLOCK` 正则（候选块照常写入）。`pipeline/engine.py` 写进本机账本的 `release_done` 是切片 14 Spec 定的发布完成记录，保留并在代码里注明暂无读取方。不需要升钉。
 

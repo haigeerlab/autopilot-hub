@@ -40,6 +40,25 @@ class AddedLinesTest(unittest.TestCase):
         self.assertEqual([f["filename"] for f in files], ["x.md", "y.md"])
         self.assertEqual(list(lp.added_lines(files[1])), [(1, "fresh")])
 
+    def test_binary_files_in_a_local_diff_are_unchecked(self):
+        diff = ("diff --git a/logo.png b/logo.png\nindex 1111111..2222222 100644\n"
+                "Binary files a/logo.png and b/logo.png differ\n"
+                "diff --git a/new.bin b/new.bin\nnew file mode 100644\nindex 0000000..3333333\n"
+                "GIT binary patch\nliteral 3\nKcmZ?wWB>pF0RRC2\n\nliteral 0\nHcmV?d00001\n\n"
+                "diff --git a/x.md b/x.md\n--- a/x.md\n+++ b/x.md\n@@ -1 +1,2 @@\n line\n+added\n")
+        files = lp.files_from_diff(diff)
+        self.assertEqual([(f["filename"], f["status"]) for f in files],
+                         [("logo.png", "modified"), ("new.bin", "added"), ("x.md", "modified")])
+        self.assertEqual(unchecked(files), ["logo.png", "new.bin"])
+        self.assertEqual(list(lp.added_lines(files[2])), [(2, "added")])
+
+    def test_removed_binary_file_in_a_local_diff_is_not_unchecked(self):
+        diff = ("diff --git a/old.png b/old.png\ndeleted file mode 100644\nindex 1111111..0000000\n"
+                "Binary files a/old.png and /dev/null differ\n")
+        files = lp.files_from_diff(diff)
+        self.assertEqual([(f["filename"], f["status"]) for f in files], [("old.png", "removed")])
+        self.assertEqual(unchecked(files), [])
+
     def test_empty_added_file_without_patch_is_checkable(self):
         files = [{"filename": "empty.txt", "status": "added", "patch": None, "additions": 0}]
         self.assertEqual(unchecked(files), [])
