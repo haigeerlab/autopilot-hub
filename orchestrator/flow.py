@@ -656,7 +656,7 @@ def unrecognised_reason(work, base_view):
                 "本机检查证据已写好")
     if owners:
         return ("改动同时在新流程模块 " + "、".join(owners) + " 的范围里，这个 PR 又没改任何一个模块的 spec/<id>.md "
-                "或 tasks/<id>/，拿不准属于哪个；勾上所属模块 tasks/<id>/todo.md 里完成的任务再运行")
+                "或 tasks/<id>/，拿不准属于哪个；勾上所属模块 tasks/<id>/todo.md 里完成的任务再运行；本机检查证据已写好")
     reason = ("这是 spec-guard 项目，但当前提交没有最终验收记录（不属于任何模块的 PR 也停在这里）。"
               "本机检查证据已写好，等 spec-guard 验收后再运行")
     if pending:
