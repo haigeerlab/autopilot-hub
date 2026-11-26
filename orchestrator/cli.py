@@ -1,6 +1,7 @@
 """`autopilot run`: drive one PR with the local orchestrator (slice 10). See orchestrator/flow.py.
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
+    python3 -B orchestrator/cli.py followups --repo haigeerlab/autopilot-sandbox --pr 1 [--json]
     python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --resume 9 [--confirm "..."]
@@ -785,6 +786,66 @@ def release(args):
     return result["code"]
 
 
+def followups(args):
+    """Recover post-merge notes only from trusted evidence and its exact local report."""
+    from admission.gate import current_evidence
+    try:
+        token = tokens.mint(args.repo, WRITE)
+    except tokens.TokenError as error:
+        print('autopilot: 换不出机器人令牌：%s' % error, file=sys.stderr)
+        return 2
+    try:
+        io = LocalIO(token, None)
+        bot = io.bot_identity()
+        if not bot:
+            raise flow.Stop('followups', 'hub 没配机器人身份，不能补开后续 issue')
+        pr = io.api(f'repos/{args.repo}/pulls/{args.pr}')
+        if not pr.get('merged'):
+            raise flow.Stop('followups', 'PR 还没有合并，不能开后续 issue')
+        comments = io.api(f'repos/{args.repo}/issues/{args.pr}/comments?per_page=100') or []
+        evidence = [p for p in current_evidence(
+            [flow.rest_comment(c) for c in sorted(comments, key=lambda c: c.get('id', 0))], bot, pr['head']['sha'])
+                    if p.get('_v') == 2]
+        if not evidence:
+            raise flow.Stop('followups', '没有绑定合并前 head 的机器人 v2 证据')
+        latest = evidence[-1]
+        module, patch_id = latest.get('module'), latest.get('patch_id')
+        verification = latest.get('verification')
+        if not isinstance(module, str) or not module.strip() or not isinstance(patch_id, str) \
+                or not re.fullmatch(r'[0-9a-fA-F]{40}', patch_id) or not isinstance(verification, dict):
+            raise flow.Stop('followups', 'v2 证据缺少有效的模块、补丁指纹或报告摘要')
+        try:
+            raw = io.read_bytes(io.verification_paths(args.repo, patch_id)[0])
+        except FileNotFoundError:
+            raise flow.Stop('followups', '本机验证报告不存在，不能补开后续 issue') from None
+        if hashlib.sha256(raw).hexdigest() != verification.get('report_sha256'):
+            raise flow.Stop('followups', '本机验证报告 sha256 与 v2 证据不符，不能补开后续 issue')
+        try:
+            report = json.loads(raw)
+        except ValueError:
+            raise flow.Stop('followups', '本机验证报告不是有效 JSON') from None
+        if not isinstance(report, dict) or not isinstance(report.get('notes'), list) or any(
+                not isinstance(note, dict) or not isinstance(note.get('title'), str) for note in report['notes']):
+            raise flow.Stop('followups', '本机验证报告的意见格式不对')
+        result = flow.open_followups(io, args.repo, args.pr, module, patch_id, report['notes'], bot)
+    except flow.Stop as error:
+        print('autopilot: ' + error.reason, file=sys.stderr)
+        return 1
+    except (ApiError, OSError, ValueError, KeyError, TypeError) as error:
+        print('autopilot: 补开后续 issue 的环境或调用失败：%s' % error, file=sys.stderr)
+        return 2
+    finally:
+        tokens.revoke(token)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+    else:
+        print('autopilot：新开 %s；追加 %s；跳过 %d 条；失败 %s' % (
+            '、'.join('#%s' % n for n in result['opened']) or '无',
+            '、'.join('#%s' % n for n in result['commented']) or '无', result['skipped'],
+            '、'.join(result['failed']) or '无'))
+    return 1 if result['failed'] else 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot local orchestrator (slice 10)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -793,6 +854,10 @@ def main(argv=None):
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
+    follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
+    follow.add_argument('--repo', required=True, help='owner/name')
+    follow.add_argument('--pr', required=True, type=int)
+    follow.add_argument('--json', action='store_true')
     bat = sub.add_parser("batch", help="推进一个 module-crew 合并第一段模块")
     bat.add_argument("--repo", required=True, help="owner/name")
     bat.add_argument("--dry-run", action="store_true", help="只读 first-stage 与 GitHub，不推分支、不开 PR、不验收、不合并")
@@ -814,6 +879,8 @@ def main(argv=None):
         return batch_command(a)
     if a.cmd == "release":
         return release(a)
+    if a.cmd == 'followups':
+        return followups(a)
     if a.cmd == "stats":
         try:
             token = tokens.mint(a.repo, READ)

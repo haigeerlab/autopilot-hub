@@ -7,6 +7,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 ## [Unreleased]
 
 ### Added
+- S110 切片 S4：新流程模块合并后，把合并前验证报告里的每条意见开成后续 issue（标签 `autopilot:followup`，标题「[跟进] 模块：意见」，带来源 PR 与补丁指纹）；同模块同标题已有机器人开的 issue 只追加评论，同一 PR 同一补丁重跑一律跳过。开失败不回滚合并，在 PR 上留补开命令 `orchestrator/cli.py followups --repo <owner/name> --pr <n>`（只认机器人 v2 证据与 sha256 对得上的本机报告）。不需要升钉。
 - S110 切片 S3：新流程模块的证据评论 `autopilot-evidence:v2`（补丁指纹、merge-base、模块、检查、合并前验证结论与报告／回归文档 sha256、已核对产物）；硬卡 `admission/gate.py` 同时认 v1 与 v2，v2 要求结论为 pass／pass-with-notes、模块与接管评论一致、仍绑定当前 head（工作流不重算补丁指纹，rebase 后由编排复用验证结论、重发绑定新 head 的证据）。编排在合并前验证成立后发 v2 证据、过本地准入并合并。切片 12 改档对新流程模块改为：需求由用户确认，且技术方案已批（用户或审查方）、不需要审或没有技术方案。新流程模块的接管评论带 `flow: v2`，硬卡据此只认 v2 证据，其他模块只认 v1。检查输出和意见标题写进机器人评论前转义 HTML 注释标记。**需要升钉**（改到 `admission/`）：本机编排用 hub 自己的准入代码判定，升钉前也照样自动合并；没升钉的仓库，远端准入检查（只报告、不拦）读不懂 v2，会显示「不会自动合并」。
 - S110 切片 S2 合并前验证（⑦）：spec-guard 新流程模块（`tier` 不为 null）由本机编排照回归文档执行用例、写 `spec-guard.verification/v1` 报告，交 spec-guard 0.96.0 校验并记录（`verify/core.py`、`orchestrator/flow.py` 的 `verify_module`）。与基础分支一致的命令用例自动执行，新增或改过的命令要你在跟踪 issue（`autopilot:verify`）回复「确认执行」后才跑；人工与 ai-operate 用例由你在跟踪 issue 回复结果。验证成立并记录后停下交你合，证据评论 v2 与硬卡在 S3 接上。老流程模块仍走 Codex 最终验收。不需要升钉（只改本机编排）。
 - `docs/plugin-standard.md`：《插件开发规范》正式存放处（现为 v1.7.3），附条目与 hub 检查的对应表。
