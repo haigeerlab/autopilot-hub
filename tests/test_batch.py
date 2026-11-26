@@ -105,6 +105,7 @@ class FakeBatchIO:
         self.data = data or first_stage()
         self.calls, self.pushes, self.comments, self.prs, self.events = [], [], [], [], []
         self.ancestors = set()
+        self.local_ancestors = set()  # (ancestor, descendant) pairs in the user's local checkout
         self.post_merge_status = "ahead"
         self.files = {}
         self.route = {"spec": None, "plan": None}
@@ -121,6 +122,10 @@ class FakeBatchIO:
 
     def first_stage(self, repo):
         return json.dumps(self.data)
+
+    def is_ancestor(self, repo, ancestor, descendant):
+        self.calls.append(("is_ancestor", ancestor, descendant))
+        return ancestor == descendant or (ancestor, descendant) in self.local_ancestors
 
     def api(self, path, method="GET", body=None):
         self.calls.append((method, path, body))
@@ -211,7 +216,7 @@ class BatchTest(unittest.TestCase):
             batch.parse_first_stage("not json", REPO)
 
     def test_candidates_skip_manual_remote_ancestors_and_merged_pr(self):
-        merges = [entry("manual", auto=False), entry("remote", "1" * 40), entry("done", "2" * 40), entry()]
+        merges = [entry("manual", "9" * 40, auto=False), entry("remote", "1" * 40), entry("done", "2" * 40), entry()]
         io = FakeBatchIO(first_stage(*merges))
         io.ancestors.add("1" * 40)
         io.prs.append(pull(merges[2], state="closed", merged=True))
@@ -229,6 +234,37 @@ class BatchTest(unittest.TestCase):
         self.assertIn("autopilot:authored", str(io.calls))
         for text in (HEAD, "b" * 40, "123", "指纹"):
             self.assertIn(text, created["body"])
+
+    def test_unpushed_manual_ancestor_stops_before_push(self):
+        manual = entry("human", "9" * 40, auto=False)
+        for order in ((manual, entry()), (entry(), manual)):  # list order must not matter
+            with self.subTest(first=order[0]["module"]):
+                io = FakeBatchIO(first_stage(*order))
+                io.local_ancestors.add(("9" * 40, HEAD))
+                result, run = self.run_batch(io)
+                self.assertEqual((result["code"], result["result"], result["step"]), (2, "stopped", "batch"), result)
+                self.assertIn("C123（模块 human）", result["reason"])
+                self.assertIn("还没推送", result["reason"])
+                self.assertEqual(io.pushes, [])
+                self.assertFalse(any(m == "POST" and p.endswith("/pulls") for m, p, *_ in io.calls))
+                run.assert_not_called()
+
+    def test_manual_ancestor_already_on_remote_base_is_pushed(self):
+        io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
+        io.local_ancestors.add(("9" * 40, HEAD))
+        io.ancestors.add("9" * 40)  # GitHub compare: already contained in the remote base
+        result, run = self.run_batch(io)
+        self.assertEqual(result["code"], 0, result)
+        self.assertEqual(io.pushes, [(REPO, HEAD, "autopilot/batch-m")])
+
+    def test_unpushed_manual_merge_off_the_pushed_history_does_not_block(self):
+        # Not an ancestor of the automatic merge commit (e.g. not on its first-parent chain): pushing
+        # the automatic merge cannot carry it, so it does not block.
+        io = FakeBatchIO(first_stage(entry("human", "9" * 40, auto=False), entry()))
+        result, run = self.run_batch(io)
+        self.assertEqual(result["code"], 0, result)
+        self.assertEqual(io.pushes, [(REPO, HEAD, "autopilot/batch-m")])
+        self.assertIn(("is_ancestor", "9" * 40, HEAD), io.calls)
 
     def test_open_batch_pr_is_resumed_before_new_candidate(self):
         io = FakeBatchIO(first_stage(entry("earlier", "1" * 40), entry()))
