@@ -162,7 +162,9 @@ class FlowV2ModulesTest(unittest.TestCase):
         self.assertEqual(result["problems"], [])
 
     def test_flow_v2_module_is_noted(self):
-        self.assertTrue(any("新流程" in n for n in run(self.flow_v2())["notes"]))
+        notes = run(self.flow_v2())["notes"]
+        self.assertTrue(any("新流程模块改由新流程检查判断（需求确认、重要需求技术方案、合并前验证）" in n for n in notes))
+        self.assertFalse(any("尚未接入" in n for n in notes))
 
     def test_flow_v2_skips_important_spec_and_rounds_too(self):
         m = module(spec="codex-approved", by_spec="codex", plan="codex-approved", by_plan="codex",

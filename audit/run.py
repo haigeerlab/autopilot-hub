@@ -2,6 +2,7 @@
 
 Pure logic over an `io` object (see audit/cli.py LiveIO for the real one, tests/test_audit_run.py for a fake):
   io.bot_identity() / io.baselines() -> {repo: entry} / io.snapshot(repo, ref) / io.degrade_issues(repo)
+  io.verification_records(repo, module_ids) -> {module_id: record or None}, or None without a local checkout
   io.today() -> "YYYY-MM-DD" / io.hub_api(path, method, body)
   io.edited_at(number) -> when the hub issue body was last edited, or None (REST updated_at moves on comments)
 Report only (M6): never changes a takeover level, never closes an issue.
@@ -11,6 +12,7 @@ import re
 
 from admission import decide as d
 from audit import config_check as cc
+from audit import flow_check as fc
 from audit import plan_check as pc
 
 HUB_REPO = "haigeerlab/autopilot-hub"
@@ -71,9 +73,16 @@ def audit_repo(io, repo, base, ref=None):
     problems = (cc.check_takeover(snap["takeover"], base) + cc.check_pins(snap["pins"], base)
                 + cc.check_checkup(snap["checkup"], base) + cc.check_degrade(degrade, repo))
     if snap.get("spec_guard"):
-        plan = pc.check_plan(snap.get("view"))
+        view = snap.get("view")
+        plan = pc.check_plan(view)
         problems += plan["problems"]
         out["notes"] += plan["notes"]
+        if isinstance(view, dict) and isinstance(view.get("modules"), list):
+            ids = [m.get("id") for m in view["modules"] if m.get("tier") is not None and m.get("status") == "done"]
+            records = io.verification_records(repo, ids) if ids else {}
+            flow = fc.check_flow(view, records)
+            problems += flow["problems"]
+            out["notes"] += flow["notes"]
     else:
         out["notes"].append("不是 spec-guard 项目，Plan 审批不查")
     problems.sort(key=lambda p: p["severity"] != "严重")

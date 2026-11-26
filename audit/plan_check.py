@@ -85,8 +85,7 @@ def check_plan(view):
                 mid, "、".join(reasons), spec)))
     if flow_v2:
         shown = "、".join(str(m) for m in flow_v2[:8]) + ("等" if len(flow_v2) > 8 else "")
-        notes.append("%d 个新流程模块不按老流程审批规则检查（Plan、重要需求 Spec、审查轮次都不查；Plan 写完即自动批准，"
-                     "需求确认与技术方案批准改由 S110 的新流程检查判断，尚未接入）：%s" % (len(flow_v2), shown))
+        notes.append("%d 个新流程模块改由新流程检查判断（需求确认、重要需求技术方案、合并前验证）：%s" % (len(flow_v2), shown))
     if unmarked:
         shown = "、".join(str(m) for m in unmarked[:8]) + ("等" if len(unmarked) > 8 else "")
         notes.append("%d 个已开工模块的 Plan 没有批准标记（多为用批准标记之前的旧模块），判不了：%s" % (len(unmarked), shown))

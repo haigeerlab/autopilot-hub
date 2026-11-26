@@ -42,13 +42,19 @@ def snapshot(**over):
 
 
 class FakeIO:
-    def __init__(self, baselines=None, snapshots=None, issues=(), degrade=()):
+    def __init__(self, baselines=None, snapshots=None, issues=(), degrade=(), records=None):
         self.bases = baselines if baselines is not None else {REPO: baseline()}
         self.snaps = snapshots or {REPO: snapshot()}
         self.issues = [dict(i) for i in issues]
         self.degrade = list(degrade)
         self.calls = []
         self.edited = {}
+        self.records = records
+        self.verification_calls = []
+
+    def verification_records(self, repo, module_ids):
+        self.verification_calls.append((repo, module_ids))
+        return self.records
 
     def edited_at(self, number):
         return self.edited.get(number)
@@ -100,6 +106,46 @@ class FakeIO:
 
 
 class RunTest(unittest.TestCase):
+    def flow_io(self, status="in_progress", confirmation="confirmed", **kw):
+        view = {"modules": [{"id": "flow", "tier": "normal", "status": status, "progress": {"done": 1},
+                             "requirementConfirm": {"status": confirmation, "by": "user"}, "reviewRounds": {}}]}
+        return FakeIO(snapshots={REPO: snapshot(view=view)}, **kw)
+
+    def test_unconfirmed_flow_opens_deduplicated_violation(self):
+        io = self.flow_io(confirmation="pending")
+        res = r.run(io)
+        self.assertEqual(res["repos"][0]["status"], "违规")
+        self.assertEqual(res["code"], 1)
+        created = io.created(r.VIOLATION_LABEL)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(r.payload(created[0][2]["body"], r.VIOLATION),
+                         {"repo": REPO, "kind": "requirement-not-confirmed"})
+        r.run(io)
+        self.assertEqual(len(io.created(r.VIOLATION_LABEL)), 1)
+        self.assertEqual(io.verification_calls, [])
+
+    def test_done_flow_with_local_record_is_clean(self):
+        io = self.flow_io(status="done", records={"flow": {"verdict": "pass"}})
+        res = r.run(io)
+        self.assertEqual(res["repos"][0]["status"], "合规")
+        self.assertEqual(res["code"], 0)
+        self.assertEqual(io.created(r.VIOLATION_LABEL), [])
+        self.assertEqual(io.verification_calls, [(REPO, ["flow"])])
+
+    def test_verification_only_reads_done_flow_modules(self):
+        for io in (FakeIO(), self.flow_io(), FakeIO(snapshots={REPO: snapshot(spec_guard=False)})):
+            with self.subTest(io=io):
+                r.run(io)
+                self.assertEqual(io.verification_calls, [])
+
+    def test_unavailable_map_is_reported_once(self):
+        for view in (None, {}, {"modules": None}):
+            with self.subTest(view=view):
+                io = FakeIO(snapshots={REPO: snapshot(view=view)})
+                res = r.run(io)
+                self.assertEqual([p["kind"] for p in res["repos"][0]["problems"]], ["map-unavailable"])
+                self.assertEqual(io.verification_calls, [])
+
     def test_clean_repo_only_comments_on_report(self):
         io = FakeIO()
         res = r.run(io)
