@@ -121,6 +121,8 @@ class Work:
         self.git("init", "-q")
         self.git("fetch", "-q", "--no-tags", "https://github.com/%s" % repo,
                  "+refs/heads/%s:refs/remotes/base" % self.base_ref, self.head)
+        # Let spec-guard's scope_base find the fetched base when trimming a rework.
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/base")
         self.base_tip = self.git("rev-parse", "refs/remotes/base").strip()
         self.merge_base = self.git("merge-base", self.base_tip, self.head).strip()
 
@@ -150,7 +152,8 @@ class Work:
             r = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, env=env, capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise flow.Stop("check", "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60))
+            reason = "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60)
+            raise flow.Stop("check", reason, failures={f"check:{command}": reason})
         return flow.check_result(r.returncode, r.stdout + "\n" + r.stderr)
 
     def regression(self, module, ref):
@@ -286,6 +289,30 @@ class Work:
         except (OSError, subprocess.TimeoutExpired, ValueError, flow.Stop):
             return False
         return isinstance(data, dict) and data.get("outside") == 0 and bool(data.get("files"))
+
+    def changed_existing_files(self, module):
+        """Return the baseline and paths that existed there and changed on the pinned head."""
+        base, source = self.merge_base, "merge-base"
+        root = find_spec_guard_root((0, 96, 0)) if module else None
+        hooks = os.path.join(root, "hooks") if root else None
+        if hooks and os.path.isfile(os.path.join(hooks, "module_scope.py")):
+            # scope_base also works for modules without an explicit scope boundary.
+            code = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+                    "from module_scope import scope_base\nprint(scope_base(Path(sys.argv[2]), sys.argv[3]) or '')")
+            try:
+                self.git("checkout", "-q", "--detach", self.head)
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", code, hooks, self.root, module],
+                                        cwd=self.root, env=_clean_env(), capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, timeout=120)
+                candidate = result.stdout.strip()
+                if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", candidate):
+                    base = self.git("rev-parse", "--verify", candidate + "^{commit}").strip()
+                    source = "scope_base"
+            except (OSError, subprocess.TimeoutExpired, UnicodeError, flow.Stop):
+                pass
+        # Disabling rename detection treats a moved test as a deletion of the existing path.
+        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", base, self.head, "--")
+        return base, source, [path for path in paths.split("\0") if path]
 
     @staticmethod
     def _parse(r):

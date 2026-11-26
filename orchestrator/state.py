@@ -12,6 +12,9 @@ from threading import get_ident
 import time
 
 
+REPAIR_LIMIT = 2
+
+
 class StateLockedError(RuntimeError):
     """Another holder owns the watch lock."""
 
@@ -191,6 +194,20 @@ class WatchState:
 
     def repair_count(self, repo, number, reason_key):
         return len(self.read()["repairs"].get(f"{repo}#{number}", {}).get(reason_key, []))
+
+    def record_failure(self, repo, number, reason_key, commit):
+        """Record the first failing head separately and return the counted repair commits."""
+        pr_key = f"{repo}#{number}"
+        with self._locked_snapshot() as data:
+            repairs = data["repairs"].get(pr_key, {}).get(reason_key, [])
+            first = data["prs"].get(pr_key, {}).get("firstFailures", {}).get(reason_key)
+            if first is None and not repairs:
+                data["prs"].setdefault(pr_key, {}).setdefault("firstFailures", {})[reason_key] = commit
+                self._write(data)
+            elif commit != first and commit not in repairs and len(repairs) < REPAIR_LIMIT:
+                self.record_repair(repo, number, reason_key, commit)
+                repairs.append(commit)
+            return repairs[:REPAIR_LIMIT]
 
     def intend(self, key, detail):
         """Persist a new intent and return whether it was recorded."""

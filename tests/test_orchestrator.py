@@ -21,8 +21,10 @@ from orchestrator import cli, flow
 from orchestrator.state import WatchState
 
 if __package__:
+    from ._checkup_util import commit_on_branch, git, make_repo, write_files
     from .test_verify import case
 else:
+    from _checkup_util import commit_on_branch, git, make_repo, write_files
     from test_verify import case
 
 REPO = "haigeerlab/autopilot-sandbox"
@@ -57,7 +59,11 @@ class FakeWork:
         self.base_tip = "t" * 40
 
     def regression(self, module, ref):
-        return self.io.regression_head if ref == HEAD else self.io.regression_base
+        return self.io.regression_head if ref == self.io.pr['head']['sha'] else self.io.regression_base
+
+    def changed_existing_files(self, module):
+        return (self.io.scope_base or self.merge_base, 'scope_base' if self.io.scope_base else 'merge-base',
+                self.io.changed_existing)
 
     def patch_id(self):
         return 'c' * 40
@@ -114,6 +120,7 @@ class FakeIO:
         self.bot = bot
         self.check_command, self.check_exit = check_command, check_exit
         self.check_results = {}
+        self.scope_base, self.changed_existing = None, []
         self.reports = list(reports if reports is not None else [report()])
         self.stored = stored
         self.merged_ok = merged_ok
@@ -1144,6 +1151,153 @@ class RunFailureRecordTest(RunRouteFixture):
         [notice] = self.state.pending_notifications()
         self.assertEqual(notice['target'], 'user')
         self.assertIn(str(error), notice['body'])
+
+
+class RepairLimitTest(RunRouteFixture):
+    def test_two_failed_repairs_pause_and_notify_once(self):
+        io = self.verify.io([case('R9')])
+        heads = ['a' * 40, 'e' * 40, 'c' * 40, 'd' * 40]
+
+        def execute(work, command, sha):
+            return {'exit': int(sha == io.pr['head']['sha']), 'timeout': False, 'output': 'regression'}
+
+        with mock.patch.object(FakeWork, 'run_case', execute):
+            for index, head in enumerate(heads):
+                io.pr['head']['sha'] = head
+                expected = 'stopped' if index < 2 else 'paused'
+                for _ in range(2):
+                    with self.subTest(head=head, result=expected):
+                        result = self.run_pr(io)
+                        self.assertEqual(result['result'], expected, result)
+                        self.assertEqual(self.state.repair_count(REPO, 7, 'case:R9'), min(index, 2))
+            exit_code, stdout = self.cli_run(io, '--json')
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout)['result'], 'paused')
+        self.assertEqual(self.state.read()['repairs'][f'{REPO}#7']['case:R9'], heads[1:3])
+        pause = self.state.get_pr(REPO, 7)['pause']
+        self.assertEqual(pause['reason'], '同一原因修了两次仍失败：case:R9')
+        self.assertEqual(pause['recovery'], '用户决定')
+        [notice] = self.state.pending_notifications()
+        self.assertEqual(notice['target'], 'user')
+        for value in ('case:R9', *heads[1:3], '继续修', '改方案', '交给你手工处理'):
+            self.assertIn(value, notice['body'])
+        self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_checks_and_review_findings_keep_separate_counts(self):
+        io = legacy_io(check_command='R9', check_exit=1)
+        first = {'id': 'R9', 'severity': 'blocking', 'title': 'Requires a fix'}
+        other = {'file': 'src/a.py', 'title': 'Missing assignment', 'severity': 'blocking', 'line': 7}
+        suggestion = {'id': 'advice', 'severity': 'suggestion'}
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        io.check_exit = 0
+        io.pr['head']['sha'] = 'b' * 40
+        review = dict(report_for(io.pr['head']['sha']), findings=[first, other, suggestion], review_outcome='findings')
+        io.acceptance_record = accepted(review, sha=io.pr['head']['sha'])
+        self.assertEqual(self.run_pr(io)['step'], 'review')
+        self.assertEqual(self.state.repair_count(REPO, 7, 'check:R9'), 0)
+        self.assertEqual(self.state.repair_count(REPO, 7, 'review:R9'), 0)
+        io.pr['head']['sha'] = 'c' * 40
+        review = dict(report_for(io.pr['head']['sha']), findings=[first, suggestion], review_outcome='findings',
+                      recheck={'items': [{'status': 'unresolved', 'finding': dict(other, line=13)}]})
+        io.acceptance_record = accepted(review, sha=io.pr['head']['sha'])
+        self.assertEqual(self.run_pr(io)['step'], 'review')
+        io.check_exit = 1
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        repairs = self.state.read()['repairs'][f'{REPO}#7']
+        self.assertEqual(len(repairs), 3, repairs)
+        self.assertEqual(repairs['check:R9'], ['c' * 40])
+        self.assertEqual(repairs['review:R9'], ['c' * 40])
+        [summary] = [key for key in repairs if key not in ('check:R9', 'review:R9')]
+        self.assertTrue(summary.startswith('review:'))
+        self.assertEqual(repairs[summary], ['c' * 40])
+
+    def test_failed_cases_count_even_if_spec_guard_cannot_record_the_report(self):
+        io = self.verify.io([case('R8'), case('R9')])
+        io.verify_code, io.verify_problem = 3, 'author-unknown'
+
+        def execute(work, command, sha):
+            return {'exit': int(sha == io.pr['head']['sha']), 'timeout': False, 'output': 'regression'}
+
+        with mock.patch.object(FakeWork, 'run_case', execute):
+            for head in (HEAD, 'e' * 40):
+                io.pr['head']['sha'] = head
+                self.assertIn('author-unknown', self.run_pr(io)['reason'])
+        self.assertEqual(self.state.read()['repairs'][f'{REPO}#7'], {'case:R8': [head], 'case:R9': [head]})
+
+    def test_existing_test_pauses_before_checks_and_exits_one(self):
+        io = self.new_flow()
+        io.scope_base, io.changed_existing = 'e' * 40, ['components/widget.spec.js']
+        io.pr['auto_merge'] = {'merge_method': 'squash'}
+        exit_code, stdout = self.cli_run(io, '--json')
+        self.assertEqual(exit_code, 1)
+        result = json.loads(stdout)
+        self.assertEqual(result['result'], 'paused')
+        self.assertEqual(result['repairBaseline'], {'source': 'scope_base', 'sha': io.scope_base})
+        reason = '修复时改了已有测试／回归测试文档：components/widget.spec.js'
+        self.assertEqual(self.state.get_pr(REPO, 7)['pause']['reason'], reason)
+        [notice] = self.state.pending_notifications()
+        self.assertEqual(notice['target'], 'user')
+        self.assertIn(reason, notice['body'])
+        self.assertEqual(io.ran, [])
+        self.assertEqual(io.case_runs, [])
+        self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+        self.assertIsNone(io.pr['auto_merge'])
+
+    def test_existing_regression_document_pauses_before_checks(self):
+        io = self.new_flow()
+        io.changed_existing = ['tasks/m/regression.md']
+        result = self.run_pr(io)
+        self.assertEqual(result['result'], 'paused', result)
+        self.assertEqual(result['reason'], '修复时改了已有测试／回归测试文档：tasks/m/regression.md')
+        self.assertEqual(result['repairBaseline'], {'source': 'merge-base', 'sha': 'b' * 40})
+        self.assertEqual(io.ran, [])
+        self.assertEqual(io.verify_calls, [])
+
+    def test_added_test_can_pass_and_evidence_names_the_fallback_baseline(self):
+        io = self.new_flow()
+        io.files.append({'filename': 'tests/test_added.py', 'status': 'added', 'additions': 1,
+                         'deletions': 0, 'patch': '+assert True'})
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        self.assertEqual(self.verify.evidence(io)['repairBaseline'], {'source': 'merge-base', 'sha': 'b' * 40})
+        self.assertEqual(self.state.pending_notifications(), [])
+
+    def test_dry_run_leaves_no_pause_or_notice(self):
+        io = self.new_flow()
+        io.changed_existing = ['tests/test_existing.py']
+        result = self.run_pr(io, dry_run=True)
+        self.assertEqual(result['result'], 'stopped', result)
+        self.assertIn('tests/test_existing.py', result['reason'])
+        self.assertIsNone(self.state.get_pr(REPO, 7))
+        self.assertEqual(self.state.pending_notifications(), [])
+        self.assertEqual(io.writes(), [])
+
+    def test_work_diffs_committed_files_against_scope_base_then_merge_base(self):
+        root = make_repo(self, {'tests/test_old.py': 'old\n', 'tasks/m/regression.md': 'original\n'})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.git_env = root, dict(os.environ)
+        scope_base = work.git('rev-parse', 'HEAD').strip()
+        write_files(root, {'tests/test_existing.py': 'existing\n'})
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'advance main')
+        work.merge_base = work.git('rev-parse', 'HEAD').strip()
+        commit_on_branch(root, {'tests/test_old.py': 'changed\n', 'tests/test_existing.py': 'changed\n',
+                                'tests/test_added.py': 'new\n', 'tasks/m/regression.md': 'edited\n'})
+        work.head = work.git('rev-parse', 'HEAD').strip()
+        git(root, 'checkout', '-q', 'main')
+        with tempfile.TemporaryDirectory() as plugin:
+            write_files(plugin, {'hooks/module_scope.py': (
+                'import subprocess\n'
+                'def scope_base(root, module):\n'
+                '    assert module == "m"\n'
+                '    return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD^^"], text=True).strip()\n'
+            )})
+            with mock.patch.object(cli, 'find_spec_guard_root', return_value=plugin):
+                self.assertEqual(work.changed_existing_files('m'), (scope_base, 'scope_base',
+                                 ['tasks/m/regression.md', 'tests/test_old.py']))
+        with mock.patch.object(cli, 'find_spec_guard_root', return_value=None):
+            self.assertEqual(work.changed_existing_files('m'), (work.merge_base, 'merge-base',
+                             ['tasks/m/regression.md', 'tests/test_existing.py', 'tests/test_old.py']))
 
 
 class DirectModeTest(RunRouteFixture):

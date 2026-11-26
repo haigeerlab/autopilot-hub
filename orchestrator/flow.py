@@ -21,7 +21,7 @@ from admission import decide as d
 from admission.gate import EVIDENCE_BLOCK
 from checkup import yamlsub
 from degrade.run import ApiError
-from orchestrator.state import WatchState
+from orchestrator.state import REPAIR_LIMIT, WatchState
 from pipeline import model as pipeline_model
 from risk import tiers as risk_tiers
 
@@ -36,9 +36,10 @@ RUN_LOCK_WAIT = 60
 class Stop(Exception):
     """A planned stop: `step` names where, `reason` says why and who has to act."""
 
-    def __init__(self, step, reason):
+    def __init__(self, step, reason, *, failures=None):
         super().__init__(f"{step}: {reason}")
         self.step, self.reason = step, reason
+        self.failures = failures or {}
 
 
 def block(name, payload):
@@ -286,11 +287,30 @@ def evaluate(io, repo, pr, bot, optimistic_artifacts=None, *, prospective_eviden
     return result
 
 
+def blocking_findings(report):
+    """Blocking or unknown-severity findings and unresolved findings from the previous review."""
+    findings = [f or {} for f in report.get("findings") or [] if (f or {}).get("severity") != "suggestion"]
+    findings.extend(item.get("finding") or item for item in ((report.get("recheck") or {}).get("items") or [])
+                    if (item or {}).get("status") == "unresolved")
+    return findings
+
+
 def blocking_of(report):
-    """Blocking set of a conclusive delegate report: blocking/unknown-severity findings + unresolved rechecks."""
-    n = sum(1 for f in report.get("findings") or [] if (f or {}).get("severity") != "suggestion")
-    n += sum(1 for i in ((report.get("recheck") or {}).get("items") or []) if (i or {}).get("status") == "unresolved")
-    return n
+    return len(blocking_findings(report))
+
+
+def review_failures(findings):
+    failures = {}
+    for finding in findings:
+        title = " ".join(str(finding.get("title") or finding.get("trigger") or "未命名审查意见").split())
+        path = finding.get("file")
+        identifier = finding.get("id")
+        if identifier is None or identifier == "":
+            # A line number or an index in a report can change as the patch is repaired.
+            summary = json.dumps([path, title], ensure_ascii=False)
+            identifier = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
+        failures[f"review:{identifier}"] = f"{path}：{title}" if path else title
+    return failures
 
 
 def conclusive(report):
@@ -345,14 +365,15 @@ def gate_review(report):
     return fp
 
 
-def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None, extra_checks=(), queue_check=None):
+def evidence_body(head, command, check, report, rounds, fp, acceptance=None, artifacts=None, extra_checks=(),
+                  queue_check=None, *, repair_baseline):
     checks = [dict(check, cmd=command)] + list(extra_checks)
     payload = {"head_sha": head, "runner": "autopilot-orchestrator",
                "checks": [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in checks],
                "review": {"backend": report.get("backend"), "status": report.get("execution_status"),
                           "outcome": report.get("review_outcome"), "fingerprint": fp,
                           "blocking": blocking_of(report), "rounds": rounds},
-               "acceptance": acceptance}
+               "acceptance": acceptance, "repairBaseline": repair_baseline}
     if artifacts is not None:
         payload["artifacts"] = artifacts
     check_lines = "\n".join(f"- 检查：`{c['cmd']}`，退出码 {c['exit']}（在一次性克隆里由本机编排重新运行）" for c in checks)
@@ -369,14 +390,15 @@ def evidence_body(head, command, check, report, rounds, fp, acceptance=None, art
             + block("autopilot-evidence", payload) + "\n")
 
 
-def evidence_v2_body(head, base, module, command, check, verification, artifacts, extra_checks=(), queue_check=None):
+def evidence_v2_body(head, base, module, command, check, verification, artifacts, extra_checks=(), queue_check=None,
+                     *, repair_baseline):
     """Render flow v2 evidence from the established verification and the checks just executed."""
     checks = [dict(check, cmd=command)] + list(extra_checks)
     payload = {"head_sha": head, "base_sha": base, "patch_id": verification["patch_id"],
                "module": module, "runner": "autopilot-orchestrator",
                "checks": [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in checks],
                "verification": {k: verification[k] for k in ("verdict", "report_sha256", "regression_sha256")},
-               "artifacts": artifacts}
+               "artifacts": artifacts, "repairBaseline": repair_baseline}
     check_lines = "\n".join(f"- 检查：`{c['cmd']}`，退出码 {c['exit']}（在一次性克隆里由本机编排重新运行）" for c in checks)
     notes = "\n".join("- 意见：" + defang(title) for title in verification["notes"])
     queue_line = ""
@@ -540,6 +562,11 @@ def verification_state(view, module):
                  if m.get('id') == module), {})
 
 
+def case_failures(results):
+    return {f"case:{case['id']}": f"{case['id']}（{case['failCategory']}）"
+            for case in results if case['result'] == 'fail'}
+
+
 def verify_module(io, repo, pr, work, module, notes, dry_run):
     from verify.core import select_cases, parse_replies, case_result, build_report, new_executor
     head = pr['head']['sha']
@@ -627,24 +654,29 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
         if pending_confirm or pending_manual:
             wanted = (["确认执行 " + ' '.join(pending_confirm)] if pending_confirm else []) \
                 + (["要你测 " + ' '.join(pending_manual)] if pending_manual else [])
-            raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：" + '；'.join(wanted))
+            raise Stop('verification', f"等你在跟踪 issue #{issue['number']} 回复：" + '；'.join(wanted),
+                       failures=case_failures(results))
         report = build_report(module, doc, work.merge_base, head, patch_id, new_executor(), results, replies['notes'])
         write_json(report_path, report)
     digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
-    with io.verification_worktree(repo, head, pr['base']['ref']) as root:
-        code, data, text = io.verification_check(root, module, report_path)
-        if code:
-            prefix = 'spec-guard 判报告不成立：' if code == 1 else ('spec-guard 判不了：' if code == 3 else 'spec-guard 校验失败：')
-            raise Stop('verification', prefix + problems(data))
-        code, data, text = io.verification_record(root, module, report_path)
-        if code:
-            raise Stop('verification', 'spec-guard 记录失败：' + problems(data))
-        state = verification_state(io.verification_view(root), module)
-        if not (state.get('current') is True and state.get('reportSha256') == digest and state.get('verdict') == report['verdict']):
-            raise Stop('verification', '记录后 map view 的 verification 与报告对不上（current／reportSha256／verdict）')
+    failures = case_failures(report['cases']) if report['verdict'] == 'fail' else {}
+    try:
+        with io.verification_worktree(repo, head, pr['base']['ref']) as root:
+            code, data, text = io.verification_check(root, module, report_path)
+            if code:
+                prefix = 'spec-guard 判报告不成立：' if code == 1 else ('spec-guard 判不了：' if code == 3 else 'spec-guard 校验失败：')
+                raise Stop('verification', prefix + problems(data))
+            code, data, text = io.verification_record(root, module, report_path)
+            if code:
+                raise Stop('verification', 'spec-guard 记录失败：' + problems(data))
+            state = verification_state(io.verification_view(root), module)
+            if not (state.get('current') is True and state.get('reportSha256') == digest and state.get('verdict') == report['verdict']):
+                raise Stop('verification', '记录后 map view 的 verification 与报告对不上（current／reportSha256／verdict）')
+    except Stop as error:
+        error.failures.update(failures)
+        raise
     if report['verdict'] == 'fail':
-        failures = '、'.join(c['id'] + '（' + str(c['failCategory']) + '）' for c in report['cases'] if c['result'] == 'fail')
-        raise Stop('verification', '合并前验证不通过：' + failures)
+        raise Stop('verification', '合并前验证不通过：' + '、'.join(failures.values()), failures=failures)
     return dict(verdict=report['verdict'], report_sha256=digest, regression_sha256=doc['sha256'],
                 patch_id=patch_id, notes=[note['title'] for note in report.get('notes', [])])
 
@@ -943,14 +975,49 @@ def record_automerge_on(io, repo, number, head, key, state, bot, say, notes):
     return message
 
 
+def protected_repair_paths(paths):
+    # Use the same template and matcher as the risk classifier's is_test predicate.
+    test_patterns = risk_tiers.load_templates()["test_files"]
+    return [path for path in paths if risk_tiers.any_match(test_patterns, path) is not None
+            or re.fullmatch(r"tasks/[^/]+/regression\.md", path)]
+
+
+def pause_for_repair(state, repo, number, head, stop):
+    if stop.step != "repair-guard" and not stop.failures:
+        return None
+    with state.lock(wait_seconds=RUN_LOCK_WAIT):
+        notices = []
+        if stop.step == "repair-guard":
+            notices.append((stop.reason, head, stop.reason))
+        for key, detail in sorted(stop.failures.items()):
+            commits = state.record_failure(repo, number, key, head)
+            if len(commits) < REPAIR_LIMIT:
+                continue
+            reason = f"同一原因修了两次仍失败：{key}"
+            body = (f"{reason}。{detail}。已试过提交 {'、'.join(commits)}。\n"
+                    "可让会话继续修并重新验证，也可改方案后重新确认，或交给你手工处理。")
+            notices.append((reason, ",".join(commits), body))
+        if not notices:
+            return None
+        reason = notices[0][0]
+        recovery = "用户决定"
+        state.pause_pr(repo, number, reason, recovery)
+        for notice_reason, notice_id, body in notices:
+            digest = hashlib.sha256(f"{notice_reason}\0{notice_id}".encode("utf-8")).hexdigest()
+            state.enqueue_notification("user", f"{repo}#{number} 已暂停。{defang(body)}\n等待{recovery}。",
+                                       f"{repo}:{number}:repair-paused:{digest}")
+        return reason
+
+
 def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notify=None, author_host=None,
         sleep=time.sleep):
     """Check one PR and return its result, route, and evidence context."""
-    notes, pr = [], None
+    notes, pr, head = [], None, None
     result_info, manual_reasons = {}, []
     checking = False
     automerge_key = None
     queue_check = None
+    fallback_note = ""
     bot = io.bot_identity()
     # Batch uses the existing explicit direct-merge path and its existing token permissions.
     batch_merge = merge_method is not None
@@ -1011,7 +1078,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             result_info.update(route="direct", routeReasons=["mergeMode=direct"])
         with io.checkout(repo, pr) as work:
             base_view = None
-            new_modules = []
+            new_modules, module_candidates = [], []
             if not dependabot:
                 changed = [f.get("filename") for f in io.api(f"repos/{repo}/pulls/{number}/files?per_page=100") or []]
                 base_view = work.base_view()
@@ -1022,6 +1089,21 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                     raise Stop('verification', '这个 PR 改到了多个新流程模块（' + '、'.join(new_modules) + '），拿不准属于哪个')
                 if new_modules and extra is not None and extra.get('module') != new_modules[0]:
                     raise Stop('batch', 'batch 的模块与新流程识别结果不符')
+                module_candidates = new_modules or io.find_modules(repo, head)
+
+            checking = True
+            scope_module = module_candidates[0] if len(module_candidates) == 1 else None
+            baseline, baseline_source, existing_paths = work.changed_existing_files(scope_module)
+            repair_baseline = dict(source=baseline_source, sha=baseline)
+            result_info["repairBaseline"] = repair_baseline
+            if baseline_source == "merge-base":
+                fallback_note = f"取不到 spec-guard scope_base，保护已有测试使用 PR 的 merge base `{baseline}`。"
+                notes.append(fallback_note)
+            protected = protected_repair_paths(existing_paths)
+            if protected:
+                raise Stop("repair-guard", "修复时改了已有测试／回归测试文档：" + "、".join(protected))
+
+            if not dependabot:
                 merges = [view_merge(base_view, m.get("id")) for m in modules if isinstance(m, dict)] \
                     if isinstance(modules, list) else []
                 if not any(merge == "auto" for merge, _ in merges):
@@ -1043,13 +1125,13 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                         raise Stop("risk", risk_item["detail"])
                     manual_reasons.append(risk_item["detail"])
 
-            checking = True
             command = work.find_check()
             if not command:
                 raise Stop("check", "基础分支上找不到检查命令（interface.yml 的 entries.check.run 或 PR workflow），硬卡无法满足")
             check = work.run_check(command)
             if check["exit"] != 0:
-                raise Stop("check", f"检查 `{command}` 退出码 {check['exit']}，交作者修")
+                reason = f"检查 `{command}` 退出码 {check['exit']}，交作者修"
+                raise Stop("check", reason, failures={f"check:{command}": reason})
             evidence = check_evidence(repo, head, command, check, io.now())
             io.write_check_evidence(repo, evidence)
             try:
@@ -1066,15 +1148,17 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 try:
                     result = work.run_check(cmd)
                 except Stop as error:
-                    raise Stop("pre-merge", "合并前追加步骤 %s：%s" % (identifier, error.reason)) from error
+                    failures = {f"check:{identifier}": error.reason} if error.failures else None
+                    raise Stop("pre-merge", "合并前追加步骤 %s：%s" % (identifier, error.reason), failures=failures) from error
                 evidence["checks"].append(dict(result, cmd=cmd))
                 io.write_check_evidence(repo, evidence)
                 if result["exit"] != 0:
-                    raise Stop("pre-merge", "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"]))
+                    reason = "合并前追加步骤 %s `%s` 退出码 %d，交作者修" % (identifier, cmd, result["exit"])
+                    raise Stop("pre-merge", reason, failures={f"check:{identifier}": reason})
             module = acceptance = artifacts = verification = None
             flow_v2 = False
             if not dependabot:
-                modules = new_modules or io.find_modules(repo, head)
+                modules = module_candidates
                 if not modules:
                     raise Stop("acceptance", unrecognised_reason(work, base_view))
                 if len(modules) > 1:
@@ -1096,8 +1180,10 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 else:
                     acceptance, report = accepted_review(io, repo, module, head)
                     fp, rounds = gate_review(report), 1
-                    if blocking_of(report):
-                        raise Stop("review", f"验收审查报告里还有 {blocking_of(report)} 条 blocking")
+                    findings = blocking_findings(report)
+                    if findings:
+                        raise Stop("review", f"验收审查报告里还有 {len(findings)} 条 blocking",
+                                   failures=review_failures(findings))
                     notes.append(f"模块 {module} 沿用 spec-guard 的验收审查报告，不另审")
                 if not (dry_run and flow_v2):
                     artifacts = {"module": module, "verified": verify_artifacts(work.module_view(), module, changed,
@@ -1128,16 +1214,18 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             return finish("dry-run", "evidence", "预演：已跑完仓库检查，没有发证据、没有合并")
         if flow_v2:
             body = evidence_v2_body(head, merge_base, module, command, check, verification, artifacts,
-                                    extra_checks=evidence["checks"][1:], queue_check=queue_check)
+                                    extra_checks=evidence["checks"][1:], queue_check=queue_check,
+                                    repair_baseline=repair_baseline)
         elif dependabot:
             checks = [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in evidence["checks"]]
             body = (f"**autopilot 依赖更新检查证据**（提交 `{head[:12]}`）\n\n"
                     + "\n".join(f"- 检查：`{defang(c['cmd'])}`，退出码 {c['exit']}" for c in checks) + "\n\n"
                     + block("autopilot-evidence", {"head_sha": head, "runner": "autopilot-orchestrator",
-                                                   "checks": checks}) + "\n")
+                                                   "checks": checks, "repairBaseline": repair_baseline}) + "\n")
         else:
             body = evidence_body(head, command, check, report, rounds, fp, acceptance, artifacts,
-                                 extra_checks=evidence["checks"][1:], queue_check=queue_check)
+                                 extra_checks=evidence["checks"][1:], queue_check=queue_check,
+                                 repair_baseline=repair_baseline)
 
         blocks = list(EVIDENCE_BLOCK.finditer(body))
         match = blocks[0] if len(blocks) == 1 else None
@@ -1245,16 +1333,19 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
         if automerge_key is not None:
             pause_automerge(repo, number, head, s.reason, notify, state)
             return finish("paused", s.step, s.reason)
+        pause_reason = None if dry_run else pause_for_repair(state, repo, number, head, s)
         if checking and not (dry_run or batch_merge):
             try:
                 verification_status(io, repo, head, "failure", "合并前验证未通过")
             finally:
                 disable_queued_automerge(io, repo, number)
-        if manual_reasons and not result_info:
+        if manual_reasons and "route" not in result_info:
             result_info.update(route="manual", routeReasons=manual_reasons)
+        reason = pause_reason or s.reason
         if pr is not None and s.step != "identity":
-            say(f"{RUN_MARKER}\nautopilot 停在「{s.step}」：{s.reason}")
-        return finish("stopped", s.step, s.reason)
+            message = f"{RUN_MARKER}\nautopilot 停在「{s.step}」：{defang(reason)}"
+            say(message + ("\n" + fallback_note if fallback_note else ""))
+        return finish("paused" if pause_reason else "stopped", s.step, reason)
 
 
 REWORK_DAYS = 14

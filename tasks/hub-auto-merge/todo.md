@@ -14,10 +14,10 @@
 - [x] Task 4：automerge 路线与回退
   - 验证：R1、R6
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
-- [ ] Task 5：修复上限与「不许改裁判」
+- [x] Task 5：修复上限与「不许改裁判」
   - 验证：R9
   - 文件：`orchestrator/flow.py`、`orchestrator/state.py`、`tests/test_orchestrator.py`
-- [ ] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过
+- [x] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过（2026-11-27 按回归文档命令逐条执行全部 OK；回归文档命令加 PYTHONPATH=tests 前缀，见其变更记录）
 - [ ] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」
 - [ ] Task 6：ai-operate 交 delegate
   - 验证：R7
