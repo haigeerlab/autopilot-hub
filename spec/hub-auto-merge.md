@@ -1,5 +1,7 @@
 # 需求：hub-auto-merge
 
+<!-- spec-guard: review approved f339792be46b -->
+
 <!-- spec-guard: flow v2 tier=important -->
 
 ## 目标
