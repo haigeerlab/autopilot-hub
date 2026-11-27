@@ -1,7 +1,7 @@
 """Check a PR, publish verification on its head, and choose a merge route as the autopilot App bot.
 
 Direct merges still require live admission on the checked head. Flow v2 uses regression verification;
-older modules reuse recorded final acceptance. Dependabot PRs only run repository checks and risk grading.
+older modules reuse recorded final acceptance. Dependabot and unassigned PRs only run repository checks and risk grading.
 """
 import base64
 import hashlib
@@ -30,6 +30,7 @@ TAIL = 40
 AUTHORED = "autopilot:authored"
 AUTO_MERGED = "autopilot:auto-merged"
 VERIFIED = "autopilot/verified"
+UNASSIGNED_HANDOFF = "未归属模块，交你合并"
 RUN_LOCK_WAIT = 60
 
 
@@ -889,12 +890,15 @@ def automerge_hold_reasons(state, repo):
     return reasons
 
 
-def choose_route(io, repo, base_ref, state, config, bot, *, direct, dependabot, flow_v2, decision, reasons):
+def choose_route(io, repo, base_ref, state, config, bot, *, direct, dependabot, flow_v2, decision, reasons,
+                 unassigned=False):
     """Select a route, collecting unmet preconditions in the order they are checked."""
     if direct:
         return "direct", ["mergeMode=direct", *reasons]
     holds = automerge_hold_reasons(state, repo)
     reasons = [*reasons, *holds]
+    if unassigned:
+        return "manual", [*reasons, UNASSIGNED_HANDOFF]
     if dependabot:
         return "manual", [*reasons, "Dependabot 依赖更新由人合并"]
     if not flow_v2:
@@ -1234,16 +1238,14 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
         if not sg_project:
             takeover = read_takeover(io, repo, base_ref, notes)
             say_takeover(say, None, "human", takeover["source"])
-            raise Stop("takeover", "本仓库不是 spec-guard 项目，没有回归文档；按已批方案一律交你合")
+            if batch_merge:
+                raise Stop("takeover", "本仓库不是 spec-guard 项目，没有回归文档；按已批方案一律交你合")
 
         config = {} if batch_merge else io.local_config()
-        direct = not dependabot and (batch_merge or config.get("mergeMode") == "direct")
-        if direct and not batch_merge:
-            result_info.update(route="direct", routeReasons=["mergeMode=direct"])
         with io.checkout(repo, pr) as work:
             base_view = None
             new_modules, module_candidates = [], []
-            if not dependabot:
+            if sg_project and not dependabot:
                 changed = [f.get("filename") for f in io.api(f"repos/{repo}/pulls/{number}/files?per_page=100") or []]
                 base_view = work.base_view()
                 modules = base_view.get("modules") if isinstance(base_view, dict) else None
@@ -1254,6 +1256,12 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 if new_modules and extra is not None and extra.get('module') != new_modules[0]:
                     raise Stop('batch', 'batch 的模块与新流程识别结果不符')
                 module_candidates = new_modules or io.find_modules(repo, head)
+
+            unassigned = not sg_project or (not batch_merge and not dependabot and not module_candidates)
+            checks_only = dependabot or unassigned
+            direct = not checks_only and (batch_merge or config.get("mergeMode") == "direct")
+            if direct and not batch_merge:
+                result_info.update(route="direct", routeReasons=["mergeMode=direct"])
 
             checking = True
             if not batch_merge:
@@ -1271,7 +1279,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 if protected:
                     raise Stop("repair-guard", "修复时改了已有测试／回归测试文档：" + "、".join(protected))
 
-            if not dependabot:
+            if not checks_only:
                 merges = [view_merge(base_view, m.get("id")) for m in modules if isinstance(m, dict)] \
                     if isinstance(modules, list) else []
                 if not any(merge == "auto" for merge, _ in merges):
@@ -1325,7 +1333,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                     raise Stop("pre-merge", reason, failures={f"check:{identifier}": reason})
             module = acceptance = artifacts = verification = None
             flow_v2 = False
-            if not dependabot:
+            if not checks_only:
                 modules = module_candidates
                 if not modules:
                     raise Stop("acceptance", unrecognised_reason(work, base_view))
@@ -1362,15 +1370,16 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             if not (dry_run or batch_merge):
                 patch_id = verification["patch_id"] if flow_v2 else work.patch_id()
 
-        if dependabot:
-            dependency_risk = classify_pr_risk(io, repo, pr, set())
-            risk_item, _ = d.risk_item(dependency_risk)
+        if checks_only:
+            risk = classify_pr_risk(io, repo, pr, set())
+            risk_item, _ = d.risk_item(risk)
             if not risk_item["ok"]:
                 manual_reasons.append(risk_item["detail"])
 
         if dry_run:
             route, reasons = choose_route(io, repo, base_ref, state, config, bot, direct=direct,
-                                          dependabot=dependabot, flow_v2=flow_v2, decision=None, reasons=manual_reasons)
+                                          dependabot=dependabot, flow_v2=flow_v2, decision=None, reasons=manual_reasons,
+                                          unassigned=unassigned)
             result_info.update(route=route, routeReasons=reasons)
             if route == "automerge":
                 notes.append("预演：验证和准入通过后，写入 automerge-requested，添加 autopilot:authored，"
@@ -1384,9 +1393,10 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             body = evidence_v2_body(head, merge_base, module, command, check, verification, artifacts,
                                     extra_checks=evidence["checks"][1:], queue_check=queue_check,
                                     repair_baseline=repair_baseline)
-        elif dependabot:
+        elif checks_only:
             checks = [{k: c[k] for k in ("cmd", "exit", "output_sha256")} for c in evidence["checks"]]
-            body = (f"**autopilot 依赖更新检查证据**（提交 `{head[:12]}`）\n\n"
+            subject = "未归属模块" if unassigned else "依赖更新"
+            body = (f"**autopilot {subject}检查证据**（提交 `{head[:12]}`）\n\n"
                     + "\n".join(f"- 检查：`{defang(c['cmd'])}`，退出码 {c['exit']}" for c in checks) + "\n\n"
                     + block("autopilot-evidence", {"head_sha": head, "runner": "autopilot-orchestrator",
                                                    "checks": checks, "repairBaseline": repair_baseline}) + "\n")
@@ -1404,19 +1414,20 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
         expected = {k: verification[k] for k in ("verdict", "report_sha256", "regression_sha256")} if flow_v2 else None
         if not isinstance(payload, dict) or (flow_v2 and (match[1] != "2" or payload.get("verification") != expected)):
             raise Stop("verification", "证据评论的合并前验证与已成立的报告不一致，没有发证据")
-        checking = False
+        checking = checks_only
 
         if not batch_merge:
             decision = None
-            if not (direct or dependabot):
+            if not (direct or checks_only):
                 decision = evaluate(io, repo, pr, bot, prospective_evidence=body)
             route, reasons = choose_route(io, repo, base_ref, state, config, bot, direct=direct,
-                                          dependabot=dependabot, flow_v2=flow_v2, decision=decision, reasons=manual_reasons)
+                                          dependabot=dependabot, flow_v2=flow_v2, decision=decision, reasons=manual_reasons,
+                                          unassigned=unassigned)
             result_info.update(route=route, routeReasons=reasons, validatedHeadOid=head, validatedBaseOid=base_tip)
             metadata = {k: result_info[k] for k in ("route", "routeReasons", "validatedHeadOid", "validatedBaseOid")}
             metadata.update(patch_id=patch_id, authorHost=author_host)
-            if dependabot:
-                metadata["riskTier"] = dependency_risk["tier"]
+            if checks_only:
+                metadata["riskTier"] = risk["tier"]
             if route != "automerge":
                 # A new success status can unblock a queue left by an earlier run.
                 disable_queued_automerge(io, repo, number)
@@ -1425,14 +1436,18 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
             if not evidence_url:
                 raise ApiError("读不到验证证据评论的地址")
             status_description = f"补丁 {patch_id[:12]}，基础提交 {base_tip[:12]}"
+            if unassigned:
+                status_description = f"{UNASSIGNED_HANDOFF}。{status_description}"
+            if checks_only:
+                # Recheck after the repository checks and evidence posting, before success can unblock a merge.
+                late_degrade, _ = d.degrade_item(active_degrade_issues(io, repo), repo)
+                if not late_degrade["ok"]:
+                    raise Stop("admission", late_degrade["detail"])
+            checking = False
             if route != "automerge":
                 verification_status(io, repo, head, "success", status_description, evidence_url)
             if route == "manual":
-                if dependabot:
-                    late_degrade, _ = d.degrade_item(active_degrade_issues(io, repo), repo)
-                    if not late_degrade["ok"]:
-                        raise Stop("admission", late_degrade["detail"])
-                elif any(item["id"] == "degrade" and not item["ok"] for item in decision["items"]):
+                if decision and any(item["id"] == "degrade" and not item["ok"] for item in decision["items"]):
                     raise Stop("admission", decision["headline"])
                 hand_to_user(io, repo, number, head, base_tip, notify, state, bot, say, reasons)
                 return finish("handed-to-user", "merge", "由你合并")
