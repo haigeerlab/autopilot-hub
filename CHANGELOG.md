@@ -6,6 +6,9 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 
 ## [Unreleased]
 
+### Documentation
+- README「打开自动路之前」清单按检查点 5 沙盒实测补四项：本机 `config.json` 配 `appId`；watch 的发件身份在 agent-relay 登记；主干规则用规则集（旧版分支保护需 App 有 Administration 只读权限）；新流程模块的开发会话先登记作者。不需要升钉。
+
 ### Changed
 - 合规监测（`audit`）新流程检查：重要需求模块的技术方案，在 spec-guard 的模块接管档位 `takeover.design` 为 `reviewer` 时，审查者批准（`approvedBy` 为 `reviewer`）也算合规；其余情况仍只认你批的，否则照旧报严重 `important-design-not-user`。配合 spec-guard 模块 sg-review-rules（技术方案可由审查者放行）。spec-guard 现有版本对重要需求的有效档位固定为人批，所以在它发版前行为不变。不需要升钉。
 
