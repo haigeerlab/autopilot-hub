@@ -62,6 +62,7 @@ DELEGATE_AI_MINIMUM = (0, 13, 2)
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 RUN_WRITE = dict(WRITE, statuses="write")
 WATCH = dict(WRITE, contents="read", statuses="read", actions="write")
+WATCH_DISABLE = {"contents": "write", "pull_requests": "write"}
 WATCH_NARROW = {"contents": "write", "pull_requests": "write"}
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
@@ -1311,15 +1312,37 @@ class WatchNarrowIO:
 def watch_round(state):
     connections = {}
 
+    def mint_io(repo, permissions):
+        try:
+            credential = tokens.mint(repo, permissions)
+        except (ValueError, TypeError, KeyError) as error:
+            raise tokens.TokenError("换取机器人令牌时返回了无效数据") from error
+        return LocalIO(credential, None)
+
     def io_for(repo, *, narrow=False):
         key = repo, narrow
         if key not in connections:
-            try:
-                credential = tokens.mint(repo, WATCH_NARROW if narrow else WATCH)
-            except (ValueError, TypeError, KeyError) as error:
-                raise tokens.TokenError("换取机器人令牌时返回了无效数据") from error
-            connections[key] = LocalIO(credential, None)
+            connections[key] = mint_io(repo, WATCH_NARROW if narrow else WATCH)
         return connections[key]
+
+    def revoke(repo, io):
+        try:
+            tokens.revoke(io.token)
+        except watch.WATCH_ERRORS as error:
+            reason, recovery = watcher.error(repo, "撤销机器人令牌", error, io=io)
+            state.set_repo(repo, pause=watcher.paused(reason, recovery))
+
+    def disable_automerge(io, repo, number):
+        def mutate(path, method, body):
+            write_io = mint_io(repo, WATCH_DISABLE)
+            try:
+                return write_io.api(path, method, body)
+            except ApiError as error:
+                raise ApiError(str(error).replace(write_io.token, "[redacted]")) from None
+            finally:
+                revoke(repo, write_io)
+
+        flow.disable_queued_automerge(io, repo, number, mutation_api=mutate)
 
     def narrow(io, repo, base, number, state):
         bot = io.bot_identity()
@@ -1330,16 +1353,13 @@ def watch_round(state):
         flow.narrow_pending(WatchNarrowIO(io, io_for, state), repo, base, [issue], project, bot, [], False)
 
     watcher = watch.Watch(state, LocalIO.local_config(), io_for, followups=recover_followups,
-                          narrow=narrow, ledger=LocalIO.ledger, ledger_events=LocalIO.ledger_events)
+                          disable_automerge=disable_automerge, narrow=narrow,
+                          ledger=LocalIO.ledger, ledger_events=LocalIO.ledger_events)
     try:
         watcher.round()
     finally:
         for (repo, _), io in connections.items():
-            try:
-                tokens.revoke(io.token)
-            except watch.WATCH_ERRORS as error:
-                reason, recovery = watcher.error(repo, "撤销机器人令牌", error, io=io)
-                state.set_repo(repo, pause=watcher.paused(reason, recovery))
+            revoke(repo, io)
     return 1 if watcher.failed else 0
 
 
