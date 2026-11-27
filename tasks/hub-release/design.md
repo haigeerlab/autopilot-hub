@@ -35,72 +35,86 @@
 
 ## 实现方案
 
-### 1. 入口、资格与目标提交
+### 0. 两条入口并存
 
-- `engine.run(io, repo, *, target=None, tag=None, version=None, resume=None, confirm=None, dry_run=False)`。新发版必须给 `target`（40 位）或 `tag`（人批交接，见第 9 节）。
-- **资格**（引擎入口统一核，watch 和命令行共用）：仓库在 `release-limits.json` 的 `release_repos`（五个插件仓库与沙盒）里，不是 hub；`owner.type == "User"`；`target` 在默认分支历史上；`target` 上主干规则要求的必需检查全部成功（复用 `flow.verified_requirements` 读规则，按提交的检查结果核对）。任一不满足 → 停，不开 issue。
+- **新入口**（本模块）：`cli.py release --repo R --target SHA` 或 `--tag vX.Y.Z`，以及 watch 触发。只对 `release-limits.json` v2 的 `release_repos`（五个插件仓库与沙盒）生效，下面第 1～11 节的守卫全部适用。
+- **旧入口**保留不变：`cli.py release --repo R --version V`、`--resume N`（没有 `target` 的起始块），供站点模板（`frontend` → `site`，`cli.py:928`）和名单外仓库使用；行为与现在一致，不经本模块守卫。名单内的仓库用旧入口新发版时拒绝，提示用新入口。进行中的旧 issue（起始块没有 `target`）按旧入口续跑。
+- **仓库名规范化**：入口先读 `GET repos/R` 的 `full_name`，锁文件、状态键、意图键都用它的 `casefold()`。
+
+### 1. 资格与目标提交
+
+- 资格（新入口统一核）：仓库在 `release_repos`、不是 hub、`owner.type == "User"`；`target` 在默认分支历史上；`target` 上**主干 push 触发的 CI 运行全部成功**（按提交查 check-runs，只看 `push` 事件的运行，不套用 PR 合并的必需检查，因为 `autopilot/verified` 写在 PR head 上）；范围内每个 PR 都有可信 v2 证据（见第 2 节）。任一不满足 → 停，不开 issue。
 - `resolve_pipeline`、档位、守卫全部基于 `target`；起始块记 `target`，续跑只用起始块的值。
 
 ### 2. 发布范围、模块归属与需求分组（`release_gate.py`）
 
-- **上次发版提交**：`state.repos[R].lastReleasedSha`；没有时取 `git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude <本次 tag> <target>`（考虑全部祖先）的 tag 解引用提交；一个都没有 → 首次发版，`route = human`。
-- **先后**：`target` 是上次的后继 → 继续；`target` 是上次的祖先或相等 → `covered`；两者分叉 → 停，记暂停交用户（不当覆盖）。
-- **范围内的 PR**：`git rev-list 上次..target`（全部提交，不只首父）；每个提交用 `GET commits/{sha}/pulls` 找 PR，要求 PR 已合并、`base.ref` 为默认分支、`merge_commit_sha` 在范围内；模块取「机器人发、绑定 PR head、未编辑」的最新 v2 证据块（复用 `cli.py:1236-1248` 的筛选）的 `module`。找不到合格 PR 或证据的提交 → 「未归属」。
-- **需求分组**：在 `target` 上跑 `map_view.py --json`。模块按 `overallDesign.path` 分组，组内模块须全部 `status: done`，且每个模块所有已合并 PR 的合并提交都是 `target` 的祖先。**没有总体技术方案的模块**：能力图上另有已开工未完成的模块时，无法判断是否同一需求，`route` 至少 `confirm`，汇报写明（偏离见「已定的偏离」）。
-- **入口可用性**：`target` 上 `interface.yml` 没登记 `release_publish`，或没有 `.github/workflows/release-tag.yml`，或 `release-limits.json` 的 `release_creator[R] == "local"` → `route = human`。
+- **版本 tag**：只认 `^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`；解析失败、查询失败 → 停。
+- **上次发版提交**：`state.repos[R].lastReleasedSha`；没有时取 `target` 的严格祖先上、版本号最大的合规版本 tag 的解引用提交（指向 `target` 本身的 tag 只有在 `released` 里有记录时才算已发）；一个都没有 → 首次发版，`route = human`。
+- **先后**：`target` 是上次的后继 → 继续；是祖先或相等 → `covered`；分叉 → 停，记暂停交用户。
+- **范围内的 PR**：`git rev-list 上次..target`；每个提交用 `GET commits/{sha}/pulls` 找 PR，要求已合并、`merge_commit_sha` 在范围内（不限 PR 的目标分支，module-crew 先合进集成分支、再由 batch PR 带进主干的内层 PR 也算）；模块取机器人发、绑定 PR head、未编辑的最新 v2 证据块（复用 `cli.py:1236-1248`）的 `module`。找不到合格 PR 或证据的提交 → 「未归属」。
+- **需求分组**：在 `target` 上跑 `map_view.py --json`。有 `overallDesign.path` 的模块按它分组，组内模块须全部 `status: done`，且各自所有已合并 PR 的合并提交都在 `target` 历史上。**没有总体方案的模块**：能力图上另有未完成的模块（已开工或未开工）时，`route` 至少 `confirm`，清单里列出这些模块，由用户确认时判断是否同一需求（偏离一）。
+- **入口可用性**：`target` 上解析出的流水线里，凡 `entry.py <名字>` 形式的 AI 步骤，其入口都要在 `interface.yml` 登记（`impact` 除外，见第 3 节）；`tag-and-release` 必须存在且没被仓库 `replace`；`.github/workflows/release-tag.yml` 存在；`release_creator[R] != "local"`；仓库有生效的 tag 规则集，`refs/tags/v*` 的创建只放行 hub App 与仓库管理员（读 `GET repos/R/rulesets?targets=tag` 及各规则集详情；读不到按没有）。任一不满足 → `route = human`，原因写进汇报。
 
-### 3. 版本号（只读，不靠仓库输出）
+### 3. 版本号（hub 按 F1 计算）
 
-- `impact` 步照旧执行（只读、记证据），但版本号由 hub 自己算：读上次版本 tag 的版本号，再读范围内每个提交的第一行（F1 格式）：有 `!` 或正文有 `BREAKING CHANGE:` → 主版本 +1；否则有 `feat` → 次版本 +1；否则修订号 +1。提交不合 F1 格式 → 停下交用户。
-- 是否升主版本 = 新版本主号 > 上次主号，独立于提交类型再核一次。
-- 命令行给了 `--version` 时与算出的比对，不一致就停。人批交接（`--tag`）的版本取自 tag 名，不再计算，但仍记录是否升主版本供汇报。
+- 版本号由 hub 算：上次版本号，加上范围内**每个已合并 PR 的标题**的类型：有 `!` 或 PR 正文含 `BREAKING CHANGE:` → 主版本 +1；否则有 `feat` → 次版本 +1；否则修订号 +1。用 PR 标题而不是逐个提交，避开 merge commit 和 PR 内部的中间提交。PR 标题不合 F1 → 停下交用户。
+- 是否升主版本 = 新主号 > 上次主号。提交类型由作者写，标错时算不准，这一点在「风险」里列为残余风险；T4 改动另由作废条件拦住。
+- 模板的 `impact` 步改为只记证据：入口没登记（退出码 3）记「未登记，跳过」，不停；登记了但退出非 0 → 停。
+- 命令行给了 `--version` 时与算出的比对，不一致就停。人批交接的版本取自 tag 名。
 
 ### 4. 路线判定与最终档位
 
-- `route` 按需求规定的先后：任一模块 `takeover.release == human`、或第 2 节判为 human → `human`；否则任一模块 `takeover.release` 低于 `auto-confirm`、`releasePreauth is not True`、作废（`module_scope.py` 的 `scope_base` 取不到或不是 `target` 祖先、`scope_base..target` 含 T4、升主版本）、有未归属、或第 2 节判为至少 `confirm` → `confirm`；否则 `auto`。
-- **最终档位只有一个函数** `final_level(route, confirmed, pipeline, limits)`：`human` → `human`；`confirm` 未确认 → `prepare`；`auto` 或已确认 → `min("auto-confirm", effective_level(..., authorized=True))`。最终档位低于 `auto-confirm` 而本该自动 → 停下并写原因（例如「上限文件压到 prepare」）。推 tag 守卫再算一次。
+- `route` 先后：任一模块 `takeover.release == human`、或第 2 节判为 human → `human`；否则任一模块 `takeover.release` 低于 `auto-confirm`、`releasePreauth is not True`、作废（`module_scope.py` 的 `scope_base` 取不到或不是 `target` 祖先、`scope_base..target` 含 T4、升主版本）、有未归属、或第 2 节判为至少 `confirm` → `confirm`；否则 `auto`。
+- **最终档位**（唯一函数）`final_level(route, phase, confirmed, raw, pipeline, limits)`：
+  - `auto`，或 `confirm` 且已确认 → `min("auto-confirm", effective_level(raw_or_auto, ..., authorized=True))`；
+  - `confirm` 未确认 → `min("prepare", effective_level(raw, ...))`（显式的 `human` 上限照样压住）；
+  - `human`：交接前 → `human`；交接后（`--tag` 进来、tag 已在远端）→ `min("auto-confirm", effective_level(raw, ..., authorized=True))`，因为交接方推 tag 时已凭用户原话授权了这一次发版。
+- 最终档位低于这一步需要的档位 → 这一步按现有 `decision` 等待，清单把它标为 `needsUser`，原因写明（例如「上限文件压到 prepare」）。推 tag 守卫再算一次。
 
 ### 5. 可信清单与确认
 
-- 停下确认时，机器人在 issue 里发一条**新评论**（不改正文），块 `autopilot-release-checklist`：`{seq, target, version, route, reasons, steps:[{id, at, by, run, needsUser}], fingerprint}`；`needsUser` = 该步在 `auto-confirm` 档下 `decision` 仍为等待（含 `ask:`、`human`、`external`、无 `auto_when`、要求高于 `auto-confirm`）。`fingerprint = sha256(规范化 JSON(target, version, steps))`。清单有变就发 `seq+1` 的新清单，旧确认作废。
-- **确认判定**：评论作者 `user.id == 仓库所有者 id`、`user.type == "User"`；GraphQL `IssueComment.lastEditedAt` 为空（未编辑）；评论 id 大于最新清单评论；评论正文去掉首尾空白后**整条恰好是** `确认发版 <指纹前 8 位>`（多一行、引用、别的文字都不算）。
-- 确认成立后，机器人发块 `autopilot-release-confirmed {seq, fingerprint, commentId}`。之后按 `auto-confirm` 跑，`needsUser` 的步骤照样等人。
-- `--confirm` 只能放行当前等待且 `needsUser` 的步骤；当前等待的是 `approve` 或推 tag 时拒绝，提示到 issue 回复。
+- **每次发版开始时都发清单**（自动路线也发，作为续跑依据）：机器人追加评论块 `autopilot-release-checklist {seq, target, version, route, reasons, modules, steps:[{id, at, by, run, needsUser}], fingerprint}`；`needsUser` = 该步在本次最终档位下 `decision` 仍等待。`fingerprint = sha256(规范化 JSON(target, version, steps))`。清单有变就发 `seq+1`，旧确认作废。
+- **确认判定**：作者 `user.id == 仓库所有者 id`、`user.type == "User"`；GraphQL `IssueComment.lastEditedAt` 为空；评论 id 大于最新清单评论；正文按 Markdown 逐行看，忽略围栏代码块内、四空格或制表符缩进、以 `>` 开头的行，其余行里**恰有一行**去掉首尾空白后等于 `确认发版 <指纹前 8 位>`，其他行可以是普通说明。GraphQL 字段在沙盒端到端验收时实读核对。
+- 确认成立 → 机器人追加块 `autopilot-release-confirmed {seq, fingerprint, commentId}`。
+- 暂停后继续：所有者按同样规则回复 `继续发版 <seq>`，或修好后由命令行续跑、该步重跑通过（重新验证）。`--confirm` 只放行当前等待且 `needsUser` 的步骤；当前等待的是 `approve` 或推 tag 时拒绝。`watch --resume R` 只解除仓库级巡检暂停，不解除发版暂停。
 
-### 6. 本地建 tag 与推 tag（守卫步骤）
+### 6. 本地建 tag 与推 tag
 
-- **执行顺序**：先对账远端（`git ls-remote origin refs/tags/v<版本> refs/tags/v<版本>^{}` 取解引用提交）：已有且等于 `target` → 跳过建和推，直接到第 7 节；已有但不等 → 停；没有 → 往下。
-- **`tag-and-release`（模板步，改为本地建 tag）**：在**隔离克隆 A** 里执行 `entry.py release_publish`。环境：新建临时 `HOME`；`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=/bin/false`；去掉 `SSH_AUTH_SOCK`、`GH_*`、`GITHUB_*`、`GIT_*` 凭据类变量；另给 `AUTOPILOT_RELEASE_VERSION`、`AUTOPILOT_RELEASE_TARGET`（保留旧 `AUTOPILOT_VERSION`）。执行前后各记一次 `git for-each-ref refs/tags --format='%(refname) %(objectname)'`：只允许新增 `refs/tags/v<版本>` 一条、其他引用不增不改；新引用的对象是附注 tag（`git cat-file -t` 为 `tag`），`git rev-parse <对象>^{commit} == target`。通过后记下 tag 对象 id 与对象内容（`git cat-file tag`）。
-- **`push-tag`（引擎内置守卫步，不在模板里）**：重新核授权（`route == auto` 时在 `target` 上重算第 2、4 节；`confirm` 时重读最新清单与确认原评论、再判一次）；在 hub 自己的**克隆 B**（全新、不执行任何仓库代码）里，从克隆 A 只取那一个 tag 对象（`git fetch <A> <对象 id>`），核对对象 id 一致；用新令牌 `RELEASE_TAG = {"contents": "write"}` 执行 `git -c core.hooksPath=/dev/null push --no-verify origin <对象 id>:refs/tags/v<版本>`；推后用 `ls-remote` 读回，解引用等于 `target`、对象 id 一致。令牌用完撤销。
-- `route == human` 时这两步跳过。
+- **先对账远端**：`git ls-remote origin refs/tags/v<版本> refs/tags/v<版本>^{}`：已有且解引用等于 `target` → 跳过建和推，补记 `released`（对象 id 取远端值）后到第 7 节；已有但不等 → 停；没有 → 往下。远端没有时，本地建 tag 的结果不算数，丢了就重建（还没发布，重建不影响）。
+- **`tag-and-release`（模板步，本地建 tag）**：在**隔离克隆 A** 里执行 `entry.py release_publish`。环境：临时 `HOME`；`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=/bin/false`、`SSH_ASKPASS=/bin/false`；去掉 `SSH_AUTH_SOCK` 和 `GH_*`、`GITHUB_*`、`GIT_*` 等凭据类变量；另给 `AUTOPILOT_RELEASE_VERSION`、`AUTOPILOT_RELEASE_TARGET`（保留 `AUTOPILOT_VERSION`）。前后各记 `git for-each-ref refs/tags --format='%(refname) %(objectname)'`：只允许新增 `refs/tags/v<版本>` 一条，其余不增不改；新对象 `git cat-file -t` 为 `tag`、`^{commit} == target`。
+- **`push-tag`（引擎内置守卫步）**：重新核授权（`auto` 在 `target` 上重算第 2、4 节；`confirm` 重读最新清单与确认原评论再判）；在 hub 自己的**克隆 B**（全新、不执行仓库代码）里只取那一个 tag 对象（`git fetch <A> <对象 id>`），核对 id；用令牌 `RELEASE_TAG = {"contents": "write"}` 执行 `git -c core.hooksPath=/dev/null push --no-verify origin <对象 id>:refs/tags/v<版本>`；推后 `ls-remote` 读回核对；令牌用完撤销；写 `released[R][version] = {target, tagObject, pushedBy: "hub", at}`。
+- **隔离边界**：只有 `tag-and-release` 在隔离环境里跑（它是唯一需要「不能推」保证的步骤）；`prepare`、`install-local`、`verify-install`、`record` 照现状执行，因为它们要用用户本机环境安装插件。它们拿不到 App 写令牌（令牌只在 `push-tag` 的进程里签发），但能读到用户本机已有的登录凭据，这是现状就有的残余风险，由 tag 规则集与「会话不自己打 tag」规则兜住，列入风险。
 
-### 7. 等 Release 就绪（守卫步）
+### 7. 等 Release 就绪
 
-- `await-release`：令牌 `RELEASE_READ = {"actions": "read", "contents": "read"}`。每 30 秒查一次，单步总时限 30 分钟：`release-tag.yml` 对 `v<版本>` 的那次 push 运行 `completed` 且 `success`；`GET releases/tags/v<版本>` 存在、`tag_name` 一致、名字含版本号；远端 tag 解引用等于 `target`。运行失败（即使 Release 已建）、没触发、超时 → 停。
-- `release_creator[R] == "local"`（spec-guard 补 workflow 前）：只走人批，跳过运行核对，只核 Release 与 tag。
+- `await-release`：令牌 `RELEASE_READ = {"actions": "read", "contents": "read"}`。`GET repos/R/actions/workflows/release-tag.yml/runs?event=push` 里取 `head_branch == "v<版本>"` 且 `head_sha == target` 的运行，按 `run_number` 取最新，再取它最新的 `run_attempt`；记下 `runId`、`attempt`。每 30 秒查一次，单步总时限 30 分钟：运行 `completed` 且 `success`；`GET releases/tags/v<版本>` 存在、`tag_name` 一致、名字含版本号；远端 tag 解引用等于 `target`。运行失败（即使 Release 已建）、没出现、超时 → 停。通过后 `released[R][version]` 补 `releaseUrl`、`runId`、`attempt`。
+- `release_creator[R] == "local"`：只走人批；交接后只核 Release 存在、对应 tag，记 `released`（`runId` 为空）。
 
-### 8. 状态、锁、暂停与收尾（4.6）
+### 8. 状态、锁、认领与暂停（4.6）
 
-- **锁与排队**：发版用每仓库独立的文件锁 `~/.autopilot/release-<owner>__<repo>.lock`，命令行和 watch 都先拿它。watch 只做「入队」：主干运行变绿且通过资格 → `releases[R].candidates` 追加 `target`（去重、按提交顺序），持久化后才推进游标；watch 在自己的整轮锁之外，对每个有候选且没在跑的仓库启动一个独立的 `cli.py release --repo R --target <最早候选>` 进程，不在 watch 锁内跑长步骤。
-- **记录**：`releases[R] = {state, target, version, route, issue, step, since, pause, candidates}`；`state` 为 `planned|running|waiting-human|finishing|done|paused|covered`。`released[R][version] = {target, tagObject, releaseUrl, issue, at}` 在推 tag 成功时写，Release 就绪后补 `releaseUrl`。
-- **幂等**：意图键 `R:release:<target>:<version>:<步骤>:<动作>[:<对象>]`（对象如评论 seq、通知对象），先记意图后做、做完写 done。中断后按意图对账：tag 看远端；issue／评论按块里的键查；`install-local` 先读本机已装版本，等于 `version` 视为已做；`record` 按 `version` 去重。
-- **守卫**（开始前和每步之前）：`frozen`；`repos[R].narrowed`；该仓库主干最新运行的 `fields.pause` 或未解决的红色分类；`repos[R].pause`；未关闭的降级 issue。任一成立 → `paused`，记原因。
-- **失败**：任一步 `stopped` → `paused`，通知用户（桌面 + issue 评论）和负责的会话（第 10 节）；时限：单步 30 分钟，`waiting-human` 24 小时 → `paused`。离开暂停：用户在 issue 确认、命令行续跑或 `watch --resume R`。
-- **收尾**：Release 就绪、安装与验证完成后先置 `finishing`、写 `lastReleasedSha = target`、`released`、账本 `release_done`；再发总结、关 issue、`done`。`finishing` 状态下续跑只补收尾，不做覆盖判定。
+- **锁**：每仓库文件锁 `~/.autopilot/release-<规范名>.lock`，命令行和 watch 的认领都先拿它。
+- **认领**：在锁内读 `releases[R]`：`state` 为 `running` 且记录的进程还活着 → 不再启动；否则把选中的候选写成 `{state: running, target, pid, since}`，持久化后释放锁，再执行步骤（长步骤不持锁；每步开始前重新拿锁核对自己仍是认领者）。
+- **候选**：watch 在主干运行变绿且过资格时把 `target` 追加进 `releases[R].candidates`（去重），持久化后才推进游标；在 watch 整轮锁之外，对有候选且未认领的仓库启动 `cli.py release --repo R --target <最新候选>` 子进程。**总选最新候选**：它包含更早的候选；更早的候选在最新的发完后标 `covered`。最新候选因需求未做完不能发时，保留在队里，下一个更新的候选到来时替换它。
+- **等确认的恢复**：watch 每轮查 `waiting-human` 的发版 issue，发现新的合格确认或 `继续发版` 后启动续跑子进程。
+- **记录**：`releases[R] = {state, target, version, route, issue, step, since, pid, pause, candidates}`；`state` 为 `planned|running|waiting-human|finishing|done|paused|covered`。`released[R][version]` 见第 6、7 节；人批交接也建这一条。
+- **幂等**：意图键 `<规范名>:release:<target>:<version>:<步骤>:<动作>[:<对象>]`，先记后做、做完写 done。中断后：tag 看远端；issue 与评论按块里的键查；`install-local` 不按版本去重，续跑时先跑 `verify-install`，通过就记完成，不过再重装；`record` 以账本里 `release_record:<规范名>:<version>` 键去重，结果写进 `released`。
+- **守卫**（开始前和每步之前）：`frozen`；`repos[R].narrowed`；该仓库主干运行记录里任一 `fields.pause` 未解除，或红色分类未解决；`repos[R].pause`；未关闭的降级 issue。任一成立 → `paused`，记原因。
+- **失败**：任一步 `stopped` → `paused`，通知用户（桌面 + issue 评论）和负责的会话；时限：单步 30 分钟，`waiting-human` 24 小时 → `paused`。
+- **收尾**：Release 就绪、安装与验证完成后进入 `finishing`，依次做（各带意图键）：写 `lastReleasedSha = target`、`released` 完成标记、账本 `release_done`、总结评论、关 issue，最后 `done`。`finishing` 由状态驱动续跑，不经 issue 的起始块校验（已关闭的 issue 不影响），每一项按意图键对账，不做覆盖判定。
 
 ### 9. 人批交接
 
-- `cli.py release --repo R --tag vX.Y.Z`：读远端 tag 解引用提交作为 `target`，过第 1 节资格（不要求提前授权），`route = human`，跳过建／推 tag，从 `await-release`（或 `release_creator == local` 时的 Release 核对）开始；上次发版提交取这个 tag 之前最近的版本 tag。
+- `cli.py release --repo R --tag vX.Y.Z`：读远端 tag 解引用提交作为 `target`，过第 1 节资格（不要求提前授权），`route = human`、交接后档位见第 4 节；跳过建／推 tag，从 `await-release`（或 `local` 仓库的 Release 核对）开始；上次发版提交取这个 tag 之前最近的合规版本 tag。缺安装、验证、记录入口时，这几步标 `needsUser`，由用户本人做完后在 issue 回复或命令行 `--confirm`。
 
 ### 10. 汇报与通知
 
-- **开始前**：写账本事件「将要做什么」：仓库、目标、版本、路线、清单、每个模块的授权与作废事实、范围内 PR 的修复次数（`state.repairs`）。通知负责的会话：取范围内 PR 在 `state.prs` 里的 `notify`，去重；没有就只通知用户。
-- **发版后发现问题**：`verify-install` 失败 → 暂停并通知，附 `released[R][version]` 的 tag、Release、issue；发版后主干 CI 变红 → watch 的主干通知里补「最近已发版本」（取 `released[R]` 最新一条）；`cli.py report-failure --repo R --stage release --version vX.Y.Z --detail …`：按版本查 `released` 补齐证据后通知用户（`--pr` 在 `--stage release` 时可省）。
+- **开始前**：账本写「将要做什么」：仓库、目标、版本、路线、清单、每个模块的授权与作废事实、范围内 PR 的修复次数（`state.repairs`）。通知负责的会话：范围内 PR 在 `state.prs` 的 `notify` 去重；没有就只通知用户。
+- **发版后发现问题**：`verify-install` 失败 → 暂停并通知，附 `released[R][version]` 的 tag、Release、运行、issue；发版后主干 CI 变红 → 取 `released[R]` 里 `target` 是这次红色运行 `headSha` 的祖先或相等、且最新的那一条，作为「涉及的已发版本」写进 watch 的通知；`cli.py report-failure --repo R --stage release --version vX.Y.Z --detail …`：按版本查 `released` 补齐证据后通知用户（`--stage release` 时 `--pr` 可省）。
 
 ### 11. 上限（T4，最后一个实现 PR）
 
-- `effective_level(repo, raw, pipeline, limits, *, authorized=False)`：只有 `authorized` 为真**且** `release-limits.json` 为 v2 并给出 `authorized_cap` 时，`pipeline_own` 的上限改取 `authorized_cap`（只能是 `auto-confirm`），再与 `repo_caps` 取低；其余情况与现在完全一样。文件缺失、读不懂、v1 → 现状（`prepare`）。
-- 回滚：删 `authorized_cap` 即恢复现状；代码不内置放宽值。
+- `effective_level(repo, raw, pipeline, limits, *, authorized=False)`：只有 `authorized` 为真**且** `release-limits.json` 为 v2 并给出 `authorized_cap`（只能是 `auto-confirm`）时，`pipeline_own` 的上限改取 `authorized_cap`，再与 `repo_caps` 取低；其余情况与现在完全一样（非 `pipeline_own` 的仓库照现有规则算，kb 的 `repo_caps` 本来就是 `auto-confirm`）。文件缺失、读不懂、v1 → 现状。
+- 回滚：删 `authorized_cap` → 四个流水线自用插件回到最高 `prepare`；要让所有仓库都停下确认，用 `watch --freeze` 或把模块 `takeover.release` 改回 human。
 
 ## 接口和数据改动
 
@@ -123,6 +137,8 @@
 | 判定读错 `/map --json` | 不该自动的被自动发 | 读不到、类型不对一律按没有授权；没有总体方案的模块从严 |
 | 版本号算错 | 版本跳级或漏升主版本 | 只认 F1 格式；主版本独立再核；给了 `--version` 就比对 |
 | 中途中断 | 重复推或漏收尾 | 意图与幂等键；推前对账远端；`finishing` 状态独立收尾 |
+| 其他发布步骤读到用户本机凭据（现状就有） | 仓库命令可用用户身份推 tag | tag 规则集只放行 App 与管理员；规则「会话不自己打 tag」；残余风险，第一版接受 |
+| PR 类型标错（`!` 漏写） | 该升主版本没升，提前授权没作废 | T4 由作废条件另拦；残余风险，第一版接受，汇报列出范围内 PR 标题 |
 
 回滚：删 `authorized_cap` → 全部回到停下确认；`watch --freeze` → 不开始新发版；最坏把 hub 钉回本模块之前的提交。已发出的版本不撤回。
 
@@ -142,7 +158,9 @@
 | S14 | 安装验证失败、主干变红、`report-failure --stage release --version` 都通知并附版本证据 |
 | S15 | `test_limits.py`：未授权与现在一致；无 `authorized_cap` 或 v1 时不放宽；`repo_caps` 仍取低；文件非法按 `prepare` |
 | S16 | 缺 `release_publish`／`release-tag.yml` 时路线为人批；人批交接从 `await-release` 开始 |
-| 交接清单第 5 项 | 五个插件仓库各验一次 App 推 `v*` tag 触发 `release-tag.yml`；旧版 spec-guard（缺 `releasePreauth`）时按无授权停下 |
+| 交接清单第 5 项 | 五个插件仓库各验一次：App 推 `v*` tag 触发 `release-tag.yml` 并实际建出对应 Release；旧版 spec-guard（缺 `releasePreauth`）时按无授权停下；GraphQL 评论编辑字段实读 |
+| 入口并存、规范化、候选 | 旧入口（站点）行为不变；名单内仓库用旧入口被拒；大小写不同的仓库名共用一把锁；总选最新候选、不完整候选被更新的替换；认领与进程存活 |
+| 人批交接 | 交接后安装、验证、记录按 `auto-confirm` 跑；缺入口时标 `needsUser` |
 
 ## 方案取舍
 
@@ -155,12 +173,13 @@
 
 ## 已定的偏离与外部前提
 
-- **偏离一（交用户批）**：需求说「需求还有模块没完成时不发」。没有总体技术方案的模块，spec-guard 给不出它属于哪个需求；本方案在这种情况下只要能力图上另有已开工未完成的模块，就按停下确认处理，而不是一律不发（一律不发会让无关的长期模块卡住所有发版）。
-- **偏离二（交用户批）**：需求文档写「发布引擎的 impact 步骤给出要升主版本」。本方案改为 hub 按 F1 提交类型算版本、独立判主版本，不要求各仓 impact 新增输出，交接清单不加新项。
-- 外部前提（需求交接清单已列）：各仓登记 `release_publish`；spec-guard 补 `release-tag.yml`；六仓 tag 规则集。前提不满足的仓库只走人批。
+- **偏离一（交用户批）**：需求说「需求还有模块没完成时不发」。没有总体技术方案的模块，spec-guard 给不出它属于哪个需求；本方案在这种情况下只要能力图上另有未完成的模块（已开工或未开工），就停下确认，清单列出这些模块，由用户确认时判断是否同一需求，而不是一律不发（一律不发会让无关的长期模块卡住所有发版）。
+- **偏离二（交用户批）**：需求文档写「由 impact 结论算出版本号」。本方案改为 hub 按范围内已合并 PR 标题的 F1 类型算版本，不要求各仓 impact 新增输出，交接清单不加新项；impact 步只记证据。
+- 外部前提（需求交接清单已列）：各仓登记 `release_publish`；spec-guard 补 `release-tag.yml`；六仓 tag 规则集。前提不满足的仓库只走人批（第 2 节逐项核对）。
 
 ## 审查记录
 
 - 第一轮：Codex 只读审查（delegate review，2026-11-27），24 条阻断、1 条建议，全部核实成立并改入第二稿。其中「`IMPACT:` 输出行没有调研支撑」一条，补查各仓 `interface.yml` 后确认现有仓库都不给升级结论，改用 F1 提交类型计算，不再要求各仓新增输出。
+- 第二轮：Codex 复审（带第一轮报告），上一轮 7 条已解决、17 条仍有缺口，另有 7 条新阻断，全部核实成立并改入第三稿：新旧入口并存与仓库名规范化；资格改看主干 push CI；发布范围不限 PR 目标分支；版本 tag 严格匹配；版本按 PR 标题算、impact 只记证据；入口、模板替换与 tag 规则集都进路线判定；确认按 Markdown 逐行、允许附说明；人批交接后档位；每次都发清单；认领、总选最新候选与等确认的恢复；安装与记录的对账；收尾逐项对账；已发记录补运行证据与主干红的归属；隔离边界与残余风险写明。
 
 ## 变更记录
