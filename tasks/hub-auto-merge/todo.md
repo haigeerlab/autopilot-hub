@@ -35,5 +35,5 @@
   - 验证：R16、R17
   - 文件：`examples/launchd/com.haigeerlab.autopilot-watch.plist`、`README.md`、`README.en.md`、`CHANGELOG.md`
 - [x] Checkpoint 3（report）：R5、R7、R8、R10～R13、R18 通过（2026-11-27 按回归文档命令逐条执行全部 OK，全量两遍通过）
-- [ ] Checkpoint 4（gate）：推送并开实现 PR 二（Task 6～10），用户说「合并」
+- [x] Checkpoint 4（gate）：推送并开实现 PR 二（Task 6～10），用户说「合并」（2026-11-27 hub#98 用户「合并 hub#98」，已合 5f354b0）
 - [ ] Checkpoint 5（gate）：最终验收：沙盒 R14、R15 等用户原话
