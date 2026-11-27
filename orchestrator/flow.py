@@ -523,15 +523,20 @@ def verification_listing(module, groups, payload):
         lines.append("要你测的人工用例（含 ai-operate）：")
     for case in groups['manual']:
         lines.extend([f"{case['id']}：{case['title']}", f"步骤：{case['steps']}", f"预期：{case['expected']}"])
+        reason = payload.get('aiUnavailable', {}).get(case['id'])
+        if reason:
+            lines.append(f"AI 执行不可用：{reason}")
     lines.extend(["", "请逐行回复，例如：确认执行 R5 R6；R2 通过；R3 不通过：说明；意见 R2：文字。",
                   "只认仓库所有者在最新清单之后、没有编辑过的评论。", block('autopilot-verify', payload)])
     return '\n'.join(lines)
 
 
-def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
+def verification_issue(io, repo, pr, module, groups, patch_id, document_sha, ai_unavailable):
     bot = io.bot_identity()
     payload = dict(pr=pr['number'], patchId=patch_id, regressionSha256=document_sha,
                    confirm=[c['id'] for c in groups['confirm']], manual=[c['id'] for c in groups['manual']])
+    if ai_unavailable:
+        payload['aiUnavailable'] = ai_unavailable
     def listings(source, issue_body=False):
         # REST updated_at of an issue moves on every comment, so the issue body is identified by its bot
         # author and app only; listing comments must also be unedited.
@@ -578,7 +583,33 @@ def case_failures(results):
             for case in results if case['result'] == 'fail'}
 
 
-def verify_module(io, repo, pr, work, module, notes, dry_run):
+def run_ai_case(work, case, head, author_host):
+    if author_host == 'codex':
+        return None, '非作者后端 claude-code 不支持 delegate run'
+    if author_host != 'claude-code':
+        return None, '未传 --author-host，无法选择非作者后端'
+    backend = 'codex'
+    cid = case['id']
+    task = (f"用例 {cid}：{case['title']}\n步骤：{case['steps']}\n预期：{case['expected']}\n"
+            f"证据要求：{case['evidence']}\n"
+            f'执行该用例，并把最后一行写成独立 JSON，不加代码围栏：'
+            f'{{"case":"{cid}","result":"pass 或 fail","evidence":"实际观察和证据"}}。'
+            'result 必须是 pass 或 fail，evidence 写下克隆删除后仍可核对的证据。')
+    output, reason = work.run_delegate(backend, head, task)
+    if reason:
+        return None, reason
+    try:
+        data = json.loads(output.strip().rpartition('\n')[2])
+    except ValueError:
+        return None, 'delegate 结尾 JSON 无法解析'
+    if not isinstance(data, dict) or data.get('result') not in ('pass', 'fail') or not data.get('evidence'):
+        return None, 'delegate 结尾 JSON 缺少有效结果或证据'
+    if data.get('case') != cid:
+        return None, 'delegate 返回的用例编号不匹配'
+    return dict(executor=f'delegate:{backend}', result=data['result'], evidence=data['evidence'], exit=0), None
+
+
+def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=None):
     from verify.core import select_cases, parse_replies, case_result, build_report, new_executor
     head = pr['head']['sha']
     base_code, base_doc = work.regression(module, ref=work.base_tip)
@@ -606,7 +637,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
     def write_json(path, value):
         io.write_verification_file(path, json.dumps(value, ensure_ascii=False, indent=2) + '\n')
     def evidence(path, text, kind='log', source=None):
-        raw = text.encode('utf-8')
+        raw = text.encode('utf-8', errors='backslashreplace')
         io.write_verification_file(path, raw)
         return dict(type=kind, path=os.path.relpath(path, os.path.dirname(report_path)),
                     sha256=hashlib.sha256(raw).hexdigest(), source=source)
@@ -620,13 +651,27 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
         reused = (state.get('current') is True and state.get('reportSha256') == digest
                   and report.get('verdict') != 'fail')
     if not reused:
+        ai_results, ai_unavailable = {}, {}
+        for case in groups['ai']:
+            cid = case['id']
+            execution, reason = run_ai_case(work, case, head, author_host)
+            if reason:
+                groups['manual'].append(case)
+                ai_unavailable[cid] = reason
+                continue
+            text = execution['evidence']
+            if not isinstance(text, str):
+                text = json.dumps(text, ensure_ascii=False, indent=2)
+            execution['evidence'] = [evidence(os.path.join(logs, cid+'-delegate.log'), text)]
+            ai_results[cid] = case_result(case, execution)
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:
             owner = pr['base']['repo']['owner']
             if owner.get('type') == 'Organization':  # checked before any tracking-issue write
                 raise Stop('verification', '仓库属于组织，跟踪 issue 只认仓库所有者本人的答复，组织仓库还不支持，交你处理')
-            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
+            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'],
+                                                           ai_unavailable)
             owner_id = owner.get('id')
             if owner_id is None:
                 owner_id = (io.api(f'repos/{repo}').get('owner') or {}).get('id')
@@ -635,6 +680,9 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
         results, pending_confirm, pending_manual = [], [], []
         for case in doc['cases']:
             cid = case['id']
+            if cid in ai_results:
+                results.append(ai_results[cid])
+                continue
             if case in groups['manual']:
                 reply = replies['results'].get(cid)
                 if reply is None:
@@ -1234,7 +1282,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                         raise Stop("takeover", detail)
                     manual_reasons.append(f"{detail}（{reason}）" if reason else detail)
                 if flow_v2:
-                    verification = verify_module(io, repo, pr, work, module, notes, dry_run)
+                    verification = verify_module(io, repo, pr, work, module, notes, dry_run, author_host=author_host)
                 else:
                     acceptance, report = accepted_review(io, repo, module, head)
                     fp, rounds = gate_review(report), 1

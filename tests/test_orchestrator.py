@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -672,6 +674,169 @@ class RunRouteFixture(unittest.TestCase):
                 mock.patch.object(cli.tokens, 'revoke'), contextlib.redirect_stdout(StringIO()) as stdout:
             code = cli.main(['run', '--repo', REPO, '--pr', '7', *args])
         return code, stdout.getvalue()
+
+
+class AiOperateFlowTest(RunRouteFixture):
+    def setUp(self):
+        super().setUp()
+        source = make_repo(self, {'fixture.txt': 'base'})
+        commit_on_branch(source, {'fixture.txt': 'head'})
+        self.head = subprocess.check_output(['git', '-C', source, 'rev-parse', 'HEAD'], text=True).strip()
+        self.source_object = Path(source, '.git', 'objects', self.head[:2], self.head[2:])
+        git(source, 'checkout', '-q', 'main')
+        self.work = cli.Work.__new__(cli.Work)
+        self.work.root, self.work.delegate = source, None
+        plugin = tempfile.TemporaryDirectory()
+        self.addCleanup(plugin.cleanup)
+        self.plugin = Path(plugin.name)
+        self.script = self.plugin / 'scripts' / 'delegate-exec.sh'
+        write_files(plugin.name, {
+            'scripts/delegate-exec.sh': r'''#!/bin/bash
+exec python3 -B "$(dirname "$0")/fake_delegate.py" "$@"
+''',
+            'scripts/fake_delegate.py': '''import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+options, task = sys.argv[1:-1], sys.argv[-1]
+cid = re.search(r'^用例 (R\\d+)', task).group(1)
+settings = json.loads((root / 'responses.json').read_text())
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+obj = Path('.git', 'objects', head[:2], head[2:]).stat()
+with (root / 'calls.jsonl').open('a', encoding='utf-8') as file:
+    print(json.dumps(dict(options=options, task=task, cwd=os.getcwd(), head=head,
+        object=[obj.st_dev, obj.st_ino], dot_git=Path('.git').is_dir(),
+        fixture=Path('fixture.txt').read_text())), file=file)
+Path('fixture.txt').write_text('changed by delegate')
+response = settings[cid]
+print(response['stdout'])
+sys.exit(response['exit'])
+''',
+        })
+        self.script.chmod(0o700)
+        self.set_version('0.14.0')
+        discover = mock.patch.object(cli, 'find_delegate', return_value=str(self.script))
+        self.find_delegate = discover.start()
+        self.addCleanup(discover.stop)
+
+        def run_delegate(backend, head, task):
+            return self.work.run_delegate(backend, head, task)
+
+        executor = mock.patch.object(FakeWork, 'run_delegate', side_effect=run_delegate, create=True)
+        self.delegate = executor.start()
+        self.addCleanup(executor.stop)
+
+    def set_version(self, version):
+        write_files(str(self.plugin), {'.claude-plugin/plugin.json': json.dumps({'version': version})})
+
+    def io(self, *ids):
+        io = self.verify.io([dict(case(cid, 'ai-operate'), command=None, evidence='记录界面反馈') for cid in ids])
+        io.pr['head']['sha'] = self.head
+        return io
+
+    def responses(self, **outcomes):
+        (self.plugin / 'responses.json').write_text(json.dumps({
+            cid: dict(stdout=stdout, exit=exit_code) for cid, (stdout, exit_code) in outcomes.items()
+        }), encoding='utf-8')
+
+    def calls(self):
+        path = self.plugin / 'calls.jsonl'
+        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
+
+    def assert_clean_clones(self, calls):
+        self.assertEqual(len({call['cwd'] for call in calls}), len(calls))
+        src = self.source_object.stat()
+        for call in calls:
+            self.assertTrue(call['dot_git'])
+            self.assertEqual((call['head'], call['fixture']), (self.head, 'head'))
+            self.assertNotEqual(call['object'], [src.st_dev, src.st_ino])
+            self.assertFalse(Path(call['cwd']).exists(), call)
+        self.assertEqual(Path(self.work.root, 'fixture.txt').read_text(), 'base')
+
+    def test_delegate_pass_and_fail_use_independent_clones_and_record_evidence(self):
+        self.responses(R1=('progress\n{"case":"R1","result":"pass","evidence":"first evidence"}', 0),
+                       R2=('{"case":"R2","result":"fail","evidence":"second evidence"}', 0))
+        io = self.io('R1', 'R2')
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 1, out)
+        self.assertIn('R2（check-failure）', out)
+        self.assertEqual(io.verify_issues, [])
+        self.assertEqual(io.merge_calls(), [])
+        report = self.verify.report(io)
+        self.assertEqual(report['verdict'], 'fail')
+        for result, expected in zip(report['cases'], [('pass', b'first evidence'), ('fail', b'second evidence')]):
+            self.assertEqual((result['result'], result['executor'], result['exit']), (expected[0], 'delegate:codex', 0))
+            self.assertEqual(io.verification_files['evidence/' + result['evidence'][0]['path']], expected[1])
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call['options'], ['run', '--backend', 'codex', '--repo', call['cwd'], '--write', '--'])
+            for field in ('操作', '成功', '记录界面反馈', 'JSON'):
+                self.assertIn(field, call['task'])
+        self.assert_clean_clones(calls)
+
+    def test_delegate_013_uses_clone_as_working_directory_and_parses_answer_before_footer(self):
+        self.set_version('0.13.1')
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"evidence"}\n\n'
+                           '---\n模型：宿主默认\n过程日志（未进入本会话上下文）：日志\n'
+                           'delegate: result=report.json', 0))
+        io = self.io('R1')
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.verify.report(io)['verdict'], 'pass')
+        self.assertEqual(io.verify_issues, [])
+        calls = self.calls()
+        self.assertEqual([call['options'] for call in calls], [['run', '--backend', 'codex', '--write', '--']])
+        self.assert_clean_clones(calls)
+
+    def test_invalid_answers_and_nonzero_exit_require_manual_and_remove_clones(self):
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"old"}\nnot JSON', 0),
+                       R2=('{"case":"R9","result":"pass","evidence":"wrong case"}', 0),
+                       R3=('{"case":"R3","result":"pass","evidence":"ignore"}', 127))
+        io = self.io('R1', 'R2', 'R3')
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 1, out)
+        self.assertIn('要你测 R1 R2 R3', out)
+        body = io.verify_issues[0]['body']
+        self.assertEqual(body.count('AI 执行不可用：'), 3)
+        for reason in ('结尾 JSON', '用例编号', '退出码 127'):
+            self.assertIn(reason, body)
+        self.assertEqual(io.verify_calls, [])
+        self.assertEqual(len(self.calls()), 3)
+        self.assert_clean_clones(self.calls())
+
+    def test_missing_delegate_waits_for_manual_reply(self):
+        self.find_delegate.return_value = None
+        io = self.io('R1')
+        self.assertIn('要你测 R1', self.cli_run(io, '--author-host', 'claude-code', '--json')[1])
+        self.assertIn('AI 执行不可用：找不到 delegate', io.verify_issues[0]['body'])
+        self.verify.reply(io, 'R1 通过')
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        result = self.verify.report(io)['cases'][0]
+        self.assertEqual((result['method'], result['evidence'][0]['type']), ('ai-operate', 'user-quote'))
+        self.assertEqual(len(io.verify_issues), 1)
+
+    def test_old_delegate_waits_for_manual_without_starting(self):
+        self.set_version('0.12.6')
+        io = self.io('R1')
+        self.assertIn('要你测 R1', self.cli_run(io, '--author-host', 'claude-code', '--json')[1])
+        self.assertIn('AI 执行不可用：delegate 版本低于 0.13', io.verify_issues[0]['body'])
+        self.assertEqual(self.calls(), [])
+
+    def test_no_author_and_codex_author_wait_for_manual_without_delegate(self):
+        for args, reason in [((), '未传 --author-host'), (('--author-host', 'codex'), 'claude-code')]:
+            with self.subTest(args=args):
+                io = self.io('R1')
+                self.assertIn('要你测 R1', self.cli_run(io, *args, '--json')[1])
+                self.assertIn('AI 执行不可用：', io.verify_issues[0]['body'])
+                self.assertIn(reason, io.verify_issues[0]['body'])
+        self.delegate.assert_not_called()
+        self.find_delegate.assert_not_called()
 
 
 class RoutePreconditionTest(RunRouteFixture):

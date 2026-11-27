@@ -204,6 +204,56 @@ class Work:
         except OSError:
             return {"exit": None, "timeout": False, "output": "验证命令无法启动"}
 
+    def run_delegate(self, backend, sha, task):
+        """Run delegate against a fresh local copy of the pinned PR commit."""
+        script = self.delegate or find_delegate()
+        if not script or not os.path.isfile(script):
+            return None, "找不到 delegate-exec.sh"
+        try:
+            script = Path(script).resolve()
+            manifest = script.parent.parent / ".claude-plugin" / "plugin.json"
+            version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+            if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version):
+                return None, "无法确认 delegate 版本"
+            major_minor = tuple(map(int, version.split(".")[:2]))
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            return None, "无法确认 delegate 版本"
+        if major_minor < (0, 13):
+            return None, f"delegate 版本低于 0.13（{version}）"
+
+        git_env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
+        delegate_env = {k: v for k, v in _clean_env().items() if not k.startswith("GIT_")}
+        # Delegate 0.13 only accepts --repo for review. Its run uses cwd and prints a footer after the answer.
+        legacy_run = major_minor == (0, 13)
+        try:
+            with tempfile.TemporaryDirectory(prefix="autopilot-ai-case-") as tmp:
+                clone = os.path.realpath(os.path.join(tmp, "repo"))
+                for args in (("clone", "-q", "--no-hardlinks", "--no-checkout", "--", self.root, clone),
+                             ("-C", clone, "checkout", "-q", "--detach", sha),
+                             ("-C", clone, "remote", "remove", "origin")):
+                    subprocess.run(["git", *args], env=git_env, check=True, capture_output=True,
+                                   stdin=subprocess.DEVNULL, timeout=120)
+                command = ["bash", str(script), "run", "--backend", backend]
+                if not legacy_run:
+                    command.extend(("--repo", clone))
+                result = subprocess.run([*command, "--write", "--", task], cwd=clone, env=delegate_env,
+                                        capture_output=True, text=True, errors="replace",
+                                        stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT)
+        except subprocess.CalledProcessError:
+            return None, "准备用例的独立克隆失败"
+        except subprocess.TimeoutExpired:
+            return None, "准备克隆或执行 delegate 超时"
+        except (OSError, ValueError):
+            return None, "无法准备克隆或启动 delegate"
+
+        if result.returncode:
+            return None, f"delegate 后端 {backend} 执行失败（退出码 {result.returncode}）"
+        if legacy_run:
+            answer, separator, footer = result.stdout.rpartition("\n---\n模型：")
+            if separator and "\n过程日志（未进入本会话上下文）：" in footer:
+                return answer, None
+        return result.stdout, None
+
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
         # Steps intentionally have no hub credentials for git push: release preparation
@@ -1027,7 +1077,8 @@ def main(argv=None):
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
     r.add_argument("--notify", metavar="SESSION", help="queue handoff notices for this session")
-    r.add_argument("--author-host", choices=("claude-code", "codex"), help="record the author's host in evidence")
+    r.add_argument("--author-host", choices=("claude-code", "codex"),
+                   help="record the author's host and select the other host for AI regression cases")
     follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
     follow.add_argument('--repo', required=True, help='owner/name')
     follow.add_argument('--pr', required=True, type=int)

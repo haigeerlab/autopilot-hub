@@ -5,9 +5,11 @@ import secrets
 
 def select_cases(base_view, head_view):
     base = {c['id']: c for c in (base_view or {}).get('cases', [])}
-    groups = {'auto': [], 'confirm': [], 'manual': []}
+    groups = {'auto': [], 'confirm': [], 'manual': [], 'ai': []}
     for case in head_view['cases']:
-        if case['method'] in ('manual', 'ai-operate'):
+        if case['method'] == 'ai-operate':
+            group = 'ai'
+        elif case['method'] == 'manual':
             group = 'manual'
         else:
             old = base.get(case['id'])
@@ -44,10 +46,20 @@ def parse_replies(comments, owner_id, after_id):
 def case_result(case, execution=None, evidence=(), baseline=None, baseline_evidence=(), base=None, reply=None):
     result, category, baseline_commit = 'pass', None, None
     evidence = list(evidence)
+    execution_fields = {}
     if reply is not None:
         result = reply['result']
         if result == 'fail':
             category = 'user-bug'
+    elif execution.get('executor'):
+        execution_fields = {key: execution[key] for key in ('executor', 'exit')}
+        evidence.extend(execution['evidence'])
+        if execution['exit'] != 0:
+            result, category = 'fail', 'run-failure'
+        else:
+            result = execution['result']
+            if result == 'fail':
+                category = 'check-failure'
     elif execution.get('timeout') or execution.get('exit') is None:
         result, category = 'fail', 'run-failure'
     elif execution['exit'] != 0:
@@ -58,7 +70,7 @@ def case_result(case, execution=None, evidence=(), baseline=None, baseline_evide
             result, category = 'fail', 'check-failure'
             evidence.extend(baseline_evidence)
     return dict(id=case['id'], method=case['method'], result=result, failCategory=category,
-                baselineCommit=baseline_commit, evidence=evidence)
+                baselineCommit=baseline_commit, evidence=evidence, **execution_fields)
 
 
 def new_executor():
