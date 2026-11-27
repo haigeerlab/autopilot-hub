@@ -29,3 +29,5 @@ jobs:
     uses: haigeerlab/autopilot-hub/.github/workflows/degrade.yml@<HUB_SHA>
     with:
       hub_ref: <HUB_SHA>
+      # After installing watch and enabling watchMainRed for this repo, set this to true on a hub pin that supports it.
+      # skip_main_red: true

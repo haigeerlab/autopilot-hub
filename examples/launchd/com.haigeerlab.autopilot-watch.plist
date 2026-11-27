@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.haigeerlab.autopilot-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-B</string>
+        <string>__HUB_CHECKOUT__/orchestrator/cli.py</string>
+        <string>watch</string>
+        <string>--once</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__HUB_CHECKOUT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__GH_BIN_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/autopilot-watch.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/autopilot-watch.err.log</string>
+</dict>
+</plist>

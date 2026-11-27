@@ -20,6 +20,10 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - 删掉 `correction/cli.py` 里没人用的 `CANDIDATE_BLOCK` 正则（候选块照常写入）。`pipeline/engine.py` 写进本机账本的 `release_done` 是切片 14 Spec 定的发布完成记录，保留并在代码里注明暂无读取方。不需要升钉。
 
 ### Added
+- hub-auto-merge 第二批的 AI 操作用例：合并前验证把 `ai-operate` 用例交给非作者 delegate 后端，在独立的一次性克隆中执行，结果与证据写入验证报告。当前调用未传 `--authorized-by`，授权执行通道待 delegate 发版支持后接入。作者是 Codex、delegate 不可用或结果无法解析时转人工。不需要升钉。
+- hub-auto-merge 第二批的 CI 分类（`orchestrator/classify.py`）：环境失败最多重跑两次，配置错误暂停交人，测试失败进入会话分析或主干收紧。不需要升钉。
+- hub-auto-merge 第二批的 `watch` 与 `report-failure`：巡检排队中的自动合并、PR 和主干 CI，记录暂停并通知，支持冻结、解冻与恢复。附每 5 分钟运行 `watch --once` 的 launchd 模板。不需要升钉。
+- hub-auto-merge 第二批的降级交接：`degrade.yml` 新增布尔输入 `skip_main_red`，为 `true` 时把主干 CI 失败交给 watch。**使用新输入的 caller 需要升钉**（`uses:` 与 `hub_ref` 指向同一个新提交）。输入默认 `false`，未升钉的 caller 沿用原行为。
 - S110 切片 S5 剩余：合规监测对已开工的 spec-guard 新流程模块查三项（`audit/flow_check.py`）——需求没有经你确认（严重；确认后又改过为提醒）、重要需求的技术方案不是你批的（严重）、模块已完成却没有成立的合并前验证记录（严重；验证记录只在你本机检出的公共 git 目录里，从 `~/.autopilot/config.json` 的 `checkouts` 读，没配检出时只写「判不了」）。老流程模块仍由 `audit/plan_check.py` 检查（方案原写退役，因老模块仍在用而保留）。不需要升钉。
 - S110 切片 S4：新流程模块合并后，把合并前验证报告里的每条意见开成后续 issue（标签 `autopilot:followup`，标题「[跟进] 模块：意见」，带来源 PR 与补丁指纹）；同模块同标题已有机器人开的 issue 只追加评论，同一 PR 同一补丁重跑一律跳过。开失败不回滚合并，在 PR 上留补开命令 `orchestrator/cli.py followups --repo <owner/name> --pr <n>`（只认机器人 v2 证据与 sha256 对得上的本机报告）。不需要升钉。
 - S110 切片 S3：新流程模块的证据评论 `autopilot-evidence:v2`（补丁指纹、merge-base、模块、检查、合并前验证结论与报告／回归文档 sha256、已核对产物）；硬卡 `admission/gate.py` 同时认 v1 与 v2，v2 要求结论为 pass／pass-with-notes、模块与接管评论一致、仍绑定当前 head（工作流不重算补丁指纹，rebase 后由编排复用验证结论、重发绑定新 head 的证据）。编排在合并前验证成立后发 v2 证据、过本地准入并合并。切片 12 改档对新流程模块改为：需求由用户确认，且技术方案已批（用户或审查方）、不需要审或没有技术方案。新流程模块的接管评论带 `flow: v2`，硬卡据此只认 v2 证据，其他模块只认 v1。检查输出和意见标题写进机器人评论前转义 HTML 注释标记。**需要升钉**（改到 `admission/`）：本机编排用 hub 自己的准入代码判定，升钉前也照样自动合并；没升钉的仓库，远端准入检查（只报告、不拦）读不懂 v2，会显示「不会自动合并」。
