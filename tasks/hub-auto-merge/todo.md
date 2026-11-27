@@ -28,7 +28,7 @@
 - [x] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
   - 验证：R5、R8、R10、R11、R12、R13
   - 文件：`orchestrator/watch.py`、`orchestrator/cli.py`、`tests/test_watch.py`
-- [ ] Task 9：degrade 的 `skip_main_red`
+- [x] Task 9：degrade 的 `skip_main_red`
   - 验证：R18
   - 文件：`.github/workflows/degrade.yml`、`degrade/run.py`、`tests/test_degrade.py`
 - [ ] Task 10：launchd 模板、README、CHANGELOG

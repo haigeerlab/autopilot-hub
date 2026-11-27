@@ -17,6 +17,10 @@ on:
         description: "40-char autopilot-hub commit SHA; must equal the SHA in the caller's `uses:` line"
         required: true
         type: string
+      skip_main_red:
+        description: "Skip main CI failures when autopilot watch handles them"
+        type: boolean
+        default: false
 
 # plugin-standard C8: nothing at the top level; each job asks for what it needs.
 permissions: {}
@@ -57,6 +61,8 @@ jobs:
         run: gh label create "autopilot:degrade" --color B60205 --description "autopilot 降级：关闭即解除" > /dev/null 2>&1 || true
 
       - name: Decide and open degrade issues
+        env:
+          SKIP_MAIN_RED: ${{ inputs.skip_main_red }}
         run: |
           python3 -B .hub/degrade/run.py --event-name "${GITHUB_EVENT_NAME}" --event-path "${GITHUB_EVENT_PATH}" --out-md degrade-summary.md
           cat degrade-summary.md >> "${GITHUB_STEP_SUMMARY}"

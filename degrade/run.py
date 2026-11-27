@@ -113,7 +113,7 @@ def open_degrade_keys(api, repo):
     return keys
 
 
-def candidates(event_name, event, api, repo, default_branch, notes):
+def candidates(event_name, event, api, repo, default_branch, notes, *, skip_main_red=False):
     """List of {reason, level, ref, evidence} the event calls for. Read-only."""
     found = []
     if event_name == "push":
@@ -134,6 +134,9 @@ def candidates(event_name, event, api, repo, default_branch, notes):
         run = event.get("workflow_run") or {}
         if run.get("conclusion") != "failure" or run.get("event") != "push" or run.get("head_branch") != default_branch:
             notes.append("主 CI 不是默认分支上推送触发的失败，跳过")
+            return found
+        if skip_main_red:
+            notes.append("skip_main_red=true，跳过主 CI 失败，由 autopilot watch 处理")
             return found
         pr = authored_pr(api, repo, run["head_sha"])
         if pr is None:
@@ -194,7 +197,7 @@ def check_close(event, api, repo, result):
     result["notes"].append(f"{login or '未知账号'} 没有管理员权限或不是真人账号，已重新打开 #{number}")
 
 
-def run(event_name, event, api):
+def run(event_name, event, api, *, skip_main_red=False):
     repo = event["repository"]["full_name"]
     default_branch = event["repository"]["default_branch"]
     notes = []
@@ -202,7 +205,7 @@ def run(event_name, event, api):
     if event_name == "issues" and event.get("action") == "closed":
         check_close(event, api, repo, result)
         return result
-    found = candidates(event_name, event, api, repo, default_branch, notes)
+    found = candidates(event_name, event, api, repo, default_branch, notes, skip_main_red=skip_main_red)
     if not found:
         return result
     existing = open_degrade_keys(api, repo)  # read everything before the first write
@@ -251,8 +254,9 @@ def main(argv=None):
     a = p.parse_args(argv)
     with open(a.event_path, encoding="utf-8") as f:
         event = json.load(f)
+    skip_main_red = os.environ.get("SKIP_MAIN_RED") == "true"
     try:
-        result = run(a.event_name, event, gh_api)
+        result = run(a.event_name, event, gh_api, skip_main_red=skip_main_red)
     except ApiError as e:
         print(f"degrade: {e}", file=sys.stderr)
         return 1
@@ -263,6 +267,9 @@ def main(argv=None):
     lines += [f"- 说明：{n}" for n in result["notes"]]
     with open(a.out_md, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    if skip_main_red and a.event_name == "workflow_run":
+        for note in result["notes"]:
+            print(f"degrade: {note}")
     print(f"degrade: opened={result['opened']} commented={result['commented']}")
     return 0
 
