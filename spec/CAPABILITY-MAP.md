@@ -11,10 +11,11 @@
 | Module id | Responsibility | Depends on |
 |---|---|---|
 | hub-auto-merge | 总账能力图第 2 行：合并前验证通过后由 hub 写 `autopilot/verified`、打开 GitHub 自动合并（检查已全绿时直接合并）；本机 `watch` 盯 CI；T4 不打开；CI 变红按三种分；主干变红时停下、收紧、通知，不自动撤回；等太久就停下告诉用户；风险分级按 R4 改 | — |
+| hub-release | 总账能力图第 3 行：主干 CI 通过后发版：读需求确认时的提前授权，有就直接发（步骤清单写进汇报），没有或已作废（出现 T4、要升主版本号）就列出清单停下等确认；之后自动走完到本机安装验证；版本 tag 由 hub 用 App 身份推（用户选 A）；已发出的版本有问题时通知用户、不自动撤回；失败或等太久时停下 | hub-auto-merge |
 
-Build order: hub-auto-merge
+Build order: hub-auto-merge → hub-release
 
-<!-- 总账能力图第 3 行 hub-release、第 9 行 hub-cleanup 开工时再加。 -->
+<!-- 总账能力图第 9 行 hub-cleanup 开工时再加。 -->
 
 ---
 
