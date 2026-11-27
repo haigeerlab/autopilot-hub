@@ -589,6 +589,33 @@ def case_failures(results):
             for case in results if case['result'] == 'fail'}
 
 
+def delegate_authorization_problem(authorization, hub_digest, *, expected_path=None):
+    if not isinstance(authorization, dict):
+        return 'delegate 结果文件缺少有效的 authorization 对象'
+    for field in ('source', 'path', 'sha256', 'bytes'):
+        if field not in authorization:
+            return f'delegate 结果文件缺少 authorization.{field}'
+    if authorization['source'] != 'file':
+        return 'delegate 结果文件的 authorization.source 不是 file'
+    path = authorization['path']
+    if not isinstance(path, str) or not path or (expected_path is not None and path != expected_path):
+        return 'delegate 记录的授权文件路径不一致'
+    if not isinstance(hub_digest, str) or not re.fullmatch(r'[0-9a-f]{64}', hub_digest):
+        return 'hub 授权文件的 SHA-256 缺失或无效'
+    if authorization['sha256'] != hub_digest:
+        return 'delegate 记录的授权文件 SHA-256 不一致'
+    size = authorization['bytes']
+    if type(size) is not int or size <= 0:
+        return 'delegate 结果文件的 authorization.bytes 无效'
+    return None
+
+
+def has_delegate_authorization(result):
+    if not isinstance(result, dict) or not result.get('executor'):
+        return False
+    return delegate_authorization_problem(result.get('authorization'), result.get('hubAuthorizationSha256')) is None
+
+
 def run_ai_case(work, case, head, author_host):
     if author_host == 'codex':
         return None, '非作者后端 claude-code 不支持 delegate run'
@@ -601,18 +628,16 @@ def run_ai_case(work, case, head, author_host):
             f'执行该用例，并把最后一行写成独立 JSON，不加代码围栏：'
             f'{{"case":"{cid}","result":"pass 或 fail","evidence":"实际观察和证据"}}。'
             'result 必须是 pass 或 fail，evidence 写下克隆删除后仍可核对的证据。')
-    output, reason = work.run_delegate(backend, head, task)
-    answer, separator, footer = (output or '').rpartition('\n---\n模型：')
+    run, reason = work.run_delegate(backend, head, task)
+    output = run['stdout'] if run is not None else ''
+    answer, separator, footer = output.rpartition('\n---\n模型：')
     if not separator or '\n过程日志（未进入本会话上下文）：' not in footer:
-        answer, footer = output or '', ''
+        answer, footer = output, ''
     if (answer.lstrip().startswith('NEED_USER:')
             or re.search(r'^delegate: run_id=\S+ status=needs-input(?: |$)', footer, re.M)):
         return None, 'delegate 要人回答，交你执行用例'
     if reason:
         return None, reason
-    authorization = re.search(r'^写入授权：文件 ([^\n]+)（sha256 ([0-9a-f]{12})）$', footer, re.M)
-    if authorization is None:
-        return None, 'delegate 没有记录授权来源'
     try:
         data = json.loads(answer.strip().rpartition('\n')[2])
     except ValueError:
@@ -621,9 +646,8 @@ def run_ai_case(work, case, head, author_host):
         return None, 'delegate 结尾 JSON 缺少有效结果或证据'
     if data.get('case') != cid:
         return None, 'delegate 返回的用例编号不匹配'
-    source = dict(path=authorization[1], sha256Prefix=authorization[2], line=authorization[0])
     return dict(executor=f'delegate:{backend}', result=data['result'], evidence=data['evidence'], exit=0,
-                authorization=source), None
+                authorization=run['authorization'], hubAuthorizationSha256=run['hubAuthorizationSha256']), None
 
 
 def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=None):
@@ -662,7 +686,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
     report = read_json(report_path)
     reused = False
     if (ai_approved and isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']
-            and not any(c.get('method') == 'ai-operate' and not (c.get('executor') and c.get('authorization'))
+            and not any(c.get('method') == 'ai-operate' and not has_delegate_authorization(c)
                         for c in report.get('cases', []))):
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
@@ -684,7 +708,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                 outcome = read_json(outcome_path)
                 result = outcome.get('result') if isinstance(outcome, dict) else None
                 reason = None
-                if not isinstance(result, dict) or result.get('result') != 'pass' or not result.get('authorization'):
+                if not has_delegate_authorization(result) or result.get('result') != 'pass':
                     execution, reason = run_ai_case(work, case, head, author_host)
                     result = None
                     if execution is not None:
@@ -694,6 +718,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                         execution['evidence'] = [evidence(os.path.join(logs, f'{cid}-delegate-{key}.log'), text)]
                         result = case_result(case, execution)
                         result['authorization'] = execution['authorization']
+                        result['hubAuthorizationSha256'] = execution['hubAuthorizationSha256']
                         if result['result'] == 'pass':
                             write_json(outcome_path, dict(result=result, reason=None))
             if reason is not None:

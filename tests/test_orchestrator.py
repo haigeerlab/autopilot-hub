@@ -749,7 +749,9 @@ class AiOperateFlowTest(RunRouteFixture):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         state = Path(home.name) / '.autopilot'
-        home_patch = mock.patch.dict(os.environ, HOME=home.name)
+        self.delegate_tmp = Path(home.name) / 'delegate temp'
+        self.delegate_tmp.mkdir()
+        home_patch = mock.patch.dict(os.environ, HOME=home.name, TMPDIR=str(self.delegate_tmp))
         home_patch.start()
         self.addCleanup(home_patch.stop)
         state_patch = mock.patch.object(cli, 'STATE', str(state))
@@ -775,7 +777,8 @@ class AiOperateFlowTest(RunRouteFixture):
             'scripts/delegate-exec.sh': r'''#!/bin/bash
 exec python3 -B "$(dirname "$0")/fake_delegate.py" "$@"
 ''',
-            'scripts/fake_delegate.py': '''import json
+            'scripts/fake_delegate.py': '''import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -795,6 +798,29 @@ with (root / 'calls.jsonl').open('a', encoding='utf-8') as file:
 Path('fixture.txt').write_text('changed by delegate')
 response = settings[cid]
 print(response['stdout'])
+run_id = f'20261127120000.{os.getpid()}'
+result_dir = Path(os.environ['TMPDIR']) / 'delegate'
+result_dir.mkdir(exist_ok=True)
+result_path = result_dir / f'{run_id}.result.json'
+result = dict(runId=run_id, status=response['status'], exitCode=response['exit'])
+if response['result'] is None:
+    path = Path(options[options.index('--authorized-by') + 1])
+    contents = path.read_bytes()
+    result['authorization'] = dict(source='file', path=str(path.resolve()),
+                                   sha256=hashlib.sha256(contents).hexdigest(), bytes=len(contents),
+                                   extra={'keep': ['intact', 7]})
+elif isinstance(response['result'], dict):
+    result.update(response['result'])
+if response['result'] != 'missing':
+    contents = response['result'] if isinstance(response['result'], str) else json.dumps(result)
+    result_path.write_text(contents, encoding='utf-8')
+if response['exit'] and response['status'] != 'needs-input':
+    if response['announce']:
+        print(f'delegate: result={result_path}', file=sys.stderr)
+else:
+    if response['announce']:
+        print(f'delegate: result={result_path}')
+    print(f"delegate: run_id={run_id} status={response['status']} resumable=false")
 sys.exit(response['exit'])
 ''',
         })
@@ -823,14 +849,18 @@ sys.exit(response['exit'])
         digest = hashlib.sha256(self.authorization.read_bytes()).hexdigest()
         return f'写入授权：文件 {self.authorization.resolve()}（sha256 {digest[:12]}）'
 
-    def footer(self, status='done', *, authorization=True):
-        line = self.authorization_line() + '\n' if authorization else ''
-        return ('\n---\n模型：宿主默认\n过程日志（未进入本会话上下文）：日志\n' + line
-                + f'delegate: result=report.json\ndelegate: run_id=fixture status={status} resumable=false')
+    def reported_authorization(self):
+        contents = self.authorization.read_bytes()
+        return dict(source='file', path=str(self.authorization.resolve()),
+                    sha256=hashlib.sha256(contents).hexdigest(), bytes=len(contents),
+                    extra={'keep': ['intact', 7]})
 
-    def responses(self, *, footer=True, **outcomes):
+    def responses(self, *, metadata=False, status='done', result=None, announce=True, **outcomes):
+        footer = '\n---\n模型：宿主默认\n过程日志（未进入本会话上下文）：日志'
+        if metadata:
+            footer += '\n' + self.authorization_line()
         (self.plugin / 'responses.json').write_text(json.dumps({
-            cid: dict(stdout=stdout + (self.footer() if footer else ''), exit=exit_code)
+            cid: dict(stdout=stdout + footer, exit=exit_code, status=status, result=result, announce=announce)
             for cid, (stdout, exit_code) in outcomes.items()
         }), encoding='utf-8')
 
@@ -997,9 +1027,9 @@ sys.exit(response['exit'])
         self.assertEqual((result['executor'], result['result']), ('delegate:codex', 'fail'))
 
     def test_delegate_only_receives_allowlisted_environment(self):
-        self.responses(footer=False, R1=('delegate output', 0))
+        self.responses(R1=('delegate output', 0))
         allowed = dict(PATH=os.environ['PATH'], HOME=os.environ['HOME'], USER='runner', LOGNAME='runner',
-                       SHELL='/bin/bash', LANG='C', LC_ALL='C', LC_MESSAGES='C', TMPDIR='/tmp',
+                       SHELL='/bin/bash', LANG='C', LC_ALL='C', LC_MESSAGES='C', TMPDIR=str(self.delegate_tmp),
                        CODEX_HOME='/tmp/codex-config')
         excluded = ('SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'AWS_SESSION_TOKEN', 'GOOGLE_APPLICATION_CREDENTIALS',
                     'AZURE_CLIENT_SECRET', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_PAT',
@@ -1009,12 +1039,12 @@ sys.exit(response['exit'])
             output, error = self.work.run_delegate('codex', self.head, '用例 R1')
 
         self.assertIsNone(error)
-        self.assertEqual(output.strip(), 'delegate output')
+        self.assertEqual(output['stdout'].splitlines()[0], 'delegate output')
         delegate = next(call for call in popen.call_args_list if call.args[0][0] == 'bash')
         self.assertEqual(delegate.kwargs['env'], allowed)
 
     def test_delegate_receives_proxy_environment(self):
-        self.responses(footer=False, R1=('delegate output', 0))
+        self.responses(R1=('delegate output', 0))
         proxies = {key: f'proxy-fixture-{key}' for key in (
             'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
             'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
@@ -1023,7 +1053,7 @@ sys.exit(response['exit'])
             output, error = self.work.run_delegate('codex', self.head, '用例 R1')
 
         self.assertIsNone(error)
-        self.assertEqual(output.strip(), 'delegate output')
+        self.assertEqual(output['stdout'].splitlines()[0], 'delegate output')
         delegate = next(call for call in popen.call_args_list if call.args[0][0] == 'bash')
         self.assertEqual({key: delegate.kwargs['env'].get(key) for key in proxies}, proxies)
 
@@ -1079,7 +1109,8 @@ sys.exit(response['exit'])
                 self.assertIn('超时', error)
             else:
                 output, error = self.work.run_delegate('codex', self.head, '用例 R1')
-                self.assertEqual((output, error), ('delegate output', None))
+                self.assertEqual(output['stdout'], 'delegate output')
+                self.assertIn('结果文件路径', error)
 
         self.assertIs(started[0].get('start_new_session'), True)
         self.assertEqual([sig for sig in signals if sig], [signal.SIGTERM, signal.SIGKILL])
@@ -1099,13 +1130,17 @@ sys.exit(response['exit'])
         self.assertEqual(report['verdict'], 'fail')
         auth_contents = self.authorization.read_bytes()
         auth_stat = self.authorization.stat()
-        expected_authorization = dict(path=str(self.authorization.resolve()),
-                                      sha256Prefix=hashlib.sha256(auth_contents).hexdigest()[:12],
-                                      line=self.authorization_line())
+        expected_authorization = self.reported_authorization()
+        expected_digest = hashlib.sha256(auth_contents).hexdigest()
         for result, expected in zip(report['cases'], [('pass', b'first evidence'), ('fail', b'second evidence')]):
             self.assertEqual((result['result'], result['executor'], result['exit']), (expected[0], 'delegate:codex', 0))
             self.assertEqual(io.verification_files['evidence/' + result['evidence'][0]['path']], expected[1])
             self.assertEqual(result['authorization'], expected_authorization)
+            self.assertEqual(result['hubAuthorizationSha256'], expected_digest)
+        [cached] = [json.loads(raw)['result'] for path, raw in io.verification_files.items()
+                    if path.endswith('.ai.json')]
+        self.assertEqual(cached['authorization'], expected_authorization)
+        self.assertEqual(cached['hubAuthorizationSha256'], expected_digest)
         calls = self.calls()
         self.assertEqual(len(calls), 2)
         for call in calls:
@@ -1136,7 +1171,7 @@ sys.exit(response['exit'])
         self.authorization.unlink()
         target = self.authorization.parent / 'other.md'
         target.write_text('授权内容', encoding='utf-8')
-        self.responses(footer=False, R1=('delegate must not run', 0))
+        self.responses(R1=('delegate must not run', 0))
         for kind in ('missing', 'symlink', 'directory', 'empty', 'too long'):
             with self.subTest(kind=kind):
                 if kind == 'symlink':
@@ -1164,21 +1199,55 @@ sys.exit(response['exit'])
         self.assertIn('delegate 版本低于 0.13.2（0.13.1）', io.verify_issues[0]['body'])
         self.assertEqual(self.calls(), [])
 
-    def test_missing_authorization_in_footer_falls_back_even_with_a_valid_answer(self):
-        answer = self.authorization_line() + '\n{"case":"R1","result":"pass","evidence":"evidence"}'
-        self.responses(footer=False, R1=(answer + self.footer(authorization=False), 0))
-        io = self.io('R1')
-        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
-        self.assertEqual(code, 1, out)
-        self.assertIn('delegate 没有记录授权来源', io.verify_issues[0]['body'])
-        self.assertEqual(io.verify_calls, [])
+    def test_invalid_delegate_result_authorization_falls_back_even_with_matching_metadata(self):
+        answer = '{"case":"R1","result":"pass","evidence":"evidence"}'
+        auth = self.reported_authorization()
+        same_prefix = auth['sha256'][:12] + ('0' if auth['sha256'][12] != '0' else '1') + auth['sha256'][13:]
+        faults = [
+            ('source', {'authorization': dict(auth, source='in-turn')}, 'authorization.source'),
+            ('sha256', {'authorization': dict(auth, sha256=same_prefix)}, 'SHA-256 不一致'),
+            ('path', {'authorization': dict(auth, path='/different.md')}, '授权文件路径不一致'),
+            ('missing object', {}, 'authorization 对象'),
+            ('not an object', {'authorization': ['file']}, 'authorization 对象'),
+        ]
+        for field in ('source', 'path', 'sha256', 'bytes'):
+            incomplete = auth.copy()
+            del incomplete[field]
+            faults.append((f'missing {field}', {'authorization': incomplete}, f'authorization.{field}'))
+        for fault, result, reason in faults:
+            with self.subTest(fault=fault):
+                self.responses(metadata=True, result=result, R1=(answer, 0))
+                io = self.io('R1')
+                code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+                self.assertEqual(code, 1, out)
+                self.assertIn('要你测 R1', out)
+                self.assertIn(reason, io.verify_issues[0]['body'])
+                self.assertEqual(io.verify_calls, [])
+                self.assertFalse(any(path.endswith('.ai.json') for path in io.verification_files))
+
+    def test_missing_or_corrupt_delegate_result_file_falls_back(self):
+        answer = '{"case":"R1","result":"pass","evidence":"evidence"}'
+        for result, announce, reason in (('missing', True, '无法读取 delegate 结果文件'),
+                                         ('invalid JSON', True, 'delegate 结果文件 JSON 无法解析'),
+                                         ('{"authorization": NaN}', True, 'delegate 结果文件 JSON 无法解析'),
+                                         (None, False, '结果文件路径'),
+                                         ({'runId': 'previous'}, True, '运行编号与本次运行不一致'),
+                                         ({'status': 'unknown'}, True, '状态不是 done')):
+            with self.subTest(result=result, announce=announce):
+                self.responses(metadata=True, result=result, announce=announce, R1=(answer, 0))
+                io = self.io('R1')
+                code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+                self.assertEqual(code, 1, out)
+                self.assertIn('要你测 R1', out)
+                self.assertIn(reason, io.verify_issues[0]['body'])
+                self.assertEqual(io.verify_calls, [])
 
     def test_need_user_answer_or_status_falls_back_without_continuing(self):
         answer = '{"case":"R1","result":"pass","evidence":"evidence"}'
-        for stdout, status in (('NEED_USER: 需要选择测试账号\n' + answer + self.footer(), 0),
-                               (answer + self.footer(status='needs-input'), 1)):
+        for stdout, status, exit_code in (('NEED_USER: 需要选择测试账号\n' + answer, 'done', 0),
+                                          (answer, 'needs-input', 1)):
             with self.subTest(status=status):
-                self.responses(footer=False, R1=(stdout, status))
+                self.responses(status=status, R1=(stdout, exit_code))
                 io = self.io('R1')
                 before = len(self.calls())
                 code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
@@ -1195,29 +1264,68 @@ sys.exit(response['exit'])
         self.assertIn('未确认模块已批准', io.verify_issues[0]['body'])
         self.assertEqual(self.calls(), [])
 
-    def test_old_pass_report_and_cache_without_authorization_are_not_reused(self):
+    def test_old_pass_report_and_cache_are_rerun_without_structured_authorization(self):
+        auth = self.reported_authorization()
+        legacy = dict(path=auth['path'], sha256Prefix=auth['sha256'][:12], line=self.authorization_line())
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"new delegate run"}', 0))
+        for prior in ({}, {'authorization': legacy}):
+            with self.subTest(prior=prior):
+                io = self.io('R1')
+                old_case = dict(id='R1', method='ai-operate', result='pass', failCategory=None,
+                                baselineCommit=None, evidence=[], executor='delegate:codex', exit=0, **prior)
+                document = io.regression_head[1]
+                patch_id = FakeWork(io).patch_id()
+                report_path, _, _ = io.verification_paths(REPO, patch_id)
+                report = json.dumps(dict(regression={'sha256': document['sha256']}, verdict='pass', cases=[old_case]))
+                io.write_verification_file(report_path, report)
+                io.verification_map = {'modules': [{'id': 'm', 'verification': {
+                    'current': True, 'reportSha256': hashlib.sha256(report.encode()).hexdigest(),
+                }}]}
+                key = hashlib.sha256(json.dumps([patch_id, 'R1', document['cases'][0]['sha256']]).encode()).hexdigest()
+                cache_path = f'{report_path}.{key}.ai.json'
+                io.write_verification_file(cache_path, json.dumps(dict(result=old_case, reason=None)))
+                before = len(self.calls())
+                code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+                self.assertEqual(code, 0, out)
+                self.assertEqual(len(self.calls()), before + 1)
+                self.assertEqual(self.verify.report(io)['cases'][0]['authorization'], auth)
+                self.assertEqual(json.loads(io.verification_files[cache_path])['result']['authorization'], auth)
+
+    def test_pass_report_with_structured_authorization_is_reused(self):
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"evidence"}', 0))
         io = self.io('R1')
-        old_case = dict(id='R1', method='ai-operate', result='pass', failCategory=None,
-                        baselineCommit=None, evidence=[], executor='delegate:codex', exit=0)
-        document = io.regression_head[1]
-        patch_id = FakeWork(io).patch_id()
-        report_path, _, _ = io.verification_paths(REPO, patch_id)
-        report = json.dumps(dict(regression={'sha256': document['sha256']}, verdict='pass', cases=[old_case]))
-        io.write_verification_file(report_path, report)
-        io.verification_map = {'modules': [{'id': 'm', 'verification': {
-            'current': True, 'reportSha256': hashlib.sha256(report.encode()).hexdigest(),
-        }}]}
-        key = hashlib.sha256(json.dumps([patch_id, 'R1', document['cases'][0]['sha256']]).encode()).hexdigest()
-        io.write_verification_file(f'{report_path}.{key}.ai.json', json.dumps(dict(result=old_case, reason=None)))
-        self.authorization.unlink()
-        self.responses(footer=False, R1=('delegate must not run', 0))
         code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        report_path, _, _ = io.verification_paths(REPO, FakeWork(io).patch_id())
+        report = io.verification_files[report_path]
+        [cache_path] = [path for path in io.verification_files if path.endswith('.ai.json')]
+        del io.verification_files[cache_path]
+
+        io.merged = False
+        self.find_delegate.return_value = None
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(io.verification_files[report_path], report)
+        self.assertEqual(self.delegate.call_count, 1)
+
+    def test_delegate_authorization_is_checked_against_the_pre_run_digest(self):
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"evidence"}', 0))
+        io = self.io('R1')
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command[0] == 'bash':
+                self.authorization.write_text('启动时已变更的授权文件', encoding='utf-8')
+            return real_popen(command, **kwargs)
+
+        with mock.patch.object(subprocess, 'Popen', side_effect=popen):
+            code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
         self.assertEqual(code, 1, out)
-        self.assertIn('没有记录打开自动路的授权', io.verify_issues[0]['body'])
-        self.assertEqual(self.calls(), [])
+        self.assertIn('要你测 R1', out)
+        self.assertIn('SHA-256 不一致', io.verify_issues[0]['body'])
 
     def test_authorization_cannot_be_changed_through_cli_while_delegate_runs(self):
-        self.responses(footer=False, R1=('delegate output', 0))
+        self.responses(R1=('delegate output', 0))
         original = self.authorization.read_bytes()
         real_popen = subprocess.Popen
         attempted = []
@@ -1231,7 +1339,9 @@ sys.exit(response['exit'])
             return real_popen(command, **kwargs)
 
         with mock.patch.object(subprocess, 'Popen', side_effect=popen):
-            self.assertEqual(self.work.run_delegate('codex', self.head, '用例 R1'), ('delegate output\n', None))
+            output, error = self.work.run_delegate('codex', self.head, '用例 R1')
+        self.assertIsNone(error)
+        self.assertEqual(output['stdout'].splitlines()[0], 'delegate output')
         self.assertEqual(len(attempted), 2)
         for code, message in attempted:
             self.assertNotEqual(code, 0)

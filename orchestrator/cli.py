@@ -100,17 +100,49 @@ def authorization_lock(path, mode):
         os.close(fd)
 
 
-def usable_authorization(path):
+def _authorization_sha256(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= AUTHORIZATION_MAX_BYTES:
-            return False
+            return None
         with os.fdopen(fd, "rb", closefd=False) as handle:
             contents = handle.read(AUTHORIZATION_MAX_BYTES + 1)
-        return len(contents) <= AUTHORIZATION_MAX_BYTES and bool(contents.decode("utf-8").strip())
+        if len(contents) <= AUTHORIZATION_MAX_BYTES and contents.decode("utf-8").strip():
+            return hashlib.sha256(contents).hexdigest()
+        return None
     finally:
         os.close(fd)
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _read_delegate_result(output, clone):
+    # On success delegate emits the result path immediately before its final run line on stdout.
+    announcement = re.search(r"^delegate: result=([^\n]+)\ndelegate: run_id=(\S+) status=\S+ "
+                             r"resumable=(?:true|false)\s*\Z", output, re.M)
+    if announcement is None:
+        return None, "delegate 没有在 stdout 报告本次运行的结果文件路径"
+    path, run_id = announcement.groups()
+    try:
+        fd = os.open(Path(clone, path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "无法读取 delegate 结果文件（不是普通文件）"
+            result = json.load(handle, parse_constant=_reject_json_constant)
+    except OSError:
+        return None, "无法读取 delegate 结果文件"
+    except (ValueError, RecursionError):
+        return None, "delegate 结果文件 JSON 无法解析"
+    if not isinstance(result, dict):
+        return None, "delegate 结果文件 JSON 缺少结果对象"
+    if result.get("runId") != run_id:
+        return None, "delegate 结果文件运行编号与本次运行不一致"
+    if result.get("status") != "done":
+        return None, "delegate 结果文件状态不是 done"
+    return result, None
 
 
 def find_project_config():
@@ -300,16 +332,24 @@ class Work:
         try:
             path = authorization_path(self.repo)
             with authorization_lock(path, fcntl.LOCK_SH):
-                if not usable_authorization(path):
+                digest = _authorization_sha256(path)
+                if digest is None:
                     return None, missing
-                return self._run_delegate_in_clone(script, backend, sha, task, path)
+                expected_path = os.path.realpath(path)
+                run, reason = self._run_delegate_in_clone(script, backend, sha, task, path)
+                if reason is not None:
+                    return run, reason
+                reason = flow.delegate_authorization_problem(
+                    run["authorization"], digest, expected_path=expected_path)
+                if reason is None:
+                    run["hubAuthorizationSha256"] = digest
+                return run, reason
         except (OSError, ValueError):
             return None, missing
 
     def _run_delegate_in_clone(self, script, backend, sha, task, authorization):
         git_env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
         delegate_env = {k: v for k, v in os.environ.items() if k in DELEGATE_ENV or k.startswith("LC_")}
-        process = None
         group_stopped = True
         try:
             tmp = tempfile.mkdtemp(prefix="autopilot-ai-case-")
@@ -326,12 +366,20 @@ class Work:
                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8",
                                            errors="replace", stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
-                    output, _ = process.communicate(timeout=CHECK_TIMEOUT)
+                    with process.stdout:
+                        output, _ = process.communicate(timeout=CHECK_TIMEOUT)
                 finally:
-                    process.stdout.close()
-            finally:
-                if process is not None:
                     group_stopped = _stop_delegate_group(process)
+                if not group_stopped:
+                    return None, "无法确认 delegate 进程组已退出，已保留临时克隆"
+                run = dict(stdout=output)
+                if process.returncode:
+                    return run, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
+                result, reason = _read_delegate_result(output, clone)
+                if reason is None:
+                    run["authorization"] = result.get("authorization")
+                return run, reason
+            finally:
                 if group_stopped:
                     shutil.rmtree(tmp)
         except subprocess.CalledProcessError:
@@ -342,12 +390,6 @@ class Work:
             return None, "准备克隆或执行 delegate 超时"
         except (OSError, ValueError):
             return None, "无法准备克隆或启动 delegate"
-
-        if not group_stopped:
-            return None, "无法确认 delegate 进程组已退出，已保留临时克隆"
-        if process.returncode:
-            return output, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
-        return output, None
 
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""

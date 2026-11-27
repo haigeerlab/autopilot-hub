@@ -91,9 +91,9 @@
 
 - `verify/core.py` 分组加 `ai`：执行方式 `ai-operate` 的用例归 `ai` 组。
 - 每条用例取自已批模块的回归测试文档，由 `git clone --no-hardlinks` 建立独立的一次性克隆。在克隆目录调用一轮 `delegate-exec.sh run --backend codex --write --authorized-by <授权文件> -- <用例步骤、预期、证据要求>`，要求答复结尾一行 JSON `{"case","result":"pass|fail","evidence"}`。跑完删除克隆。
-- 执行记录保留执行者、结果、证据、退出码和 `authorization`。授权来源取自 delegate 尾部元数据，记录路径、SHA-256 前 12 位和完整原行，并原样写入验证报告。
+- 执行记录保留执行者、结果、证据、退出码和 `authorization`。授权来源取自 delegate 结果文件的 authorization 字段，要求来源为 `file`，路径和完整 SHA-256 与 hub 启动 delegate 前核对的授权文件一致。执行记录和验证报告原样保留该对象，并另记 hub 算出的 `hubAuthorizationSha256`。只有旧格式授权来源的缓存和报告会重新验证。
 - 非作者一方：`run --author-host claude-code|codex` 由会话传入，选另一家；没传或另一家不可用 → 该用例转人工组。
-- 授权文件不可用、找不到 delegate、版本低于 0.13.2、后端不可用、需要人回答或解析不到结果和授权来源时，转人工组，跟踪 issue 注明「AI 执行不可用：<原因>」。七个仓库都是个人账号所有，人工组可以开跟踪 issue（`flow.py:580` 只拦组织仓库）。
+- 授权文件不可用、找不到 delegate、版本低于 0.13.2、后端不可用、需要人回答、无法解析结果或授权来源缺失或不匹配时，转人工组，跟踪 issue 注明「AI 执行不可用：<原因>」。七个仓库都是个人账号所有，人工组可以开跟踪 issue（`flow.py:580` 只拦组织仓库）。
 - **会动本机全局状态的用例**（例如装插件再试用）：一次性克隆隔离不了 `~/.claude`、`~/.codex`。第一版这类用例标 `manual`，交用户测。这偏离了总体方案 4.3b「在一次性环境里执行」，用户已同意（2026-11-27 在 ecosystem-lead 会话原话「三件都按推荐」，经 #23378 转来）。
 - `cli.py authorize --repo owner/name --quote <用户原话> --session <记录会话>` 原子写入 `~/.autopilot/authorizations/<owner>__<repo>.md`（目录 0700，文件 0600），`--replace` 可替换授权，`--revoke` 可收回。
 
@@ -233,4 +233,4 @@
 
 - 2026-11-27（Task 1 实现时，范围内修正）：第 1 节「`spec/**`、`tasks/**` 其余内容改动走普通规则」补一条护栏：未经编排核对批准仍有效的产物（不在 `classify` 的 `verified` 里）加 `human_only`，保留切片 12「不经批准改需求或 Plan 不会被自动合并」的保护；不再叫 T4。比原方案更保守。
 - 2026-11-27（第二批审查时）：第 9 节 watch 的令牌权限补充「收窄一步另申请 `contents` 写、`pull_requests` 写的短期令牌，只用于推 `autopilot/narrow-<n>` 分支并开收窄 PR」。第 5 节第 ④ 步需要开收窄 PR，原第 9 节漏写了这一权限。
-- 2026-11-27（delegate 0.13.2 发版后）：按用户原话「走 1，转 delegate 改」及 delegate#78/#80，第 4 节补上授权记录子命令、带授权的一轮执行和授权来源留存。
+- 2026-11-27（delegate 0.13.2 发版后）：按用户原话「走 1，转 delegate 改」及 delegate#78/#80，第 4 节补上授权记录子命令、带授权的一轮执行和授权来源留存，按 delegate-owner #23472 的建议以结果文件的 authorization 字段为准。
