@@ -2,6 +2,8 @@
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
         [--notify SESSION] [--author-host claude-code|codex]
+    python3 -B orchestrator/cli.py authorize --repo owner/name --quote "..." --session "..." [--replace]
+    python3 -B orchestrator/cli.py authorize --repo owner/name --revoke
     python3 -B orchestrator/cli.py followups --repo haigeerlab/autopilot-sandbox --pr 1 [--json]
     python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
@@ -21,6 +23,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,6 +56,9 @@ CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
 WATCH_LOCK_WAIT = 30
+AUTHORIZATION_MAX_BYTES = 64 * 1024
+AUTHORIZATION_RECORD_MAX_BYTES = 16 * 1024
+DELEGATE_AI_MINIMUM = (0, 13, 2)
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 RUN_WRITE = dict(WRITE, statuses="write")
 WATCH = dict(WRITE, contents="read", statuses="read", actions="write")
@@ -74,6 +80,37 @@ def _newest(cache, minimum, rel):
 
 def find_delegate():
     return os.environ.get("AUTOPILOT_DELEGATE") or _newest(DELEGATE_CACHE, (0, 10, 0), "scripts/delegate-exec.sh")
+
+
+def authorization_path(repo):
+    if (not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}", repo)
+            or repo.split("/")[1] in (".", "..")):
+        raise ValueError("授权仓库须使用 GitHub 的 owner/name")
+    return Path(STATE) / "authorizations" / (repo.replace("/", "__") + ".md")
+
+
+@contextlib.contextmanager
+def authorization_lock(path, mode):
+    # Lock the directory so replacement and revocation share the same lock as readers.
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, mode)
+        yield
+    finally:
+        os.close(fd)
+
+
+def usable_authorization(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= AUTHORIZATION_MAX_BYTES:
+            return False
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            contents = handle.read(AUTHORIZATION_MAX_BYTES + 1)
+        return len(contents) <= AUTHORIZATION_MAX_BYTES and bool(contents.decode("utf-8").strip())
+    finally:
+        os.close(fd)
 
 
 def find_project_config():
@@ -152,6 +189,7 @@ class Work:
 
     def __init__(self, root, repo, pr, token, delegate):
         self.root, self.pr, self.delegate = root, pr, delegate
+        self.repo = repo
         self.head, self.base_ref = pr["head"]["sha"], pr["base"]["ref"]
         self.git_env = _git_env(token)
         self.git("init", "-q")
@@ -251,16 +289,26 @@ class Work:
             version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
             if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version):
                 return None, "无法确认 delegate 版本"
-            major_minor = tuple(map(int, version.split(".")[:2]))
+            version_parts = tuple(map(int, version.split(".")))
+            version_tuple = (version_parts + (0,))[:3]
         except (OSError, ValueError, TypeError, KeyError, RuntimeError):
             return None, "无法确认 delegate 版本"
-        if major_minor < (0, 13):
-            return None, f"delegate 版本低于 0.13（{version}）"
+        if version_tuple < DELEGATE_AI_MINIMUM:
+            return None, f"delegate 版本低于 0.13.2（{version}）"
 
+        missing = "没有记录打开自动路的授权，或授权文件不可用"
+        try:
+            path = authorization_path(self.repo)
+            with authorization_lock(path, fcntl.LOCK_SH):
+                if not usable_authorization(path):
+                    return None, missing
+                return self._run_delegate_in_clone(script, backend, sha, task, path)
+        except (OSError, ValueError):
+            return None, missing
+
+    def _run_delegate_in_clone(self, script, backend, sha, task, authorization):
         git_env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
         delegate_env = {k: v for k, v in os.environ.items() if k in DELEGATE_ENV or k.startswith("LC_")}
-        # Delegate 0.13 only accepts --repo for review. Its run uses cwd and prints a footer after the answer.
-        legacy_run = major_minor == (0, 13)
         process = None
         group_stopped = True
         try:
@@ -272,11 +320,10 @@ class Work:
                              ("-C", clone, "remote", "remove", "origin")):
                     subprocess.run(["git", *args], env=git_env, check=True, capture_output=True,
                                    stdin=subprocess.DEVNULL, timeout=120)
-                command = ["bash", str(script), "run", "--backend", backend]
-                if not legacy_run:
-                    command.extend(("--repo", clone))
-                process = subprocess.Popen([*command, "--write", "--", task], cwd=clone, env=delegate_env,
-                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                command = ["bash", str(script), "run", "--backend", backend, "--write",
+                           "--authorized-by", str(authorization), "--", task]
+                process = subprocess.Popen(command, cwd=clone, env=delegate_env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8",
                                            errors="replace", stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
                     output, _ = process.communicate(timeout=CHECK_TIMEOUT)
@@ -299,11 +346,7 @@ class Work:
         if not group_stopped:
             return None, "无法确认 delegate 进程组已退出，已保留临时克隆"
         if process.returncode:
-            return None, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
-        if legacy_run:
-            answer, separator, footer = output.rpartition("\n---\n模型：")
-            if separator and "\n过程日志（未进入本会话上下文）：" in footer:
-                return answer, None
+            return output, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
         return output, None
 
     def run_release(self, command, version, repo, issue):
@@ -1321,6 +1364,53 @@ def clear_direct_merge_pause(state, repo, number):
         print(f"autopilot: PR 已合并，更新本机暂停记录失败：{error}", file=sys.stderr)
 
 
+def authorize_command(args):
+    try:
+        path = authorization_path(args.repo)
+        if args.revoke:
+            if args.quote is not None or args.session is not None:
+                raise ValueError("--revoke 不能与 --quote 或 --session 同用")
+            if path.parent.exists():
+                with authorization_lock(path, fcntl.LOCK_EX | fcntl.LOCK_NB):
+                    path.unlink(missing_ok=True)
+        else:
+            if not (args.quote and args.quote.strip() and args.session and args.session.strip()):
+                raise ValueError("记录授权须提供非空的 --quote 和 --session")
+            timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            content = (f"# 打开自动路的授权\n\n仓库：{args.repo}\n时间：{timestamp}\n记录会话：{args.session}\n"
+                       "范围：只用于该仓库合并前验证里执行方式为 ai-operate 的用例，"
+                       "每条用例一个一次性克隆、只跑一轮。\n\n"
+                       f"用户原话：\n{args.quote}\n").encode("utf-8")
+            if len(content) > AUTHORIZATION_RECORD_MAX_BYTES:
+                raise ValueError("授权记录超过 16 KiB")
+            Path(STATE).mkdir(mode=0o700, exist_ok=True)
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            with authorization_lock(path, fcntl.LOCK_EX | fcntl.LOCK_NB):
+                fd, temporary = tempfile.mkstemp(prefix=".authorize-", dir=path.parent)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        os.fchmod(handle.fileno(), 0o600)
+                        handle.write(content)
+                    if args.replace:
+                        os.replace(temporary, path)
+                    else:
+                        os.link(temporary, path)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+    except FileExistsError:
+        print("autopilot: 授权文件已存在，使用 --replace 才能覆盖", file=sys.stderr)
+        return 2
+    except BlockingIOError:
+        print("autopilot: 正在使用授权，请等 delegate 执行结束后重试", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"autopilot: 无法更新授权：{error}", file=sys.stderr)
+        return 2
+    action = "已收回授权" if args.revoke else "已记录授权"
+    print(f"autopilot: {args.repo} {action}")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot local orchestrator (slice 10)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1332,6 +1422,13 @@ def main(argv=None):
     r.add_argument("--notify", metavar="SESSION", help="queue handoff notices for this session")
     r.add_argument("--author-host", choices=("claude-code", "codex"),
                    help="record the author's host and select the other host for AI regression cases")
+    auth = sub.add_parser("authorize", help="记录或收回仓库的 AI 回归用例执行授权")
+    auth.add_argument("--repo", required=True, help="owner/name")
+    auth.add_argument("--quote", help="用户打开自动路时的原话")
+    auth.add_argument("--session", help="记录授权的会话名称")
+    auth_action = auth.add_mutually_exclusive_group()
+    auth_action.add_argument("--replace", action="store_true", help="替换已有授权")
+    auth_action.add_argument("--revoke", action="store_true", help="收回授权")
     follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
     follow.add_argument('--repo', required=True, help='owner/name')
     follow.add_argument('--pr', required=True, type=int)
@@ -1373,6 +1470,8 @@ def main(argv=None):
         return 2
     if a.cmd == "batch":
         return batch_command(a)
+    if a.cmd == "authorize":
+        return authorize_command(a)
     if a.cmd == "release":
         return release(a)
     if a.cmd == "report-failure":

@@ -20,7 +20,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - 删掉 `correction/cli.py` 里没人用的 `CANDIDATE_BLOCK` 正则（候选块照常写入）。`pipeline/engine.py` 写进本机账本的 `release_done` 是切片 14 Spec 定的发布完成记录，保留并在代码里注明暂无读取方。不需要升钉。
 
 ### Added
-- hub-auto-merge 第二批的 AI 操作用例：合并前验证把 `ai-operate` 用例交给非作者 delegate 后端，在独立的一次性克隆中执行，结果与证据写入验证报告。当前调用未传 `--authorized-by`，授权执行通道待 delegate 发版支持后接入。作者是 Codex、delegate 不可用或结果无法解析时转人工。不需要升钉。
+- hub-auto-merge 第二批的 AI 操作用例通过 `cli.py authorize` 记录用户打开仓库自动路时的原话，可用 `--revoke` 收回。合并前验证对已批模块的 `ai-operate` 用例逐条在一次性克隆中用 `--write --authorized-by` 调用非作者 delegate 后端，结果、证据和授权来源写入验证报告。授权或授权来源缺失、作者是 Codex、delegate 低于 0.13.2 或不可用、要人回答或结果无法解析时转人工。不需要升钉。
 - hub-auto-merge 第二批的 CI 分类（`orchestrator/classify.py`）：环境失败最多重跑两次，配置错误暂停交人，测试失败进入会话分析或主干收紧。不需要升钉。
 - hub-auto-merge 第二批的 `watch` 与 `report-failure`：巡检排队中的自动合并、PR 和主干 CI，记录暂停并通知，支持冻结、解冻与恢复。附每 5 分钟运行 `watch --once` 的 launchd 模板。不需要升钉。
 - hub-auto-merge 第二批的降级交接：`degrade.yml` 新增布尔输入 `skip_main_red`，为 `true` 时把主干 CI 失败交给 watch。**使用新输入的 caller 需要升钉**（`uses:` 与 `hub_ref` 指向同一个新提交）。输入默认 `false`，未升钉的 caller 沿用原行为。

@@ -602,17 +602,28 @@ def run_ai_case(work, case, head, author_host):
             f'{{"case":"{cid}","result":"pass 或 fail","evidence":"实际观察和证据"}}。'
             'result 必须是 pass 或 fail，evidence 写下克隆删除后仍可核对的证据。')
     output, reason = work.run_delegate(backend, head, task)
+    answer, separator, footer = (output or '').rpartition('\n---\n模型：')
+    if not separator or '\n过程日志（未进入本会话上下文）：' not in footer:
+        answer, footer = output or '', ''
+    if (answer.lstrip().startswith('NEED_USER:')
+            or re.search(r'^delegate: run_id=\S+ status=needs-input(?: |$)', footer, re.M)):
+        return None, 'delegate 要人回答，交你执行用例'
     if reason:
         return None, reason
+    authorization = re.search(r'^写入授权：文件 ([^\n]+)（sha256 ([0-9a-f]{12})）$', footer, re.M)
+    if authorization is None:
+        return None, 'delegate 没有记录授权来源'
     try:
-        data = json.loads(output.strip().rpartition('\n')[2])
+        data = json.loads(answer.strip().rpartition('\n')[2])
     except ValueError:
         return None, 'delegate 结尾 JSON 无法解析'
     if not isinstance(data, dict) or data.get('result') not in ('pass', 'fail') or not data.get('evidence'):
         return None, 'delegate 结尾 JSON 缺少有效结果或证据'
     if data.get('case') != cid:
         return None, 'delegate 返回的用例编号不匹配'
-    return dict(executor=f'delegate:{backend}', result=data['result'], evidence=data['evidence'], exit=0), None
+    source = dict(path=authorization[1], sha256Prefix=authorization[2], line=authorization[0])
+    return dict(executor=f'delegate:{backend}', result=data['result'], evidence=data['evidence'], exit=0,
+                authorization=source), None
 
 
 def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=None):
@@ -633,6 +644,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
     if dry_run:
         notes.append('合并前验证分组：' + json.dumps({k: [c['id'] for c in v] for k, v in groups.items()}, ensure_ascii=False))
         return dict(result='dry-run', step='verification', reason='预演：已读取回归文档并分组', notes=notes, head_sha=head)
+    ai_approved = not groups['ai'] or bool(verify_artifacts(work.module_view(), module, [doc['document']], flow_v2=True))
     patch_id = work.patch_id()
     report_path, logs, cache_path = io.verification_paths(repo, patch_id)
     def read_json(path):
@@ -649,8 +661,8 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                     sha256=hashlib.sha256(raw).hexdigest(), source=source)
     report = read_json(report_path)
     reused = False
-    if (isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']
-            and not any(c.get('method') == 'ai-operate' and not c.get('executor')
+    if (ai_approved and isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']
+            and not any(c.get('method') == 'ai-operate' and not (c.get('executor') and c.get('authorization'))
                         for c in report.get('cases', []))):
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
@@ -662,13 +674,17 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
         ai_results, ai_unavailable = {}, {}
         for case in groups['ai']:
             cid = case['id']
+            if not ai_approved:
+                groups['manual'].append(case)
+                ai_unavailable[cid] = '未确认模块已批准，不能委托执行回归用例'
+                continue
             key = hashlib.sha256(json.dumps([patch_id, cid, case['sha256']]).encode('utf-8')).hexdigest()
             outcome_path = f'{report_path}.{key}.ai.json'
             with io.verification_case_lock(outcome_path):
                 outcome = read_json(outcome_path)
                 result = outcome.get('result') if isinstance(outcome, dict) else None
                 reason = None
-                if not isinstance(result, dict) or result.get('result') != 'pass':
+                if not isinstance(result, dict) or result.get('result') != 'pass' or not result.get('authorization'):
                     execution, reason = run_ai_case(work, case, head, author_host)
                     result = None
                     if execution is not None:
@@ -677,6 +693,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                             text = json.dumps(text, ensure_ascii=False, indent=2)
                         execution['evidence'] = [evidence(os.path.join(logs, f'{cid}-delegate-{key}.log'), text)]
                         result = case_result(case, execution)
+                        result['authorization'] = execution['authorization']
                         if result['result'] == 'pass':
                             write_json(outcome_path, dict(result=result, reason=None))
             if reason is not None:
