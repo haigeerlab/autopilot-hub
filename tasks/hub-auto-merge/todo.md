@@ -22,7 +22,7 @@
 - [x] Task 6：ai-operate 交 delegate
   - 验证：R7
   - 文件：`verify/core.py`、`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_verify.py`、`tests/test_orchestrator.py`
-- [ ] Task 7：`orchestrator/classify.py`
+- [x] Task 7：`orchestrator/classify.py`
   - 验证：R8（`tests.test_classify`）
   - 文件：`orchestrator/classify.py`、`tests/test_classify.py`
 - [ ] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
