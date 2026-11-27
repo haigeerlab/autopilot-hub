@@ -25,7 +25,7 @@
 - [x] Task 7：`orchestrator/classify.py`
   - 验证：R8（`tests.test_classify`）
   - 文件：`orchestrator/classify.py`、`tests/test_classify.py`
-- [ ] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
+- [x] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
   - 验证：R5、R8、R10、R11、R12、R13
   - 文件：`orchestrator/watch.py`、`orchestrator/cli.py`、`tests/test_watch.py`
 - [ ] Task 9：degrade 的 `skip_main_red`
