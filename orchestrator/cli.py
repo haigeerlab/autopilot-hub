@@ -14,10 +14,13 @@ import argparse
 import base64
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,9 +46,11 @@ STATE = os.path.expanduser("~/.autopilot")
 DELEGATE_CACHE = os.path.expanduser("~/.claude/plugins/cache/delegate-marketplace/delegate")
 SPEC_GUARD_CACHE = os.path.expanduser("~/.claude/plugins/cache/spec-guard-marketplace/spec-guard")
 SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL", "TERM")
+DELEGATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "CODEX_HOME")
 CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
+WATCH_LOCK_WAIT = 30
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 RUN_WRITE = dict(WRITE, statuses="write")
 WATCH = dict(WRITE, contents="read", statuses="read", actions="write")
@@ -113,6 +118,28 @@ def _git_env(token):
 
 def _clean_env():
     return {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")}
+
+
+def _stop_delegate_group(process):
+    for sig, wait_seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            process.poll()
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    return False
 
 
 class Work:
@@ -226,11 +253,13 @@ class Work:
             return None, f"delegate 版本低于 0.13（{version}）"
 
         git_env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
-        delegate_env = {k: v for k, v in _clean_env().items() if not k.startswith("GIT_")}
+        delegate_env = {k: v for k, v in os.environ.items() if k in DELEGATE_ENV or k.startswith("LC_")}
         # Delegate 0.13 only accepts --repo for review. Its run uses cwd and prints a footer after the answer.
         legacy_run = major_minor == (0, 13)
         try:
-            with tempfile.TemporaryDirectory(prefix="autopilot-ai-case-") as tmp:
+            tmp = tempfile.mkdtemp(prefix="autopilot-ai-case-")
+            retain_clone = False
+            try:
                 clone = os.path.realpath(os.path.join(tmp, "repo"))
                 for args in (("clone", "-q", "--no-hardlinks", "--no-checkout", "--", self.root, clone),
                              ("-C", clone, "checkout", "-q", "--detach", sha),
@@ -240,9 +269,22 @@ class Work:
                 command = ["bash", str(script), "run", "--backend", backend]
                 if not legacy_run:
                     command.extend(("--repo", clone))
-                result = subprocess.run([*command, "--write", "--", task], cwd=clone, env=delegate_env,
-                                        capture_output=True, text=True, errors="replace",
-                                        stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT)
+                process = subprocess.Popen([*command, "--write", "--", task], cwd=clone, env=delegate_env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                           errors="replace", stdin=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    output, _ = process.communicate(timeout=CHECK_TIMEOUT)
+                except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError) as error:
+                    retain_clone = True
+                    retain_clone = not _stop_delegate_group(process)
+                    if retain_clone and isinstance(error, subprocess.TimeoutExpired):
+                        return None, "执行 delegate 超时，无法确认进程组已退出，已保留临时克隆"
+                    raise
+                finally:
+                    process.stdout.close()
+            finally:
+                if not retain_clone:
+                    shutil.rmtree(tmp)
         except subprocess.CalledProcessError:
             return None, "准备用例的独立克隆失败"
         except subprocess.TimeoutExpired:
@@ -250,13 +292,13 @@ class Work:
         except (OSError, ValueError):
             return None, "无法准备克隆或启动 delegate"
 
-        if result.returncode:
-            return None, f"delegate 后端 {backend} 执行失败（退出码 {result.returncode}）"
+        if process.returncode:
+            return None, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
         if legacy_run:
-            answer, separator, footer = result.stdout.rpartition("\n---\n模型：")
+            answer, separator, footer = output.rpartition("\n---\n模型：")
             if separator and "\n过程日志（未进入本会话上下文）：" in footer:
                 return answer, None
-        return result.stdout, None
+        return output, None
 
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
@@ -680,6 +722,15 @@ class LocalIO:
         directory = os.path.join(STATE, "evidence", repo.replace("/", "__"))
         prefix = os.path.join(directory, patch_id)
         return prefix + ".verification.json", prefix + ".logs", prefix + ".cases.json"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def verification_case_lock(path):
+        lock_path = Path(path).with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
 
     @staticmethod
     def write_verification_file(path, content):
@@ -1203,9 +1254,11 @@ def watch_round(state):
 
 def watch_command(args):
     state = WatchState(STATE)
+    controls = [flag for flag, enabled in (("--freeze", args.freeze), ("--unfreeze", args.unfreeze),
+                                           ("--resume", args.resume)) if enabled]
     try:
         while True:
-            with state.lock():
+            with state.lock(wait_seconds=WATCH_LOCK_WAIT if controls else 0):
                 if args.freeze or args.unfreeze:
                     state.set_frozen(args.freeze)
                 if args.resume:
@@ -1218,8 +1271,14 @@ def watch_command(args):
                 return status
             time.sleep(300)
     except StateLockedError:
+        if controls:
+            print(f"autopilot: watch 等待状态锁超时，{'、'.join(controls)} 未生效，请重试", file=sys.stderr)
+            return 1
         return 0
     except KeyboardInterrupt:
+        if controls:
+            print(f"autopilot: watch {'、'.join(controls)} 已中断，请核对状态后重试", file=sys.stderr)
+            return 130
         return 0
     except (OSError, StateCorruptError) as error:
         print(f"autopilot: watch 无法更新本机状态：{error}", file=sys.stderr)
@@ -1232,10 +1291,11 @@ def report_failure_command(args):
         return 2
     state = WatchState(STATE)
     try:
-        with state.lock():
+        with state.lock(wait_seconds=WATCH_LOCK_WAIT):
             watch.report_failure(state, args.repo, args.pr, args.stage, args.detail, LocalIO.ledger)
     except StateLockedError:
-        return 0
+        print("autopilot: report-failure 等待状态锁超时，失败未记录，请重试", file=sys.stderr)
+        return 1
     except (OSError, StateCorruptError) as error:
         print(f"autopilot: 无法记录暂停：{error}", file=sys.stderr)
         return 2

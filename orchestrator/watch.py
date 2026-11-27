@@ -237,11 +237,15 @@ class Watch:
             raise errors[0]
 
     def verified(self, io, repo, head):
-        statuses = pages(io.api(f"repos/{repo}/commits/{head}/status?per_page=100"), "statuses")
+        statuses = io.api(f"repos/{repo}/commits/{head}/statuses?per_page=100")
+        if not isinstance(statuses, list) or any(not isinstance(row, dict) for row in statuses):
+            raise degrade.ApiError("GitHub 返回的提交状态明细数据不完整")
+        # GitHub returns statuses in reverse chronological order.
         status = next((row for row in statuses if row.get("context") == flow.VERIFIED), {})
         creator = status.get("creator")
         bot = io.bot_identity()
-        if creator and bot and creator.get("id") != bot["id"]:
+        if (not bot or not isinstance(creator, dict) or creator.get("type") != "Bot"
+                or creator.get("id") != bot["id"]):
             return {}
         return status
 
@@ -344,18 +348,32 @@ class Watch:
                 reason, recovery = self.error(repo, "PR 巡检", exc, io=io, number=number)
                 self.pause_pr_error(io, repo, number, reason, recovery)
 
-    def list_runs(self, io, repo, **filters):
+    def action_runs(self, io, repo, *, cursor=None, **filters):
+        """Fetch newest-first pages until there are no runs newer than the cursor."""
         path = f"repos/{repo}/actions/runs"
-        query = urlencode(dict(filters, per_page=100))
-        result = io.api(f"{path}?{query}")
-        first_page = result[0] if isinstance(result, list) and result else result
-        if isinstance(first_page, dict) and first_page.get("total_count", 0) >= 1000:
-            # GitHub caps filtered Actions searches at 1000 results.
-            result = io.api(path + "?per_page=100")
+        params = filters
+        page, page_size = 1, 100
         fields = {"branch": "head_branch"}
-        runs = (checked_run(run) for run in pages(result, "workflow_runs")
-                if all(run.get(fields.get(key, key)) == value for key, value in filters.items()))
-        return sorted(runs,
+        while True:
+            query = urlencode(dict(params, per_page=page_size, page=page))
+            result = io.api(f"{path}?{query}", paginate=False)
+            if page == 1 and params and isinstance(result, dict) and result.get("total_count", 0) >= 1000:
+                # GitHub caps filtered Actions searches at 1000 results.
+                params = {}
+                continue
+            rows = pages(result, "workflow_runs")
+            for run in rows:
+                run = checked_run(run)
+                if cursor is not None and run["id"] <= cursor:
+                    return
+                if all(run.get(fields.get(key, key)) == value for key, value in filters.items()):
+                    yield run
+            if len(rows) < page_size:
+                return
+            page += 1
+
+    def list_runs(self, io, repo, **filters):
+        return sorted(self.action_runs(io, repo, **filters),
                       key=lambda run: (run["id"], run.get("run_attempt", 1)))
 
     def reconcile_reruns(self, io, repo, event, number=None, head=None):
@@ -484,7 +502,7 @@ class Watch:
                 reason = (f"同一原因修了两次仍失败：{repair_key}。已试过 {'、'.join(commits)}。"
                           "可继续修复并重新验证、修订方案后重新确认，或交用户手工处理")
                 return self.pause_ci(io, repo, number, pr, key, fields, reason, "用户决定")
-            self.notice(key, repo, number, notify,
+            self.notice(key, repo, number, notify or "user",
                         f"{repo}#{number} 的 CI 测试失败。{reason}。请分析代码或用例。{run.get('html_url', '')}")
         else:
             incident = key + ":main-red"
@@ -598,7 +616,7 @@ class Watch:
         base = (io.api(f"repos/{repo}") or {}).get("default_branch")
         if not base:
             raise degrade.ApiError("GitHub 未返回默认分支")
-        runs = self.list_runs(io, repo, event="push", branch=base)
+        runs = list(self.action_runs(io, repo, cursor=cursor, event="push", branch=base))
         records = self.state.read()["runs"]
         known = {}
         for key, record in records.items():
@@ -616,8 +634,6 @@ class Watch:
 
         for run in sorted(runs, key=lambda item: item["id"]):
             run_id = run["id"]
-            if cursor is not None and run_id <= cursor and run_id not in known:
-                continue
             if self.inspect_ci_run(io, repo, run, base=base) == "retry":
                 break
             cursor = run_id if cursor is None else max(cursor, run_id)

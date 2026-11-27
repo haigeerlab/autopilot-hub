@@ -160,9 +160,13 @@ class FakeGitHub:
         if parts[0] == "pulls" and len(parts) == 2 and method == "GET":
             return self.prs[int(parts[1])]
         if parts[0] == "commits" and parts[2] in ("status", "statuses"):
-            rows = [{"context": flow.VERIFIED, "state": self.statuses[parts[1]],
-                     "target_url": f"https://github.com/{REPO}/issues/7#issuecomment-1"}] if parts[1] in self.statuses else []
-            return {"statuses": rows} if parts[2] == "status" else rows
+            status = self.statuses.get(parts[1], [])
+            rows = status if isinstance(status, list) else [{
+                "context": flow.VERIFIED, "state": status, "creator": BOT_USER,
+                "target_url": f"https://github.com/{REPO}/issues/7#issuecomment-1",
+            }]
+            return {"statuses": [{k: v for k, v in row.items() if k != "creator"} for row in rows]} \
+                if parts[2] == "status" else rows
         if parts[0] == "commits" and parts[2] == "pulls":
             return [pr for pr in self.prs.values() if pr["merge_commit_sha"] == parts[1]]
         if endpoint == "actions/runs" and method == "GET":
@@ -170,6 +174,10 @@ class FakeGitHub:
                        and all(run[field] in query[param] for param, field in
                               (("event", "event"), ("branch", "head_branch"), ("head_sha", "head_sha"))
                               if param in query)]
+            if "page" in query:
+                size, page = int(query["per_page"][0]), int(query["page"][0])
+                ordered = sorted(matches, key=lambda run: run["id"], reverse=True)
+                return {"total_count": len(matches), "workflow_runs": ordered[(page - 1) * size:page * size]}
             return [{"workflow_runs": list(reversed(matches[1:]))}, {"workflow_runs": matches[:1]}]
         if parts[:2] == ["actions", "runs"]:
             run_id = int(parts[2])
@@ -305,8 +313,48 @@ class HeadChangedTest(WatchTestCase):
         self.assertIsNone(self.github.prs[7]["auto_merge"])
         self.assertEqual(len(self.effects("relay")), 1)
 
+    def test_verified_requires_hub_creator_on_the_latest_status(self):
+        trusted = {"context": flow.VERIFIED, "state": "success", "creator": BOT_USER}
+        other_context = {"context": "CI", "state": "success", "creator": BOT_USER}
+        for number, (creator, bot) in enumerate([
+                (None, BOT), (dict(BOT_USER, id=456), BOT), (BOT_USER, None),
+                (dict(BOT_USER, type="User"), BOT)], start=7):
+            with self.subTest(creator=creator, bot=bot):
+                self.tracked_pr(number)
+                self.github.statuses[HEAD] = [other_context, dict(trusted, creator=creator), trusted]
+                with mock.patch.object(self.github, "bot_identity", return_value=bot):
+                    self.assertEqual(self.once(), 0)
+                self.assert_paused(self.state.get_pr(REPO, number))
+                self.assertIsNone(self.github.prs[number]["auto_merge"])
+
+        self.tracked_pr(12)
+        self.github.statuses[HEAD] = [other_context, trusted]
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.state.get_pr(REPO, 12)["state"], "automerge-on")
+        paths = [urlsplit(path).path for method, path in self.github.requests if method == "GET"]
+        self.assertIn(f"repos/{REPO}/commits/{HEAD}/statuses", paths)
+        self.assertNotIn(f"repos/{REPO}/commits/{HEAD}/status", paths)
+
 
 class PrCiFailureTest(WatchTestCase):
+    def test_test_failure_without_session_notifies_user_once(self):
+        self.tracked_pr(notify=None)
+        self.github.runs[10] = ci(10)
+        self.fail_desktop = True
+
+        self.once()
+
+        notices = self.state.pending_notifications()
+        self.assertEqual([item["target"] for item in notices], ["user"])
+        self.assertIn("CI 测试失败", notices[0]["body"])
+        self.assertEqual(self.effects("relay"), [])
+        self.fail_desktop = False
+        self.once()
+        self.once()
+        self.assertEqual(self.state.pending_notifications(), [])
+        self.assertEqual(len(self.effects("desktop")), 1)
+        self.assertEqual(self.effects("comment"), [("comment", 7)])
+
     def test_environment_reruns_only_twice(self):
         self.tracked_pr()
         self.github.runs[10] = ci(10)
@@ -424,6 +472,30 @@ class MainRedTest(WatchTestCase):
 
 
 class TimeoutAndFailureTest(WatchTestCase):
+    def test_report_failure_lock_timeout_reports_unsaved_failure(self):
+        with WatchState(self.directory).lock(), mock.patch("orchestrator.state.time.monotonic", side_effect=[0, 31]):
+            result = self.command("report-failure", "--repo", REPO, "--pr", "7",
+                                  "--stage", "open-pr", "--detail", "GitHub refused")
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("失败未记录", self.errors.getvalue())
+        self.assertIn("重试", self.errors.getvalue())
+        self.assertIsNone(self.state.get_pr(REPO, 7))
+        self.assertEqual(self.state.pending_notifications(), [])
+
+    def test_report_failure_waits_for_lock_and_records_after_release(self):
+        other = ExitStack()
+        with other:
+            other.enter_context(WatchState(self.directory).lock())
+            with mock.patch("orchestrator.state.time.sleep", side_effect=lambda _: other.close()) as sleep:
+                result = self.command("report-failure", "--repo", REPO, "--pr", "7",
+                                      "--stage", "open-pr", "--detail", "GitHub refused")
+
+        sleep.assert_called_once()
+        self.assertEqual(result, 0)
+        self.assert_paused(self.state.get_pr(REPO, 7))
+        self.assertEqual(len(self.state.pending_notifications()), 1)
+
     def test_automerge_over_one_hour_is_closed_and_paused(self):
         self.tracked_pr(since=OLD)
 
@@ -535,6 +607,42 @@ class TimeoutAndFailureTest(WatchTestCase):
 
 
 class FreezeTest(WatchTestCase):
+    def test_watch_controls_report_lock_timeout_without_changing_state(self):
+        self.state.set_frozen(True)
+        self.state.narrow_repo(REPO, "main-red", "20:1")
+        for flags in [("--freeze",), ("--unfreeze",), ("--resume", REPO)]:
+            with self.subTest(flags=flags), WatchState(self.directory).lock(), \
+                    mock.patch("orchestrator.state.time.monotonic", side_effect=[0, 31]):
+                self.errors.seek(0)
+                self.errors.truncate()
+                self.assertNotEqual(self.command("watch", *flags), 0)
+                self.assertIn("未生效", self.errors.getvalue())
+                self.assertIn(flags[0], self.errors.getvalue())
+        self.assertTrue(self.state.is_frozen())
+        self.assertIsNotNone(self.state.get_narrowed(REPO))
+        self.mint.assert_not_called()
+
+    def test_freeze_waits_for_lock_before_closing_queue(self):
+        self.tracked_pr()
+        other = ExitStack()
+        with other:
+            other.enter_context(WatchState(self.directory).lock())
+            with mock.patch("orchestrator.state.time.sleep", side_effect=lambda _: other.close()) as sleep:
+                result = self.command("watch", "--freeze")
+
+        sleep.assert_called_once()
+        self.assertEqual(result, 0)
+        self.assertTrue(self.state.is_frozen())
+        self.assertIsNone(self.github.prs[7]["auto_merge"])
+
+    def test_interrupted_freeze_wait_reports_failure(self):
+        with WatchState(self.directory).lock(), mock.patch("orchestrator.state.time.sleep", side_effect=KeyboardInterrupt):
+            result = self.command("watch", "--freeze")
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("中断", self.errors.getvalue())
+        self.assertFalse(self.state.is_frozen())
+
     def test_frozen_watch_only_closes_queued_prs(self):
         self.tracked_pr()
         self.github.add_pr(8)
@@ -589,6 +697,28 @@ class FreezeTest(WatchTestCase):
 
 
 class ResumeTest(WatchTestCase):
+    def test_main_actions_paging_stops_at_cursor_and_processes_new_runs_in_order(self):
+        self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 120)
+        self.github.runs = {number: ci(number, "push", conclusion="success") for number in range(1, 232)}
+        api = self.github.api
+
+        def one_page_at_a_time(path, method="GET", body=None, **kwargs):
+            if urlsplit(path).path == f"repos/{REPO}/actions/runs":
+                self.assertIs(kwargs.get("paginate"), False)
+            return api(path, method, body, **kwargs)
+
+        with mock.patch.object(self.github, "api", side_effect=one_page_at_a_time):
+            self.assertEqual(self.once(), 0)
+
+        queries = [parse_qs(urlsplit(path).query) for method, path in self.github.requests
+                   if method == "GET" and urlsplit(path).path == f"repos/{REPO}/actions/runs"]
+        self.assertEqual([query["page"] for query in queries], [["1"], ["2"]])
+        detail = [int(path.rsplit("/", 1)[1]) for method, path in self.github.requests
+                  if method == "GET" and path.startswith(f"repos/{REPO}/actions/runs/")]
+        self.assertEqual(detail, list(range(121, 232)))
+        self.assertEqual(self.state.get_cursor(REPO), 231)
+
     def test_processes_all_runs_beyond_cursor_and_finishes_merge_once(self):
         self.tracked_pr()
         self.github.add_pr(7, queued=False, merged=True)

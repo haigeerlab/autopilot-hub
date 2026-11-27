@@ -647,23 +647,33 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
         digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
-        # A failed verdict is never reused: the next run re-executes (failures may be flaky).
+        # Rebuild failed reports so flaky command cases can be re-executed.
         reused = (state.get('current') is True and state.get('reportSha256') == digest
                   and report.get('verdict') != 'fail')
     if not reused:
         ai_results, ai_unavailable = {}, {}
         for case in groups['ai']:
             cid = case['id']
-            execution, reason = run_ai_case(work, case, head, author_host)
-            if reason:
+            key = hashlib.sha256(json.dumps([patch_id, cid, case['sha256']]).encode('utf-8')).hexdigest()
+            outcome_path = f'{report_path}.{key}.ai.json'
+            with io.verification_case_lock(outcome_path):
+                outcome = read_json(outcome_path)
+                if outcome is None:
+                    execution, reason = run_ai_case(work, case, head, author_host)
+                    result = None
+                    if execution is not None:
+                        text = execution['evidence']
+                        if not isinstance(text, str):
+                            text = json.dumps(text, ensure_ascii=False, indent=2)
+                        execution['evidence'] = [evidence(os.path.join(logs, f'{cid}-delegate-{key}.log'), text)]
+                        result = case_result(case, execution)
+                    outcome = dict(result=result, reason=reason)
+                    write_json(outcome_path, outcome)
+            if outcome['reason'] is not None:
                 groups['manual'].append(case)
-                ai_unavailable[cid] = reason
-                continue
-            text = execution['evidence']
-            if not isinstance(text, str):
-                text = json.dumps(text, ensure_ascii=False, indent=2)
-            execution['evidence'] = [evidence(os.path.join(logs, cid+'-delegate.log'), text)]
-            ai_results[cid] = case_result(case, execution)
+                ai_unavailable[cid] = outcome['reason']
+            else:
+                ai_results[cid] = outcome['result']
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:

@@ -9,6 +9,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -232,6 +233,9 @@ class FakeIO:
 
     def verification_paths(self, repo, patch_id):
         return ('evidence/patch.verification.json', 'evidence/patch.logs', 'evidence/patch.cases.json')
+
+    def verification_case_lock(self, path):
+        return contextlib.nullcontext()
 
     def read_bytes(self, path):
         if path not in self.verification_files:
@@ -756,6 +760,101 @@ sys.exit(response['exit'])
             self.assertNotEqual(call['object'], [src.st_dev, src.st_ino])
             self.assertFalse(Path(call['cwd']).exists(), call)
         self.assertEqual(Path(self.work.root, 'fixture.txt').read_text(), 'base')
+
+    def test_delegate_outcomes_reused_until_case_hash_or_patch_changes(self):
+        self.responses(R1=('later output\n{"case":"R1","result":"pass","evidence":"pass"}', 0),
+                       R2=('later output\n{"case":"R2","result":"fail","evidence":"fail"}', 0))
+        io = self.io('R1', 'R2')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.assertEqual(self.delegate.call_count, 2)
+        self.assertEqual([entry['result'] for entry in self.verify.report(io)['cases']], ['pass', 'fail'])
+
+        doc = io.regression_head[1]
+        doc['cases'][0]['sha256'] = 'f' * 64
+        doc['sha256'] = 'e' * 64
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.assertEqual(self.delegate.call_count, 3)
+        self.assertTrue(self.delegate.call_args.args[2].startswith('用例 R1'))
+
+        with mock.patch.object(FakeWork, 'patch_id', return_value='a' * 40):
+            self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.assertEqual(self.delegate.call_count, 5)
+
+    def test_manual_fallback_keeps_existing_reply_when_delegate_failure_changes(self):
+        self.responses(R1=('not JSON', 0))
+        io = self.io('R1')
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 1, out)
+        self.assertIn('结尾 JSON', io.verify_issues[0]['body'])
+        self.verify.reply(io, 'R1 通过')
+
+        self.find_delegate.return_value = None  # A different failure must not replace the listing.
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.delegate.call_count, 1)
+        self.assertEqual(len(io.verify_comments), 1)
+        self.assertEqual(self.verify.report(io)['cases'][0]['evidence'][0]['type'], 'user-quote')
+
+    def test_delegate_only_receives_allowlisted_environment(self):
+        self.responses(R1=('delegate output', 0))
+        allowed = dict(PATH=os.environ['PATH'], HOME=os.environ['HOME'], USER='runner', LOGNAME='runner',
+                       SHELL='/bin/bash', LANG='C', LC_ALL='C', LC_MESSAGES='C', TMPDIR='/tmp',
+                       CODEX_HOME='/tmp/codex-config')
+        excluded = ('SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'AWS_SESSION_TOKEN', 'GOOGLE_APPLICATION_CREDENTIALS',
+                    'AZURE_CLIENT_SECRET', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_PAT',
+                    'GIT_CONFIG_COUNT', 'GIT_SSH_COMMAND', 'BASH_ENV', 'TERM', 'AUTOPILOT_OTHER')
+        with mock.patch.dict(os.environ, dict(allowed, **dict.fromkeys(excluded, 'fixture')), clear=True), \
+                mock.patch.object(subprocess, 'Popen', wraps=subprocess.Popen) as popen:
+            output, error = self.work.run_delegate('codex', self.head, '用例 R1')
+
+        self.assertIsNone(error)
+        self.assertEqual(output.strip(), 'delegate output')
+        delegate = next(call for call in popen.call_args_list if call.args[0][0] == 'bash')
+        self.assertEqual(delegate.kwargs['env'], allowed)
+
+    def test_delegate_timeout_terminates_group_before_removing_clone(self):
+        self.assert_delegate_group_stopped(subprocess.TimeoutExpired('delegate', 1))
+
+    def test_interrupted_delegate_stops_group_before_removing_clone(self):
+        self.assert_delegate_group_stopped(KeyboardInterrupt())
+
+    def assert_delegate_group_stopped(self, interruption):
+        real_popen = subprocess.Popen
+        process = mock.MagicMock(pid=12345)
+        process.__enter__.return_value = process
+        process.communicate.side_effect = interruption
+        started = []
+        signals = []
+
+        def popen(command, **kwargs):
+            if command[0] == 'bash':
+                started.append(kwargs)
+                return process
+            return real_popen(command, **kwargs)
+
+        def killpg(pgid, sig):
+            self.assertEqual(pgid, process.pid)
+            self.assertTrue(Path(started[0]['cwd']).is_dir())
+            signals.append(sig)
+            if sig == 0 and signal.SIGKILL in signals:
+                raise ProcessLookupError
+
+        with mock.patch.object(subprocess, 'Popen', side_effect=popen), \
+                mock.patch.object(os, 'killpg', side_effect=killpg), \
+                mock.patch.object(cli.time, 'monotonic', side_effect=iter(range(0, 600, 10))):
+            if isinstance(interruption, KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.work.run_delegate('codex', self.head, '用例 R1')
+            else:
+                output, error = self.work.run_delegate('codex', self.head, '用例 R1')
+                self.assertIsNone(output)
+                self.assertIn('超时', error)
+
+        self.assertIs(started[0].get('start_new_session'), True)
+        self.assertEqual([sig for sig in signals if sig], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(signals[-1], 0)
+        self.assertFalse(Path(started[0]['cwd']).exists())
 
     def test_delegate_pass_and_fail_use_independent_clones_and_record_evidence(self):
         self.responses(R1=('progress\n{"case":"R1","result":"pass","evidence":"first evidence"}', 0),
