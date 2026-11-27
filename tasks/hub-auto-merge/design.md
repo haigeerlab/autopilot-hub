@@ -58,16 +58,17 @@
 
 ### 2. run 的路线、`autopilot/verified` 与合并（U1、U2、Q2）
 
-**停点改动**：「所有模块合并档位都不是 auto」（:740-747）、风险预判（:751-754）、`verify_module` 开头的档位检查（:534-535）、老流程的档位检查（:806-807）不再停下，改成记下 `route=manual` 与原因，继续跑检查和验证。降级 issue、非 spec-guard、身份和 PR 状态检查照旧停。
+**停点改动**：「所有模块合并档位都不是 auto」（:740-747）、风险预判（:751-754）、`verify_module` 开头的档位检查（:534-535）、老流程的档位检查（:806-807）不再停下，改成记下 `route=manual` 与原因，继续跑检查和验证。降级 issue、身份和 PR 状态检查照旧停。
 
 **验证状态**：验证结束后用 App 令牌 `POST /repos/{r}/statuses/{headOid}`，`context=autopilot/verified`：
 - 通过写 `success`，`description` 带 patch id 前 12 位与验证时的基础分支提交前 12 位，`target_url` 指向证据评论；
 - 不通过写 `failure`（覆盖同一提交上此前的 success），并关闭该 PR 已排队的自动合并（如有）。
 
 **路线判定**（依次检查，先命中的决定；结果和全部原因写进证据评论和 `run` 输出）：
-1. `mergeMode=direct` → `direct` 路线：完全走现有 :836-854 的准入与直接合并（回滚第 3 步），dry-run 输出 `route=direct`。
-2. `watch-state` 的 `frozen`，或本仓库 `repos[...].narrowed` → `manual`。
-3. 以下全部满足 → `automerge`，否则 `manual`：新流程模块；模块合并档位 `auto`；风险 `auto_merge_eligible`；准入通过；主干规则要求 `autopilot/verified` 且**来源限定为 hub App**（读 `GET /repos/{r}/rules/branches/{base}` 的 `required_status_checks`，要求该 context 的 `integration_id` 等于 App ID；旧版保护读 `required_status_checks.checks[].app_id`）；规则要求分支与主干同步（rulesets 的 `strict_required_status_checks_policy` 或旧版 `strict`）；watch 心跳在 15 分钟内。
+1. 普通 `run` 遇到未归属模块的 PR（非 spec-guard 仓库，或 spec-guard 项目未识别出模块）时走 Dependabot 式的检查路线。风险项未通过时，与模块 PR 一样把风险详情加入路线原因。作者、降级和仓库检查（含合并前追加步骤）通过后写 `autopilot/verified` 的 `success`，描述注明「未归属模块，交你合并」，固定走 `manual` 并交人合并，跳过模块验收和回归验证。batch 以及当前提交有多条验收记录的 PR 照旧停下。
+2. `mergeMode=direct` → `direct` 路线：完全走现有 :836-854 的准入与直接合并（回滚第 3 步），dry-run 输出 `route=direct`。
+3. `watch-state` 的 `frozen`，或本仓库 `repos[...].narrowed` → `manual`。
+4. 以下全部满足 → `automerge`，否则 `manual`：新流程模块；模块合并档位 `auto`；风险 `auto_merge_eligible`；准入通过；主干规则要求 `autopilot/verified` 且**来源限定为 hub App**（读 `GET /repos/{r}/rules/branches/{base}` 的 `required_status_checks`，要求该 context 的 `integration_id` 等于 App ID；旧版保护读 `required_status_checks.checks[].app_id`）；规则要求分支与主干同步（rulesets 的 `strict_required_status_checks_policy` 或旧版 `strict`）；watch 心跳在 15 分钟内。
 
 **为什么要求「分支与主干同步」**：验证依赖基础分支的内容（`flow.py:537`）。打开自动合并后主干若前进，非同步规则下 GitHub 仍会合并，合进去的就不是验证过的组合。要求同步后，主干前进会让 PR 落后、不能合并；更新分支会产生新提交，新提交没有 `autopilot/verified`，必须重新 `run`（patch id 缓存让重跑便宜）。这一项进 B 批清单。
 
@@ -78,7 +79,7 @@
 4. 报 head 对不上 → 间隔 2 秒最多重试 4 次；之后读 PR head：仍不是 `validatedHeadOid` → 暂停（原因「head 被改了」），通知会话重新 `run`；已对上 → 回到第 2 步再试一次，仍失败按第 5 步。
 5. 其他拒绝 → 读 PR head、主干规则（同上来源和同步要求）、该提交上必需检查的结论（check-runs 和 statuses，按 App ID 核来源）：head 等于 `validatedHeadOid`、必需检查全部成功、PR 不落后主干，才 `PUT .../merge`（带 sha），然后同步做合并后收尾（:845-879，与现在相同），结果 `merged`；否则暂停并通知。
 
-**manual 路线**（含 T4、老流程、Dependabot）：写完状态后在 PR 上评论「由你合并」及原因，`notify` 会话收到同一句，结果 `handed-to-user`。不打开自动合并。
+**manual 路线**（含符合条件的 T4、老流程、Dependabot 和未归属模块 PR）：写完状态后在 PR 上评论「由你合并」及原因，`notify` 会话收到同一句，结果 `handed-to-user`。不打开自动合并。
 
 **结果与退出码**（`cli.py:953`）：`merged`、`automerge-on`、`handed-to-user`、`dry-run` 退出 0；停下、暂停退出 1；`ApiError` 等异常先写暂停记录（`run-failed`）和通知，再退出 2。
 
@@ -234,3 +235,4 @@
 - 2026-11-27（Task 1 实现时，范围内修正）：第 1 节「`spec/**`、`tasks/**` 其余内容改动走普通规则」补一条护栏：未经编排核对批准仍有效的产物（不在 `classify` 的 `verified` 里）加 `human_only`，保留切片 12「不经批准改需求或 Plan 不会被自动合并」的保护；不再叫 T4。比原方案更保守。
 - 2026-11-27（第二批审查时）：第 9 节 watch 的令牌权限补充「收窄一步另申请 `contents` 写、`pull_requests` 写的短期令牌，只用于推 `autopilot/narrow-<n>` 分支并开收窄 PR」。第 5 节第 ④ 步需要开收窄 PR，原第 9 节漏写了这一权限。
 - 2026-11-27（delegate 0.13.2 发版后）：按用户原话「走 1，转 delegate 改」及 delegate#78/#80，第 4 节补上授权记录子命令、带授权的一轮执行和授权来源留存，按 delegate-owner #23472 的建议以结果文件的 authorization 字段为准。
+- 2026-11-27（检查点 5 沙盒准备时）：B 批加必需检查后，非模块 PR 无人写 `autopilot/verified`。按用户原话「按 A 改 hub」，第 2 节补上未归属模块路线，照 Dependabot 跑检查和风险分级。按用户后续确认，风险项未通过时也与模块 PR 一样记下风险原因，检查通过后写 `success` 并交人合并。

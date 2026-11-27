@@ -562,33 +562,33 @@ class VerificationTest(unittest.TestCase):
         io.in_scope = set(owners)
         return io
 
-    def test_unticked_implementation_names_its_module(self):
+    def test_batch_unticked_implementation_names_its_module(self):
         io = self.unticked(owners=['m'])
-        result = run(io)
+        result = run(io, merge_method='merge')
         self.assertEqual(result['step'], 'acceptance', result)
         self.assertIn('模块 m 的范围', result['reason'])
         self.assertIn('tasks/m/todo.md', result['reason'])
         self.assertEqual(io.verify_calls, [])
         self.assertEqual(io.merge_calls(), [])
 
-    def test_unticked_implementation_in_several_scopes(self):
+    def test_batch_unticked_implementation_in_several_scopes(self):
         io = self.unticked(owners=['m', 'n'])
         io.base['modules'].append(dict(id='n', tier='normal', status='in_progress', takeover=effective()))
-        reason = run(io)['reason']
+        reason = run(io, merge_method='merge')['reason']
         self.assertIn('m、n', reason)
         self.assertEqual(io.merge_calls(), [])
 
-    def test_outside_every_scope_explains_how_modules_are_recognised(self):
+    def test_batch_outside_every_scope_explains_how_modules_are_recognised(self):
         io = self.unticked()
-        reason = run(io)['reason']
+        reason = run(io, merge_method='merge')['reason']
         self.assertIn('没有最终验收记录', reason)
         self.assertIn('tasks/<id>/', reason)
         self.assertIn('正在做的新流程模块有 m，', reason)
         self.assertEqual(io.scope_queries, ['m'])
 
-    def test_done_modules_are_not_scope_candidates(self):
+    def test_batch_done_modules_are_not_scope_candidates(self):
         io = self.unticked(owners=['m'], status='done')
-        reason = run(io)['reason']
+        reason = run(io, merge_method='merge')['reason']
         self.assertIn('没有最终验收记录', reason)
         self.assertEqual(getattr(io, 'scope_queries', []), [])
 
@@ -633,7 +633,7 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(result['result'], 'handed-to-user', result)
         self.assertEqual((len(io.ran), len(io.case_runs), len(io.verify_calls)), (1, 1, 2))
 
-    def test_dry_run_and_non_spec_guard(self):
+    def test_dry_run_verifies_no_regression_cases(self):
         io = self.io()
         result = run(io, dry_run=True)
         self.assertEqual((result['result'], result['step']), ('dry-run', 'verification'))
@@ -641,9 +641,6 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(io.case_runs, [])
         self.assertEqual(io.verification_files, {})
         self.assertEqual(io.verify_calls, [])
-        io = FakeIO(module=None, merge='auto')
-        self.assertIn('一律交你合', run(io)['reason'])
-        self.assertEqual(io.ran, [])
 
 
 def ruleset(app_id=APP_ID, *, required=True, strict=True):
@@ -1919,6 +1916,162 @@ class ManualRouteTest(RunRouteFixture):
         self.assertEqual(io.verify_calls, [])
 
 
+class UnassignedRouteTest(RunRouteFixture):
+    def unassigned_pr(self, spec_guard):
+        if spec_guard:
+            io = self.verify.unticked(owners=['m'])
+        else:
+            io = FakeIO(module=None, merge='auto')
+        io.config = {'mergeMode': 'direct'}
+        io.contents['.github/autopr/pipeline.yml'] = (
+            "extends: plugin\nadd:\n  - id: lint\n    at: pre-merge\n    run: make lint\n    by: ai\n"
+        )
+        return io
+
+    def test_unassigned_passes_checks_and_hands_off(self):
+        for spec_guard in (False, True):
+            with self.subTest(spec_guard=spec_guard):
+                io = self.unassigned_pr(spec_guard)
+                with mock.patch.object(flow, 'evaluate', side_effect=AssertionError('module admission')):
+                    result = self.run_pr(io, notify='implementation')
+                self.assertEqual((result['result'], result.get('route')), ('handed-to-user', 'manual'), result)
+                self.assertTrue(any('未归属模块' in reason for reason in result['routeReasons']))
+                [(path, status)] = io.statuses
+                self.assertEqual(path, f'repos/{REPO}/statuses/{HEAD}')
+                self.assertEqual((status['context'], status['state']), (VERIFIED, 'success'))
+                self.assertIn('未归属模块', status['description'])
+                self.assertIn('交你合并', status['description'])
+                comment = next(c['body'] for c in io.comments if c['html_url'] == status['target_url'])
+                payload = json.loads(flow_block(comment, 'autopilot-evidence'))
+                self.assertEqual(payload['route'], 'manual')
+                self.assertEqual(payload['routeReasons'], result['routeReasons'])
+                self.assertEqual(payload['validatedHeadOid'], HEAD)
+                self.assertEqual(payload['riskTier'], 'T0')
+                self.assertEqual([c['cmd'] for c in payload['checks']], ['make test', 'make lint'])
+                self.assertEqual(io.ran, ['make test', 'make lint'])
+                self.assertEqual(io.module_reads, ['base', 'find'] if spec_guard else [])
+                self.assertEqual(getattr(io, 'scope_queries', []), [])
+                self.assertEqual(getattr(io, 'verify_calls', []), [])
+                self.assertEqual(io.reviews, [])
+                self.assertEqual(io.graphql_calls, [])
+                self.assertEqual(io.merge_calls(), [])
+                self.assertEqual(self.state.get_pr(REPO, 7)['state'], 'handed-to-user')
+                self.assertTrue(any('由你合并' in c['body'] for c in io.comments))
+
+    def test_non_spec_guard_hands_off_with_human_missing_or_invalid_takeover(self):
+        for options in ({'merge': 'human'}, {'takeover': False}, {'merge': 'yes'}):
+            with self.subTest(options=options):
+                io = FakeIO(module=None, **options)
+                result = self.run_pr(io)
+                self.assertEqual((result['result'], result['route']), ('handed-to-user', 'manual'), result)
+                self.assertIn('"merge": "human"', io.comments[0]['body'])
+                self.assertEqual([status['state'] for _, status in io.statuses], ['success'])
+                self.assertEqual(io.merge_calls(), [])
+
+    def test_unassigned_check_failures_do_not_publish_success(self):
+        for spec_guard in (False, True):
+            for command, step in [('make test', 'check'), ('make lint', 'pre-merge')]:
+                with self.subTest(spec_guard=spec_guard, command=command):
+                    io = self.unassigned_pr(spec_guard)
+                    io.check_results[command] = flow.check_result(1, 'failed')
+                    result = self.run_pr(io)
+                    self.assertEqual((result['result'], result['step']), ('stopped', step), result)
+                    self.assertIn(command, result['reason'])
+                    self.assertEqual([status['state'] for _, status in io.statuses], ['failure'])
+                    self.assertEqual(io.graphql_calls, [])
+                    self.assertEqual(io.merge_calls(), [])
+
+    def test_unassigned_risk_failure_publishes_success_and_hands_off(self):
+        cases = [
+            ('requirements.txt', '风险档 T3', '改了依赖文件 requirements.txt'),
+            ('.github/workflows/ci.yml', '风险档 T4', '.github/workflows/ci.yml'),
+            ('spec/other.md', '要你合', 'spec-guard 产物没核对到有效的批准：spec/other.md'),
+        ]
+        for spec_guard in (False, True):
+            for path, risk_summary, risk_detail in cases:
+                with self.subTest(spec_guard=spec_guard, path=path):
+                    io = self.unassigned_pr(spec_guard)
+                    io.files.append({'filename': path, 'additions': 1, 'patch': '@@ -0,0 +1 @@\n+New content\n'})
+                    result = self.run_pr(io)
+                    self.assertEqual((result['result'], result.get('route')), ('handed-to-user', 'manual'), result)
+                    self.assertIn('未归属模块，交你合并', result['routeReasons'])
+                    self.assertTrue(any(risk_summary in reason and risk_detail in reason
+                                        for reason in result['routeReasons']), result)
+                    [(status_path, status)] = io.statuses
+                    self.assertEqual(status_path, f'repos/{REPO}/statuses/{HEAD}')
+                    # The required status reflects verification of the head, so a human can merge it.
+                    self.assertEqual((status['context'], status['state']), (VERIFIED, 'success'))
+                    self.assertIn('未归属模块，交你合并', status['description'])
+                    self.assertEqual(io.ran, ['make test', 'make lint'])
+                    handoff = next(c['body'] for c in io.comments if '由你合并' in c['body'])
+                    self.assertIn(risk_detail, handoff)
+                    self.assertEqual(io.graphql_calls, [])
+                    self.assertEqual(io.merge_calls(), [])
+
+    def test_unassigned_risk_failure_only_disables_queued_automerge_before_success(self):
+        io = self.unassigned_pr(spec_guard=True)
+        io.files.append({'filename': '.github/workflows/ci.yml'})
+        io.pr['auto_merge'] = {'merge_method': 'squash', 'enabled_by': BOT_USER}
+
+        result = self.run_pr(io)
+
+        self.assertEqual(result['result'], 'handed-to-user', result)
+        self.assertIsNone(io.pr['auto_merge'])
+        [disable] = io.graphql_calls
+        self.assertIn('disablePullRequestAutoMerge', disable['query'])
+        [(status_path, status)] = io.statuses
+        self.assertEqual(status['state'], 'success')
+        self.assertLess(io.calls.index(('POST', 'graphql', disable)), io.calls.index(('POST', status_path, status)))
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_unassigned_batch_still_stops_without_status(self):
+        for spec_guard in (False, True):
+            with self.subTest(spec_guard=spec_guard):
+                io = self.unassigned_pr(spec_guard)
+                result = self.run_pr(io, merge_method='merge')
+                step = 'acceptance' if spec_guard else 'takeover'
+                self.assertEqual((result['result'], result['step']), ('stopped', step), result)
+                self.assertEqual(io.ran, ['make test', 'make lint'] if spec_guard else [])
+                if not spec_guard:
+                    self.assertIn('一律交你合', result['reason'])
+                    self.assertIn('"merge": "human"', io.comments[0]['body'])
+                self.assertEqual(io.statuses, [])
+                self.assertEqual(io.graphql_calls, [])
+                self.assertEqual(io.merge_calls(), [])
+
+    def test_unassigned_dry_run_reports_manual_route_without_github_writes(self):
+        for spec_guard in (False, True):
+            with self.subTest(spec_guard=spec_guard):
+                io = self.unassigned_pr(spec_guard)
+                code, output = self.cli_run(io, '--dry-run')
+                self.assertEqual(code, 0, output)
+                self.assertIn('route=manual', output)
+                self.assertIn('未归属模块', output)
+                self.assertEqual(io.ran, ['make test', 'make lint'])
+                self.assertEqual(io.writes(), [])
+                self.assertIsNone(self.state.get_pr(REPO, 7))
+
+    def test_unassigned_rechecks_degrade_before_publishing_success(self):
+        for spec_guard in (False, True):
+            with self.subTest(spec_guard=spec_guard):
+                io = self.unassigned_pr(spec_guard)
+                api = io.api
+
+                def post_evidence_and_open_degrade(path, method='GET', body=None):
+                    response = api(path, method, body)
+                    if method == 'POST' and path.endswith('/comments') and 'autopilot-evidence' in body['body']:
+                        io.degrade = [degrade_block(3)]
+                    return response
+
+                io.api = post_evidence_and_open_degrade
+                result = self.run_pr(io)
+                self.assertEqual((result['result'], result['step']), ('stopped', 'admission'), result)
+                self.assertIn('#3', result['reason'])
+                self.assertEqual([status['state'] for _, status in io.statuses], ['failure'])
+                self.assertEqual(io.graphql_calls, [])
+                self.assertEqual(io.merge_calls(), [])
+
+
 class VerificationFailureStatusTest(RunRouteFixture):
     def test_failure_replaces_success_and_disables_only_queued_automerge(self):
         for queued in (False, True):
@@ -2359,13 +2512,6 @@ class StopTest(unittest.TestCase):
     def test_open_degrade_issue(self):
         self.assertStops(legacy_io(degrade=[3]), "degrade", "#3")
 
-    def test_takeover_human_or_missing(self):
-        io = FakeIO(module=None, merge="human")
-        self.assertStops(io, "takeover")
-        self.assertIn('"merge": "human"', io.comments[0]["body"])
-        self.assertStops(FakeIO(module=None, takeover=False), "takeover")
-        self.assertStops(FakeIO(module=None, merge="yes"), "takeover")
-
     def test_high_risk_in_direct_mode_stops_at_admission(self):
         io = legacy_io(files=(".github/workflows/ci.yml",))
         # Direct mode now reaches live admission after checking and reusing final acceptance.
@@ -2380,13 +2526,6 @@ class StopTest(unittest.TestCase):
         io = legacy_io(check_exit=1)
         self.assertStops(io, "check", "退出码 1")
         self.assertEqual(io.reviews, [])
-
-    def test_non_spec_guard_auto_takeover_still_goes_to_human(self):
-        """Q-A1: without a regression document nothing merges itself, whatever takeover.yml says."""
-        io = FakeIO(module=None, merge="auto")
-        self.assertStops(io, "takeover", "一律交你合")
-        self.assertIn('"merge": "human"', io.comments[0]["body"])
-        self.assertEqual(io.ran, [])
 
     def test_readback_not_merged(self):
         io = legacy_io(merged_ok=False)
@@ -2542,10 +2681,10 @@ class PreMergeTest(unittest.TestCase):
 class AcceptanceTest(unittest.TestCase):
     """spec-guard modules: final acceptance recorded outside the commit; its review report replaces ours."""
 
-    def test_module_without_acceptance_stops_after_writing_evidence(self):
+    def test_no_module_acceptance_hands_off_after_writing_evidence(self):
         io = FakeIO(module="m")
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
         self.assertEqual(len(io.evidence_files), 1)
         self.assertEqual(io.reviews, [])
         self.assertEqual(io.merge_calls(), [])
@@ -2622,11 +2761,16 @@ class AcceptanceTest(unittest.TestCase):
         res = run(io)
         self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
         self.assertIn("多条", res["reason"])
+        self.assertEqual([status["state"] for _, status in io.statuses], ["failure"])
+        self.assertEqual(io.merge_calls(), [])
 
-    def test_stale_record_means_no_module_and_stops(self):
+    def test_stale_record_means_no_module_and_hands_off(self):
         io = FakeIO(module="m", acceptance=accepted(sha="b" * 40), reports=[])
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "acceptance"))
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
+        self.assertIn("未归属模块", " ".join(res["routeReasons"]))
+        self.assertEqual([status["state"] for _, status in io.statuses], ["success"])
+        self.assertNotIn("acceptance", io.module_reads)
         self.assertEqual(io.reviews, [])
 
     def test_bad_acceptance_records(self):

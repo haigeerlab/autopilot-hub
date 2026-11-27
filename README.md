@@ -17,6 +17,7 @@ autopilot-hub 替各插件仓库做两件事：
 ## 现状
 
 - **hub-auto-merge** 由 `run` 在合并前验证的提交上写 `autopilot/verified`。通过写 `success` 并链接证据，失败写 `failure` 并关闭已排队的自动合并。合并档位为 `auto`、风险和准入通过、满足部署条件的新流程模块走 `automerge`，先打 `autopilot:authored`，再对验证过的提交打开 GitHub 自动合并。T4、老流程、Dependabot 和缺少自动路条件的 PR 验证通过后走 `manual`，由人合并。`mergeMode=direct` 时走原有直接合并路线。[规格](spec/hub-auto-merge.md)
+- **未归属模块的 PR** 由普通 `run` 执行仓库检查和风险分级。仓库检查通过就写 `autopilot/verified`；风险分级不过（T3、T4、`human_only`）也照样写，原因记进路线原因。这类 PR 固定走 `manual`，由你合并。
 - **巡检与暂停**由本机 `watch` 负责。PR 提交变化、验证状态失效或等待超时时，关闭排队中的自动合并并暂停，合并后补 `autopilot:auto-merged` 标签与跟进 issue。环境问题最多重跑两次，CI 配置错误暂停交人处理，PR 测试失败由负责会话分析。已移交巡检的仓库主干因测试失败变红时，watch 先在本机收紧仓库，再关闭该仓库排队中的自动合并、开降级 issue、尝试开收窄 PR，最后通知用户。收窄 PR 由人合并。主干 CI 通过时，watch 在 `~/.autopilot/watch-state.json` 的 `runs` 里记录目标提交和可核对的关联 PR 与验证证据，供发布模块读取。
 - **AI 操作用例**使用 delegate 0.13.2 或以上版本。Claude Code 作者对应 Codex 后端，已批模块的每条 `ai-operate` 用例在独立的一次性克隆里执行一轮，验证报告保留结果、证据、delegate 结果文件中的 `authorization` 和 hub 算出的完整授权文件 SHA-256。先用 `python3 -B orchestrator/cli.py authorize --repo owner/name --quote "用户原话" --session "记录会话"` 记录你打开该仓库自动路时的原话。收回授权用 `python3 -B orchestrator/cli.py authorize --repo owner/name --revoke`。缺少可用授权、授权来源不匹配、作者是 Codex、未提供作者宿主、delegate 不可用、要人回答或结果无法解析时，用例转人工。
 - **切片 1**（已退役，见切片 7）：原先准入脚本读取 repo-readiness 的接入结论、算信任上限；该部分已删除。规格留作历史：[docs/spec/slice-1.md](docs/spec/slice-1.md)。
@@ -83,7 +84,7 @@ launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/com.haigeerlab.autopilot-
 - [ ] watch 已安装并运行。`~/.autopilot/watch-state.json` 的 `heartbeat` 在最近 15 分钟内。
 - [ ] `~/.autopilot/config.json` 的 `repos.<repo>.watchMainRed` 为 `true`，其中 `<repo>` 是完整的 `owner/name` 键。
 - [ ] 降级 caller 的 `uses:` 与 `hub_ref` 都升钉到同一个包含本模块的 40 位 hub 提交。watch 装好且 `watchMainRed` 已打开后，在 caller 的 `with:` 下设 `skip_main_red: true`，把主干 CI 失败交给 watch。[降级 caller 示例](examples/caller-autopilot-degrade.yml)
-- [ ] 主干规则将 `autopilot/verified` 设为必需检查，来源限定为 hub 的 GitHub App，并要求 PR 分支与主干保持同步。
+- [ ] 先升钉到包含未归属模块 PR 验证改动的 hub 提交，再将 `autopilot/verified` 设为主干必需检查，来源限定为 hub 的 GitHub App，并要求 PR 分支与主干保持同步。
 - [ ] 先在沙盒跑通自动合并和主干测试失败后的收紧流程。
 
 ## 规则
