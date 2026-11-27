@@ -82,10 +82,13 @@ launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/com.haigeerlab.autopilot-
 
 - [ ] 要用 AI 执行 `ai-operate` 用例时，已用 `cli.py authorize` 记录你的原话。
 - [ ] hub 的 GitHub App 已安装到该仓库。权限包含 Contents、Pull requests、Issues 和 Commit statuses 读写，Actions 读写，Checks 只读。
+- [ ] 本机 `~/.autopilot/config.json` 配了 `appId`（hub GitHub App 的数字 ID），否则 `autopilot/verified` 的来源核对不了，一律交人合并。
+- [ ] watch 的发件身份已在 agent-relay 登记：`~/.agent-relay/bin/agent-relay register-script-identity autopilot-watch --confirm`，否则 watch 发给会话的通知发不出去。
 - [ ] watch 已安装并运行。`~/.autopilot/watch-state.json` 的 `heartbeat` 在最近 15 分钟内。
 - [ ] `~/.autopilot/config.json` 的 `repos.<repo>.watchMainRed` 为 `true`，其中 `<repo>` 是完整的 `owner/name` 键。
 - [ ] 降级 caller 的 `uses:` 与 `hub_ref` 都升钉到同一个包含本模块的 40 位 hub 提交。watch 装好且 `watchMainRed` 已打开后，在 caller 的 `with:` 下设 `skip_main_red: true`，把主干 CI 失败交给 watch。[降级 caller 示例](examples/caller-autopilot-degrade.yml)
-- [ ] 先升钉到包含未归属模块 PR 验证改动的 hub 提交，再将 `autopilot/verified` 设为主干必需检查，来源限定为 hub 的 GitHub App，并要求 PR 分支与主干保持同步。
+- [ ] 先升钉到包含未归属模块 PR 验证改动的 hub 提交，再将 `autopilot/verified` 设为主干必需检查，来源限定为 hub 的 GitHub App，并要求 PR 分支与主干保持同步。主干规则用规则集（rulesets）设置；用旧版分支保护的话，App 还要有 Administration 只读权限才读得到。
+- [ ] 新流程模块的开发会话在写代码前登记作者：`python3 -B <spec-guard>/hooks/verification.py author --project <仓库检出> --module <模块>`，否则合并前验证会因 author-unknown 停下。
 - [ ] 先在沙盒跑通自动合并和主干测试失败后的收紧流程。
 
 ## 规则

@@ -74,10 +74,13 @@ Check these items for each repository.
 
 - [ ] To run `ai-operate` cases with AI, you have recorded your exact words with `cli.py authorize`.
 - [ ] The hub GitHub App is installed on the repository. Its permissions include read and write access to Contents, Pull requests, Issues, Commit statuses and Actions, and read-only access to Checks.
+- [ ] `~/.autopilot/config.json` on this machine sets `appId` (the hub GitHub App's numeric ID). Without it the source of `autopilot/verified` cannot be checked and every PR goes to a human.
+- [ ] The watch sender identity is registered with agent-relay: `~/.agent-relay/bin/agent-relay register-script-identity autopilot-watch --confirm`. Without it watch cannot deliver notices to sessions.
 - [ ] watch is installed and running. The `heartbeat` in `~/.autopilot/watch-state.json` is less than 15 minutes old.
 - [ ] `repos.<repo>.watchMainRed` in `~/.autopilot/config.json` is `true`, where `<repo>` is the full `owner/name` key.
 - [ ] The degrade caller's `uses:` and `hub_ref` are both pinned to the same 40-character hub commit that includes this module. Once watch is installed and `watchMainRed` is enabled, set `skip_main_red: true` under the caller's `with:` to hand default-branch CI failures to watch. [Degrade caller example](examples/caller-autopilot-degrade.yml)
-- [ ] Update the hub pin to a commit that verifies PRs without an assigned module before requiring `autopilot/verified` on the default branch. Pin the check's source to the hub GitHub App and require PR branches to be up to date with the default branch.
+- [ ] Update the hub pin to a commit that verifies PRs without an assigned module before requiring `autopilot/verified` on the default branch. Pin the check's source to the hub GitHub App and require PR branches to be up to date with the default branch. Set the default-branch rule with a ruleset; with classic branch protection the App also needs read-only Administration access to read it.
+- [ ] Before writing code for a new-flow module, the development session registers itself as the author: `python3 -B <spec-guard>/hooks/verification.py author --project <checkout> --module <module>`. Otherwise pre-merge verification stops with author-unknown.
 - [ ] Exercise auto-merge and narrowing after a default-branch test failure in the sandbox first.
 
 ## Rules
