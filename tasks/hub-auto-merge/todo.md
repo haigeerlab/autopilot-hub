@@ -37,3 +37,8 @@
 - [x] Checkpoint 3（report）：R5、R7、R8、R10～R13、R18 通过（2026-11-27 按回归文档命令逐条执行全部 OK，全量两遍通过）
 - [x] Checkpoint 4（gate）：推送并开实现 PR 二（Task 6～10），用户说「合并」（2026-11-27 hub#98 用户「合并 hub#98」，已合 5f354b0）
 - [x] Checkpoint 5（gate）：最终验收：沙盒 R14、R15 等用户原话（2026-11-27：R14 用户原话「R14 通过，回退路也算」，证据 haigeerlab/autopilot-sandbox#26；R15 用户原话「R15 通过，收到了 macOS 通知」，证据 haigeerlab/autopilot-sandbox#28、#29）
+
+## Skill 使用记录
+
+- 需求与技术方案：spec-driven-development；外部审查用 delegate:review。
+- 实现：delegate:run（Task 一次一个派 Codex 写，会话验收）；代码审查用 delegate:review（同厂商）。
