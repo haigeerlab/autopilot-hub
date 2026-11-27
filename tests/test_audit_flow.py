@@ -62,6 +62,22 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(check(module(tier="important", designApproval={
             "status": "approved", "approvedBy": "user", "at": "2026-11-26"}))["problems"], [])
 
+    def test_important_design_accepts_reviewer_when_takeover_design_is_reviewer(self):
+        reviewer = {"status": "approved", "approvedBy": "reviewer"}
+        self.assertEqual(check(module(tier="important", designApproval=reviewer,
+                                      takeover={"design": "reviewer"}))["problems"], [])
+        for takeover in (None, {}, {"design": "human"}, {"design": "codex"}, "reviewer"):
+            with self.subTest(takeover=takeover):
+                problems = check(module(tier="important", designApproval=reviewer, takeover=takeover))["problems"]
+                self.assertEqual([(p["kind"], p["severity"]) for p in problems],
+                                 [("important-design-not-user", "严重")])
+        for approval in ({"status": "pending-user", "approvedBy": "reviewer"}, {"status": "approved", "approvedBy": "codex"}):
+            with self.subTest(approval=approval):
+                problems = check(module(tier="important", designApproval=approval,
+                                        takeover={"design": "reviewer"}))["problems"]
+                self.assertEqual([(p["kind"], p["severity"]) for p in problems],
+                                 [("important-design-not-user", "严重")])
+
     def test_normal_design_does_not_require_user(self):
         self.assertEqual(check(module(designApproval={"status": "approved", "approvedBy": "reviewer"}))["problems"], [])
 
