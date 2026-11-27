@@ -2,22 +2,22 @@
 
 测试命令：`scripts/validate.sh --quick`（日常）；`scripts/validate.sh && PYTHON=/usr/bin/python3 scripts/validate.sh`（推送前）
 
-- [ ] Task 1：风险分级按 R4
+- [x] Task 1：风险分级按 R4
   - 验证：`tests.test_risk`、`tests.test_admission`
   - 文件：`risk/templates.json`、`risk/tiers.py`、`admission/decide.py`、`.github/autopr/risk-tiers.json`、对应测试
-- [ ] Task 2：`orchestrator/state.py`
+- [x] Task 2：`orchestrator/state.py`
   - 验证：R13（`tests.test_state`）
   - 文件：`orchestrator/state.py`、`tests/test_state.py`
-- [ ] Task 3：run 的路线与 `autopilot/verified`
+- [x] Task 3：run 的路线与 `autopilot/verified`
   - 验证：R2、R3、R4、R11（RunFailureRecordTest）、R12（DirectModeTest）
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
-- [ ] Task 4：automerge 路线与回退
+- [x] Task 4：automerge 路线与回退
   - 验证：R1、R6
   - 文件：`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_orchestrator.py`
-- [ ] Task 5：修复上限与「不许改裁判」
+- [x] Task 5：修复上限与「不许改裁判」
   - 验证：R9
   - 文件：`orchestrator/flow.py`、`orchestrator/state.py`、`tests/test_orchestrator.py`
-- [ ] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过
+- [x] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过（2026-11-27 按回归文档命令逐条执行全部 OK；回归文档命令加 PYTHONPATH=tests 前缀，见其变更记录）
 - [ ] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」
 - [ ] Task 6：ai-operate 交 delegate
   - 验证：R7

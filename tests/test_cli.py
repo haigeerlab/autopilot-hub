@@ -145,24 +145,27 @@ class CliTest(unittest.TestCase):
         _, result, _ = self.run_cli(files, ["--risk-config", self.write("r.json", {"extends": "plugin"})])
         self.assertEqual(result["risk"]["tier"], "T0")
 
-    def test_no_config_is_generic_t3(self):
+    def test_no_config_is_generic_t2(self):
         _, result, _ = self.run_cli(self.write("files.json", [FILE_DOC]))
-        self.assertEqual(result["risk"]["tier"], "T3")
+        # R4 defaults unmatched paths to T2 without a category.
+        self.assertEqual(result["risk"]["tier"], "T2")
 
     def test_unreadable_json_config_is_generic_with_note(self):
         files = self.write("files.json", [FILE_DOC])
         bad = self.write("r.json", "extends: plugin", raw=True)
         proc, result, _ = self.run_cli(files, ["--risk-config-json", bad])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(result["risk"]["tier"], "T3")
-        self.assertTrue(any("risk-tiers" in n for n in result["notes"]), result["notes"])
+        # R4 uses the generic T2 default when the JSON config cannot be parsed.
+        self.assertEqual(result["risk"]["tier"], "T2")
+        self.assertIn("risk-tiers.json 读不懂，按通用规则定风险档（没匹配到的路径算 T2）", result["notes"])
 
     def test_unreadable_yml_config_is_generic_with_note(self):
         files = self.write("files.json", [FILE_DOC])
         bad = self.write("r.yml", "extends: [unclosed\n", raw=True)
         _, result, _ = self.run_cli(files, ["--risk-config-yml", bad])
-        self.assertEqual(result["risk"]["tier"], "T3")
-        self.assertTrue(any("risk-tiers.yml" in n for n in result["notes"]), result["notes"])
+        # R4 uses the generic T2 default when the YAML config cannot be parsed.
+        self.assertEqual(result["risk"]["tier"], "T2")
+        self.assertIn("risk-tiers.yml 读不懂，按通用规则定风险档（没匹配到的路径算 T2）", result["notes"])
 
     def test_old_flags_are_gone(self):
         files = self.write("files.json", [FILE_DOC])

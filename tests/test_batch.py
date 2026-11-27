@@ -587,13 +587,13 @@ class ExtraEvidenceTest(unittest.TestCase):
                     self.assertNotEqual(value["result"], "merged")
 
     def test_extra_check_cannot_replace_a_failed_local_check(self):
-        from test_orchestrator import FakeIO
+        from test_orchestrator import FakeIO, run
         io = FakeIO(check_exit=1)
         io.pr.update(pull(entry()))
         io.pr["base"]["repo"] = {"owner": {"login": "haigeerlab"}}
         io.extra_evidence = entry()
         io.batch_pr = lambda repo, number, pr=None: io.pr
-        self.assertEqual(flow.run(io, REPO, 7)["step"], "check")
+        self.assertEqual(run(io)["step"], "check")
 
 
 class BatchCLITest(unittest.TestCase):

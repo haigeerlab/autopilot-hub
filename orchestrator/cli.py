@@ -1,13 +1,14 @@
 """`autopilot run`: drive one PR with the local orchestrator (slice 10). See orchestrator/flow.py.
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
+        [--notify SESSION] [--author-host claude-code|codex]
     python3 -B orchestrator/cli.py followups --repo haigeerlab/autopilot-sandbox --pr 1 [--json]
     python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --resume 9 [--confirm "..."]
 
-Exit codes: 0 merged (or dry run passed); 1 stopped (the reason is on the PR and printed); 2 bad
-invocation or environment (no token, no delegate). Release also uses 0 for completed and 1 for waiting.
+Run exit codes: 0 merged, auto-merge enabled, handed to the user, or successful dry run;
+1 stopped or paused; 2 bad invocation or environment. Release uses 0 for completed and 1 for waiting.
 """
 import argparse
 import base64
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +32,7 @@ from checkup import workflow
 from checkup import yamlsub
 from degrade.run import ApiError, NotFound, parse_pages
 from orchestrator import batch, flow, token as tokens
+from orchestrator.state import StateCorruptError, StateLockedError, WatchState
 from pipeline import engine, model as pipeline_model
 from risk.tiers import REPO_CONFIGS
 
@@ -42,6 +45,7 @@ CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
+RUN_WRITE = dict(WRITE, statuses="write")
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
 
@@ -117,6 +121,8 @@ class Work:
         self.git("init", "-q")
         self.git("fetch", "-q", "--no-tags", "https://github.com/%s" % repo,
                  "+refs/heads/%s:refs/remotes/base" % self.base_ref, self.head)
+        # Let spec-guard's scope_base find the fetched base when trimming a rework.
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/base")
         self.base_tip = self.git("rev-parse", "refs/remotes/base").strip()
         self.merge_base = self.git("merge-base", self.base_tip, self.head).strip()
 
@@ -146,7 +152,8 @@ class Work:
             r = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, env=env, capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise flow.Stop("check", "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60))
+            reason = "检查 `%s` 超过 %d 分钟没结束" % (command, CHECK_TIMEOUT // 60)
+            raise flow.Stop("check", reason, failures={f"check:{command}": reason})
         return flow.check_result(r.returncode, r.stdout + "\n" + r.stderr)
 
     def regression(self, module, ref):
@@ -283,6 +290,38 @@ class Work:
             return False
         return isinstance(data, dict) and data.get("outside") == 0 and bool(data.get("files"))
 
+    def changed_existing_files(self, module):
+        """Return baseline evidence and changed paths already present at that baseline."""
+        baseline = {"sha": self.merge_base, "source": "merge-base"}
+        root = find_spec_guard_root((0, 96, 0)) if module else None
+        hooks = os.path.join(root, "hooks") if root else None
+        if hooks and os.path.isfile(os.path.join(hooks, "module_scope.py")):
+            # scope_base also works for modules without an explicit scope boundary.
+            code = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+                    "from module_scope import scope_base\nprint(scope_base(Path(sys.argv[2]), sys.argv[3]) or '')")
+            try:
+                self.git("checkout", "-q", "--detach", self.base_tip)
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", code, hooks, self.root, module],
+                                        cwd=self.root, env=_clean_env(), capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, timeout=120)
+                candidate = result.stdout.strip()
+                if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", candidate):
+                    try:
+                        candidate = self.git("rev-parse", "--verify", candidate + "^{commit}").strip()
+                        self.git("merge-base", "--is-ancestor", candidate, self.merge_base)
+                    except flow.Stop:
+                        baseline["fallbackReason"] = "scope-base-not-ancestor"
+                    else:
+                        baseline = {"sha": candidate, "source": "scope_base"}
+            except (OSError, subprocess.TimeoutExpired, UnicodeError, flow.Stop):
+                pass
+        # Only the PR's own changes count (merge base -> head): changes that reached main after the
+        # baseline are not the PR's doing. Of those, keep paths that already existed at the baseline.
+        # Disabling rename detection treats a moved test as a deletion of the existing path.
+        paths = self.git("diff", "--name-only", "--no-renames", "--diff-filter=a", "-z", self.merge_base, self.head, "--")
+        existing = set(self.git("ls-tree", "-r", "--name-only", "-z", baseline["sha"]).split("\0"))
+        return baseline, [path for path in paths.split("\0") if path and path in existing]
+
     @staticmethod
     def _parse(r):
         try:
@@ -296,24 +335,122 @@ class LocalIO:
     def __init__(self, token, delegate):
         self.token, self.delegate = token, delegate
 
-    def api(self, path, method="GET", body=None):
+    def api(self, path, method="GET", body=None, *, graphql_rejection=False, paginate=True):
         args = ["gh", "api", path, "--method", method]
-        if method == "GET":
+        if method == "GET" and paginate:
             args.append("--paginate")
         if body is not None:
             args += ["--input", "-"]
-        r = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True,
-                           text=True, timeout=60, env=dict(os.environ, GH_TOKEN=self.token))
+        try:
+            r = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True,
+                               text=True, timeout=60, env=dict(os.environ, GH_TOKEN=self.token))
+        except subprocess.TimeoutExpired as error:
+            raise ApiError(f"{method} {path} 超时") from error
         if r.returncode != 0:
+            # gh reports a GraphQL rejection both as a nonzero exit and in the response body.
+            if graphql_rejection and r.stdout.strip():
+                try:
+                    response = json.loads(r.stdout)
+                except ValueError:
+                    response = None
+                if isinstance(response, dict) and response.get("errors"):
+                    return response
             err = NotFound if "HTTP 404" in r.stderr else ApiError
             raise err("%s %s 失败：%s" % (method, path, r.stderr.strip()[:300]))
-        return parse_pages(r.stdout) if r.stdout.strip() else None
+        try:
+            return parse_pages(r.stdout) if r.stdout.strip() else None
+        except ValueError as error:
+            raise ApiError(f"{method} {path} 返回了无法读取的 JSON") from error
+
+    def enable_automerge(self, pr_id, head, method):
+        """Return the GraphQL rejection message, or None after confirmed success."""
+        query = ("mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!,$mergeMethod:PullRequestMergeMethod!)"
+                 "{enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,"
+                 "expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod}){pullRequest{id}}}")
+        result = self.api("graphql", "POST", {"query": query, "variables": {
+            "pullRequestId": pr_id, "expectedHeadOid": head, "mergeMethod": method.upper(),
+        }}, graphql_rejection=True)
+        try:
+            if result.get("errors"):
+                message = "; ".join(error["message"] for error in result["errors"]).strip()
+                if message:
+                    return message
+            if result["data"]["enablePullRequestAutoMerge"]["pullRequest"]["id"] == pr_id:
+                return None
+        except (AttributeError, KeyError, TypeError):
+            pass
+        raise ApiError("GitHub 未确认已打开 PR 的自动合并")
 
     def api_optional(self, path):
         try:
             return self.api(path)
         except NotFound:
             return None
+
+    def legacy_status_checks(self, repo, branch, *, need_source, need_sync, need_all=False):
+        path = f"repos/{repo}/branches/{branch}"
+        # The ordinary branch response can tell us whether a classic check is relevant.
+        protection = (self.api_optional(path) or {}).get("protection") or {}
+        checks = protection.get("required_status_checks") or {}
+        contexts = set(checks.get("contexts") or []) | {c.get("context") for c in checks.get("checks") or []}
+        if protection.get("enabled") is False:
+            return None
+        if not ((need_source and flow.VERIFIED in contexts) or ((need_sync or need_all) and contexts)):
+            return checks
+        # GitHub requires Administration: read for the classic details, including the pinned App ID.
+        try:
+            token = tokens.mint(repo, {"administration": "read"})
+        except tokens.TokenError as error:
+            raise flow.ChecksUnconfirmed(
+                "无法确认旧版分支保护的必需检查及来源，需要 hub App 的 Administration: read 权限") from error
+        try:
+            details = LocalIO(token, None).api_optional(path + "/protection/required_status_checks")
+        finally:
+            tokens.revoke(token)
+        if need_all and details is None:
+            raise ApiError("读不到旧版分支保护的必需检查与来源")
+        return details
+
+    def commit_check_results(self, repo, head):
+        """Read check runs and latest commit statuses across all result pages."""
+        try:
+            token = tokens.mint(repo, {"checks": "read"})
+        except tokens.TokenError as error:
+            raise flow.ChecksUnconfirmed("无法确认必需检查的结论，需要 hub App 的 Checks: read 权限") from error
+        path = f"repos/{repo}/commits/{head}"
+        try:
+            run_pages = LocalIO(token, None).api(f"{path}/check-runs")
+        finally:
+            tokens.revoke(token)
+
+        def entries(result, field):
+            pages = result if isinstance(result, list) else [result]
+            if not pages or any(not isinstance(page, dict) or not isinstance(page.get(field), list) for page in pages):
+                raise ApiError(f"GitHub 返回的 {field} 数据不完整")
+            return [entry for page in pages for entry in page[field]]
+
+        runs = entries(run_pages, "check_runs")
+        statuses = entries(self.api(f"{path}/status"), "statuses")
+        # The combined response omits creators. Match its status IDs so an older
+        # result from a trusted creator cannot vouch for a newer status.
+        missing = {status["id"] for status in statuses if "id" in status and not status.get("creator")}
+        if missing:
+            history = self.api(f"{path}/statuses")
+            if not isinstance(history, list):
+                raise ApiError("GitHub 返回的提交状态明细数据不完整")
+            creators = {status["id"]: status.get("creator") for status in history if status.get("id") in missing}
+            statuses = [dict(status, creator=creators[status["id"]]) if status.get("id") in creators else status
+                        for status in statuses]
+        return runs, statuses
+
+    def base_is_ancestor(self, repo, base_ref, head):
+        """Compare the live base branch to the validated head regardless of mergeability caching."""
+        ref = quote(base_ref, safe="")
+        comparison = self.api(f"repos/{repo}/compare/{ref}...{head}?per_page=1", paginate=False)
+        status = comparison.get("status") if isinstance(comparison, dict) else None
+        if status not in ("ahead", "identical", "behind", "diverged"):
+            raise ApiError("GitHub 返回的主干提交比较数据不完整")
+        return status in ("ahead", "identical")
 
     @staticmethod
     def bot_identity():
@@ -697,13 +834,19 @@ class LocalIO:
         return sorted(found)
 
     @staticmethod
-    def checkout_of(repo):
-        """The user's own checkout of `repo`, from ~/.autopilot/config.json {"checkouts": {"owner/name": path}}."""
+    def local_config():
         try:
             with open(os.path.join(STATE, "config.json"), encoding="utf-8") as fh:
-                path = (json.load(fh).get("checkouts") or {}).get(repo)
-        except (OSError, ValueError, AttributeError):
-            return None
+                config = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return config if isinstance(config, dict) else {}
+
+    @staticmethod
+    def checkout_of(repo):
+        """The user's own checkout of `repo`, from ~/.autopilot/config.json {"checkouts": {"owner/name": path}}."""
+        checkouts = LocalIO.local_config().get("checkouts")
+        path = checkouts.get(repo) if isinstance(checkouts, dict) else None
         return os.path.expanduser(path) if isinstance(path, str) and path else None
 
     def acceptance(self, repo, module):
@@ -883,6 +1026,8 @@ def main(argv=None):
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
+    r.add_argument("--notify", metavar="SESSION", help="queue handoff notices for this session")
+    r.add_argument("--author-host", choices=("claude-code", "codex"), help="record the author's host in evidence")
     follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
     follow.add_argument('--repo', required=True, help='owner/name')
     follow.add_argument('--pr', required=True, type=int)
@@ -931,16 +1076,30 @@ def main(argv=None):
                       a.repo, out["auto_merged"], out["reverted_or_reworked"], out["reverted"], out["reworked"],
                       out["codex_unavailable_stops"], out["codex_unavailable_minutes"]))
         return 0
-    delegate = None
     try:
-        token = tokens.mint(a.repo, READ if a.dry_run else WRITE)
+        token = tokens.mint(a.repo, READ if a.dry_run else RUN_WRITE)
     except tokens.TokenError as e:
         print("autopilot: 换不出机器人令牌：%s" % e, file=sys.stderr)
         return 2
+    state = WatchState(STATE)
     try:
-        result = flow.run(LocalIO(token, delegate), a.repo, a.pr, dry_run=a.dry_run)
-    except ApiError as e:
-        print("autopilot: GitHub 接口失败：%s" % e, file=sys.stderr)
+        result = flow.run(LocalIO(token, None), a.repo, a.pr, dry_run=a.dry_run,
+                          state=state, notify=a.notify, author_host=a.author_host)
+    except (ApiError, OSError, StateCorruptError, StateLockedError) as error:
+        summary = " ".join(str(error).replace(token, "[redacted]").split())[:350]
+        source, recovery_check = (("GitHub 接口", "GitHub 接口和 App 权限") if isinstance(error, ApiError)
+                                  else ("本机运行", "本机运行环境和 watch 状态"))
+        print(f"autopilot: {source}失败：{summary}", file=sys.stderr)
+        if not a.dry_run:
+            recovery = f"{summary}。核对{recovery_check}后，重新运行 autopilot run。"
+            key = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+            try:
+                with state.lock(wait_seconds=flow.RUN_LOCK_WAIT):
+                    state.pause_pr(a.repo, a.pr, "run-failed", recovery)
+                    state.enqueue_notification("user", f"{a.repo}#{a.pr} 已暂停。{recovery}",
+                                               f"{a.repo}:{a.pr}:run-failed:{key}")
+            except (OSError, StateCorruptError, StateLockedError) as error:
+                print("autopilot: 暂停记录或通知未写入：%s" % error, file=sys.stderr)
         return 2
     finally:
         tokens.revoke(token)
@@ -948,9 +1107,13 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:
         print("autopilot run %s#%d：%s（%s）%s" % (a.repo, a.pr, result["result"], result["step"], result["reason"]))
+        if result.get("route"):
+            print("  route=" + result["route"])
+            for reason in result["routeReasons"]:
+                print("  " + reason)
         for n in result["notes"]:
             print("  说明：" + n)
-    return 0 if result["result"] in ("merged", "dry-run") else 1
+    return 0 if result["result"] in ("merged", "automerge-on", "handed-to-user", "dry-run") else 1
 
 
 if __name__ == "__main__":

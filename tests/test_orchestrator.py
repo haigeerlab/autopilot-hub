@@ -4,9 +4,12 @@ Run: python3 -B -m unittest discover -s tests -v
 """
 import base64
 import contextlib
+from datetime import datetime, timedelta, timezone
+from io import StringIO
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -14,13 +17,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from admission import decide as d
-from orchestrator import flow
+from orchestrator import cli, flow
+from orchestrator.state import StateCorruptError, StateLockedError, WatchState
+
+if __package__:
+    from ._checkup_util import commit_on_branch, git, make_repo, write_files
+    from .test_verify import case
+else:
+    from _checkup_util import commit_on_branch, git, make_repo, write_files
+    from test_verify import case
 
 REPO = "haigeerlab/autopilot-sandbox"
 HEAD = "a" * 40
 BOT = d.load_bot_identity(os.path.join(ROOT, "bot-identity.json"))
 BOT_USER = {"login": BOT["login"], "id": BOT["id"], "type": "Bot"}
 T0 = "2026-11-22T01:00:00Z"
+APP_ID = 123456
+VERIFIED = "autopilot/verified"
 
 
 def b64(text):
@@ -46,7 +59,11 @@ class FakeWork:
         self.base_tip = "t" * 40
 
     def regression(self, module, ref):
-        return self.io.regression_head if ref == HEAD else self.io.regression_base
+        return self.io.regression_head if ref == self.io.pr['head']['sha'] else self.io.regression_base
+
+    def changed_existing_files(self, module):
+        return ({'sha': self.io.scope_base or self.merge_base,
+                 'source': 'scope_base' if self.io.scope_base else 'merge-base'}, self.io.changed_existing)
 
     def patch_id(self):
         return 'c' * 40
@@ -66,9 +83,11 @@ class FakeWork:
         return self.io.check_results.get(command, flow.check_result(self.io.check_exit, "ok\n"))
 
     def base_view(self):
+        self.io.module_reads.append('base')
         return self.io.base
 
     def module_view(self):
+        self.io.module_reads.append('head')
         return self.io.view
 
     def in_scope(self, module):
@@ -87,6 +106,12 @@ class FakeIO:
         if module == "__legacy__":
             module, acceptance = "m", accepted()
         self.calls, self.comments, self.ran, self.reviews, self.events = [], [], [], [], []
+        self.statuses, self.module_reads = [], []
+        self.automerge_replies = []
+        self.check_runs, self.commit_statuses = [], []
+        self.base_is_current = True
+        self.config = {"mergeMode": "direct"}  # Preserve the existing tests of direct merges and admission.
+        self.branch_rules, self.legacy_rules = [], None
         self.evidence_files = []
         self.issue_comments, self.narrow_prs, self.narrow_result = {}, [], "https://github.com/x/pull/9"
         self.view = {"modules": [{"id": module, "review": {"spec": "codex-approved", "plan": "approved"},
@@ -95,11 +120,13 @@ class FakeIO:
         self.bot = bot
         self.check_command, self.check_exit = check_command, check_exit
         self.check_results = {}
+        self.scope_base, self.changed_existing = None, []
         self.reports = list(reports if reports is not None else [report()])
         self.stored = stored
         self.merged_ok = merged_ok
         self.merged = False
-        self.pr = {"number": 7, "state": "open", "draft": False, "user": author or BOT_USER,
+        self.pr = {"number": 7, "state": "open", "draft": False, "user": author or BOT_USER, "labels": [],
+                   "node_id": "PR_node", "auto_merge": None,
                    "head": {"sha": HEAD, "repo": {"full_name": "someone/fork" if fork else REPO}},
                    "base": {"ref": "main", "repo": {"owner": {"login": "haigeerlab"}}}}
         self.files = [{"filename": f, "status": "modified", "additions": 1, "deletions": 0,
@@ -119,16 +146,32 @@ class FakeIO:
     def bot_identity(self):
         return self.bot
 
+    def local_config(self):
+        return self.config
+
     def api(self, path, method="GET", body=None):
         self.calls.append((method, path, body))
         if method == "POST" and path.endswith("/comments"):
-            self.comments.append({"id": len(self.comments) + 1, "body": body["body"], "user": BOT_USER,
-                                  "performed_via_github_app": {"slug": BOT["app_slug"]},
-                                  "created_at": T0, "updated_at": T0})
-            return {}
+            cid = len(self.comments) + 1
+            comment = {"id": cid, "body": body["body"], "user": BOT_USER,
+                       "html_url": f"https://github.com/{REPO}/pull/7#issuecomment-{cid}",
+                       "performed_via_github_app": {"slug": BOT["app_slug"]},
+                       "created_at": T0, "updated_at": T0}
+            self.comments.append(comment)
+            return dict(comment)
+        if method == "POST" and "/statuses/" in path:
+            self.statuses.append((path, body))
+            return body
+        if path == "graphql":
+            self.pr["auto_merge"] = None
+            return {"data": {"disablePullRequestAutoMerge": {"pullRequest": {"id": self.pr["node_id"]}}}}
         if method == "PUT" and path.endswith("/merge"):
             self.merged = True
             return {"merged": True}
+        if method == "POST" and path.endswith("/labels"):
+            labels = {label["name"] for label in self.pr["labels"]} | set(body["labels"])
+            self.pr["labels"] = [{"name": name} for name in sorted(labels)]
+            return self.pr["labels"]
         if method == "POST":
             return {}
         if path == f"repos/{REPO}/pulls/7":
@@ -150,9 +193,32 @@ class FakeIO:
 
     def api_optional(self, path):
         self.calls.append(("GET", path, None))
+        if path == f"repos/{REPO}/rules/branches/main":
+            return self.branch_rules
         name = path.split("/contents/", 1)[1].split("?", 1)[0]
         text = self.contents.get(name)
         return {"content": b64(text)} if text is not None else None
+
+    def legacy_status_checks(self, repo, branch, *, need_source, need_sync, need_all=False):
+        self.calls.append(("GET", f"repos/{repo}/branches/{branch}/protection/required_status_checks", None))
+        return self.legacy_rules
+
+    def enable_automerge(self, pr_id, head, method):
+        self.calls.append(("POST", "graphql", {"pullRequestId": pr_id, "expectedHeadOid": head, "mergeMethod": method}))
+        rejection = (self.automerge_replies.pop(0) if self.automerge_replies else
+                     "Auto-merge is already enabled" if self.pr["auto_merge"] else None)
+        if rejection is None:
+            self.pr["auto_merge"] = {"merge_method": method, "enabled_by": BOT_USER}
+        return rejection
+
+    def commit_check_results(self, repo, head):
+        self.calls.extend(("GET", f"repos/{repo}/commits/{head}/{endpoint}", None)
+                          for endpoint in ("check-runs", "status"))
+        return self.check_runs, self.commit_statuses
+
+    def base_is_ancestor(self, repo, base_ref, head):
+        self.calls.append(("GET", f"repos/{repo}/compare/{head}...{base_ref}", None))
+        return self.base_is_current
 
     @contextlib.contextmanager
     def checkout(self, repo, pr):
@@ -200,11 +266,13 @@ class FakeIO:
         return self.narrow_result
 
     def find_modules(self, repo, head):
+        self.module_reads.append('find')
         rec = (self.acceptance_record or {}).get("record") or {}
         extra = getattr(self, "extra_modules", [])
         return ([rec["module"]] if rec.get("sha") == head and rec.get("module") else []) + extra
 
     def acceptance(self, repo, module):
+        self.module_reads.append('acceptance')
         return self.acceptance_record
 
     def now(self):
@@ -214,21 +282,36 @@ class FakeIO:
     def writes(self):
         return [c for c in self.calls if c[0] != "GET"]
 
+    @property
+    def graphql_calls(self):
+        return [body for method, path, body in self.calls if (method, path) == ("POST", "graphql")]
+
     def merge_calls(self):
         return [c for c in self.calls if c[0] == "PUT"]
 
 
 def run(io, **kw):
-    return flow.run(io, REPO, 7, **kw)
+    if 'state' in kw:
+        return flow.run(io, REPO, 7, **kw)
+    with tempfile.TemporaryDirectory() as directory:
+        return flow.run(io, REPO, 7, state=WatchState(directory), **kw)
 
 
 def legacy_io(**kw):
     return FakeIO(module="m", acceptance=accepted(), **kw)
 
 
+def assert_artifact_blocks_merge(test, io, result, reason, step="admission"):
+    test.assertEqual((result["result"], result["step"]), ("stopped", step), result)
+    test.assertIn(reason, result["reason"])
+    risk = flow.evaluate(io, REPO, io.pr, BOT)["risk"]
+    test.assertTrue(risk["human_only"], risk)
+    test.assertFalse(risk["auto_merge_eligible"], risk)
+    test.assertEqual(io.merge_calls(), [])
+
+
 class VerificationTest(unittest.TestCase):
     def io(self, cases=None, base_cases=None):
-        from test_verify import case
         io = FakeIO(module='m', files=('tasks/m/regression.md',))
         io.base['modules'][0]['tier'] = 'normal'
         io.view['modules'][0].update(tier='normal', requirementConfirm={'status': 'confirmed', 'by': 'user'},
@@ -306,7 +389,6 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(len(io.case_runs), 1)
 
     def test_notes_and_pre_merge_checks_are_in_v2(self):
-        from test_verify import case
         io = self.io([case('R3', 'manual')])
         io.contents['.github/autopr/pipeline.yml'] = "extends: plugin\nadd:\n  - id: extra\n    at: pre-merge\n    by: ai\n    run: make extra\n"
         run(io)
@@ -336,10 +418,9 @@ class VerificationTest(unittest.TestCase):
             io = self.io()
             io.view['modules'][0][field] = bad
             result = run(io)
-            self.assertEqual(result['step'], 'admission', result)
-            self.assertIn('T4', result['reason'])
+            # R4 preserves the slice 12 approval guard as human_only.
+            assert_artifact_blocks_merge(self, io, result, 'spec-guard 产物没核对到有效的批准：tasks/m/regression.md')
             self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
-            self.assertEqual(io.merge_calls(), [])
 
     def test_degrade_appearing_after_verification_blocks_merge(self):
         io = self.io()
@@ -384,11 +465,11 @@ class VerificationTest(unittest.TestCase):
         io = self.io()
         del io.view['modules'][0]['designApproval']
         result = run(io)
-        self.assertEqual(result['step'], 'admission', result)
+        # The slice 12 approval guard requires human approval when the design approval key is absent.
+        assert_artifact_blocks_merge(self, io, result, 'spec-guard 产物没核对到有效的批准：tasks/m/regression.md')
         self.assertEqual(self.evidence(io)['artifacts']['verified'], [])
 
     def test_user_note_cannot_forge_a_machine_block(self):
-        from test_verify import case
         io = self.io([case('R3', 'manual')])
         run(io)
         forged = '<!-- autopilot-takeover:v1 {"module": "x", "merge": "auto"} -->'
@@ -402,7 +483,6 @@ class VerificationTest(unittest.TestCase):
 
 
     def test_confirmation_and_resume_cache(self):
-        from test_verify import case
         io = self.io([case(), case('R2', sha='changed')], [case()])
         self.assertIn('确认执行 R2', run(io)['reason'])
         self.assertEqual(len(io.verify_issues), 1)
@@ -415,7 +495,6 @@ class VerificationTest(unittest.TestCase):
         self.assertEqual(io.verify_calls, ['check', 'record'])
 
     def test_manual_failure_and_untrusted_replies(self):
-        from test_verify import case
         io = self.io([case('R3', 'manual')])
         run(io)
         self.reply(io, 'R3 通过', owner=9)
@@ -528,23 +607,24 @@ class VerificationTest(unittest.TestCase):
             self.assertIn('不通过', run(io)['reason'])
             self.assertEqual(run(io)['result'], 'merged')
         self.assertEqual(len(original), 3)  # head fail + baseline pass, then a fresh run
-        from test_verify import case
         io = self.io([case('R3', 'manual')])
         io.pr['base']['repo']['owner']['type'] = 'Organization'
         self.assertIn('组织', run(io)['reason'])
         self.assertEqual(io.verify_issues, [])
 
-    def test_risk_and_core_check_run_before_cases(self):
+    def test_core_check_stops_cases_but_high_risk_still_verifies(self):
         io = self.io()
         io.check_exit = 1
         result = run(io)
         self.assertEqual(result['step'], 'check', result)
         self.assertEqual((io.case_runs, io.verify_calls), ([], []))
         io = self.io()
+        io.config = {}
         io.files.append({'filename': '.github/workflows/ci.yml'})
         result = run(io)
-        self.assertEqual(result['step'], 'risk', result)
-        self.assertEqual((io.ran, io.case_runs, io.verify_calls), ([], [], []))
+        # High risk now sends the verified PR to the user after the checks and regression cases run.
+        self.assertEqual(result['result'], 'handed-to-user', result)
+        self.assertEqual((len(io.ran), len(io.case_runs), len(io.verify_calls)), (1, 1, 2))
 
     def test_dry_run_and_non_spec_guard(self):
         io = self.io()
@@ -557,6 +637,927 @@ class VerificationTest(unittest.TestCase):
         io = FakeIO(module=None, merge='auto')
         self.assertIn('一律交你合', run(io)['reason'])
         self.assertEqual(io.ran, [])
+
+
+def ruleset(app_id=APP_ID, *, required=True, strict=True):
+    checks = [{'context': VERIFIED, 'integration_id': app_id}] if required else []
+    return [{'type': 'required_status_checks', 'parameters': {
+        'required_status_checks': checks, 'strict_required_status_checks_policy': strict,
+    }}]
+
+
+class RunRouteFixture(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.now = datetime(2026, 11, 27, 8, 0, tzinfo=timezone.utc)
+        self.state = WatchState(directory.name, clock=lambda: self.now)
+        self.state.write_heartbeat()
+        self.verify = VerificationTest()
+
+    def new_flow(self):
+        io = self.verify.io()
+        io.config = {}  # The default mode is automerge.
+        io.bot = dict(BOT, app_id=APP_ID)
+        io.branch_rules = ruleset()
+        return io
+
+    def run_pr(self, io, **kwargs):
+        return run(io, state=self.state, **kwargs)
+
+    def cli_run(self, io, *args):
+        with mock.patch.object(cli, 'LocalIO', return_value=io), \
+                mock.patch.object(cli, 'WatchState', return_value=self.state), \
+                mock.patch.object(cli.tokens, 'mint', return_value='token'), \
+                mock.patch.object(cli.tokens, 'revoke'), contextlib.redirect_stdout(StringIO()) as stdout:
+            code = cli.main(['run', '--repo', REPO, '--pr', '7', *args])
+        return code, stdout.getvalue()
+
+
+class RoutePreconditionTest(RunRouteFixture):
+    def test_seven_deployment_preconditions(self):
+        cases = (
+            ('missing status', lambda io: setattr(io, 'branch_rules', ruleset(required=False)),
+             '主干未要求 autopilot/verified'),
+            ('wrong app', lambda io: setattr(io, 'branch_rules', ruleset(BOT['id'])),
+             'autopilot/verified 的来源未限定为 hub App'),
+            ('not strict', lambda io: setattr(io, 'branch_rules', ruleset(strict=False)),
+             '主干规则未要求分支与主干同步'),
+            ('stale heartbeat', lambda io: setattr(self, 'now', self.now + timedelta(minutes=16)),
+             'watch 心跳不在 15 分钟内'),
+            ('direct', lambda io: io.config.update(mergeMode='direct'), 'mergeMode=direct'),
+            ('narrowed', lambda io: self.state.narrow_repo(REPO, 'main-red', 42), '仓库已收紧'),
+            ('frozen', lambda io: self.state.set_frozen(True), 'watch 已冻结'),
+        )
+        for label, arrange, reason in cases:
+            with self.subTest(label=label):
+                self.state.set_frozen(False)
+                self.state.resume(REPO)
+                self.state.write_heartbeat()
+                io = self.new_flow()
+                arrange(io)
+                result = self.run_pr(io)
+                if label == 'direct':
+                    self.assertEqual((result['route'], result['result']), ('direct', 'merged'), result)
+                    self.assertEqual(len(io.merge_calls()), 1)
+                else:
+                    self.assertEqual((result['route'], result['result']), ('manual', 'handed-to-user'), result)
+                    self.assertEqual(io.merge_calls(), [])
+                self.assertIn(reason, result['routeReasons'])
+                evidence = self.verify.evidence(io)
+                self.assertEqual(evidence['route'], result['route'])
+                self.assertEqual(evidence['routeReasons'], result['routeReasons'])
+                self.assertEqual(io.graphql_calls, [])
+
+    def test_collects_all_unmet_conditions(self):
+        io = self.new_flow()
+        io.bot = BOT  # The bot user ID is not a configuration value for the App ID.
+        io.branch_rules = ruleset(strict=False)
+        io.base['modules'][0]['takeover'] = effective('human')
+        self.now += timedelta(minutes=16)
+        result = self.run_pr(io)
+        self.assertEqual((result['route'], result['result']), ('manual', 'handed-to-user'))
+        reasons = '\n'.join(result['routeReasons'])
+        for reason in ('没有任何模块', '模块 m 的接管档位', '准入', 'App ID', '与主干同步', 'watch 心跳'):
+            self.assertIn(reason, reasons)
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+
+    def test_legacy_branch_protection_and_app_id_from_local_config(self):
+        io = self.new_flow()
+        io.bot = BOT
+        io.config = {'appId': APP_ID}
+        io.branch_rules = None
+        io.legacy_rules = {'strict': True, 'checks': [{'context': VERIFIED, 'app_id': APP_ID}]}
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+
+    def test_legacy_protection_does_not_accept_an_unpinned_context(self):
+        io = self.new_flow()
+        io.branch_rules = None
+        io.legacy_rules = {'strict': True, 'contexts': [VERIFIED]}
+        result = self.run_pr(io)
+        self.assertEqual(result['route'], 'manual')
+        self.assertIn('autopilot/verified 的来源未限定为 hub App', result['routeReasons'])
+
+    def test_missing_administration_read_selects_manual_with_permission_reason(self):
+        io = self.new_flow()
+        io.branch_rules = []
+        local = cli.LocalIO('run-token', None)
+        io.legacy_status_checks = local.legacy_status_checks
+        projection = {'protection': {'enabled': True, 'required_status_checks': {'contexts': [VERIFIED]}}}
+        with mock.patch.object(local, 'api_optional', return_value=projection), \
+                mock.patch.object(cli.tokens, 'mint', side_effect=cli.tokens.TokenError('no permission')) as mint:
+            result = self.run_pr(io)
+        self.assertEqual((result['route'], result['result']), ('manual', 'handed-to-user'), result)
+        self.assertIn('Administration: read', '\n'.join(result['routeReasons']))
+        self.assertEqual(self.verify.evidence(io)['routeReasons'], result['routeReasons'])
+        self.assertEqual(io.graphql_calls, [])
+        mint.assert_called_once_with(REPO, {'administration': 'read'})
+
+    def test_strict_rule_without_any_checks_does_not_prove_synchronization(self):
+        io = self.new_flow()
+        io.branch_rules = ruleset(required=False)
+        io.legacy_rules = {'strict': False, 'checks': [{'context': VERIFIED, 'app_id': APP_ID}]}
+        result = self.run_pr(io)
+        self.assertEqual(result['route'], 'manual')
+        self.assertIn('主干规则未要求分支与主干同步', result['routeReasons'])
+
+
+class AutoMergeRouteTest(RunRouteFixture):
+    def test_records_intent_and_labels_before_enabling_the_verified_head(self):
+        io = self.new_flow()
+        def spy_state(method):
+            def record(*args, **kwargs):
+                result = method(*args, **kwargs)
+                io.calls.append(("state", method.__name__, (args, kwargs)))
+                return result
+            return record
+
+        with mock.patch.object(self.state, 'intend', side_effect=spy_state(self.state.intend)), \
+                mock.patch.object(self.state, 'set_pr', side_effect=spy_state(self.state.set_pr)), \
+                mock.patch.object(self.state, 'lock', wraps=self.state.lock) as lock:
+            code, output = self.cli_run(io, '--json', '--notify', 'implementation', '--author-host', 'codex')
+        self.assertEqual(code, 0)
+        result = json.loads(output)
+        self.assertEqual((result['route'], result['result'], result['routeReasons']),
+                         ('automerge', 'automerge-on', []), result)
+        evidence = self.verify.evidence(io)
+        self.assertEqual(evidence['authorHost'], 'codex')
+        self.assertEqual(evidence['validatedHeadOid'], HEAD)
+        self.assertEqual(evidence['validatedBaseOid'], FakeWork(io).base_tip)
+        [status] = io.statuses
+        self.assertEqual(status[1]['state'], 'success')
+        intent, = [call for call in io.calls if call[:2] == ('state', 'intend')]
+        requested, = [call for call in io.calls if call[:2] == ('state', 'set_pr')
+                      and call[2][1]['state'] == 'automerge-requested']
+        self.assertEqual(requested[2][1]['notify'], 'implementation')
+        label = ('POST', f'repos/{REPO}/issues/7/labels', {'labels': ['autopilot:authored']})
+        graphql = ('POST', 'graphql', {'pullRequestId': 'PR_node', 'expectedHeadOid': HEAD, 'mergeMethod': 'squash'})
+        ordered = [('POST', *status), intent, requested, label, graphql]
+        indices = [io.calls.index(call) for call in ordered]
+        self.assertEqual(indices, sorted(indices))
+        self.assertEqual(io.merge_calls(), [])
+        record = self.state.get_pr(REPO, 7)
+        self.assertEqual(record, dict(state='automerge-on', validatedHeadOid=HEAD, validatedBaseOid=FakeWork(io).base_tip,
+                                      notify='implementation', since=T0, pause=None))
+        self.assertTrue(self.state.is_done(intent[2][0][0]))
+        self.assertEqual(self.state.pending_intents(), {})
+        self.assertEqual(self.state.pending_notifications(), [])
+        self.assertTrue(lock.call_args_list)
+        self.assertTrue(all(call == mock.call(wait_seconds=60) for call in lock.call_args_list))
+
+    def test_another_run_does_not_duplicate_the_automerge_comment(self):
+        io = self.new_flow()
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        self.assertEqual(len([call for call in io.calls if call[:2] == ('POST', 'graphql')]), 1)
+        self.assertEqual(len(self.state.read()['done']), 1)
+        [comment] = [c for c in io.comments if 'autopilot-automerge:v1' in c['body']]
+        self.assertIn(f'已打开自动合并，绑定提交 `{HEAD[:12]}`', comment['body'])
+
+    def test_reopens_automerge_after_it_has_been_disabled_on_the_same_head(self):
+        io = self.new_flow()
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        io.pr['auto_merge'] = None
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        self.assertEqual(len(io.graphql_calls), 2)
+        self.assertEqual(len(self.state.read()['done']), 2)
+
+    def start_automerge_before_crash(self, io):
+        with mock.patch.object(flow, 'record_automerge_on', side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                self.run_pr(io)
+        self.assertIsNotNone(io.pr['auto_merge'])
+        self.assertEqual(self.state.get_pr(REPO, 7)['state'], 'automerge-requested')
+        key, = self.state.pending_intents()
+        return key
+
+    def test_pending_intent_recovers_a_successful_enable_without_repeating_it(self):
+        io = self.new_flow()
+        key = self.start_automerge_before_crash(io)
+        with mock.patch.object(io, 'enable_automerge', wraps=io.enable_automerge) as enable:
+            result = self.run_pr(io, notify='implementation')
+        enable.assert_not_called()
+        self.assertEqual(result['result'], 'automerge-on', result)
+        self.assertEqual(self.state.get_pr(REPO, 7)['state'], 'automerge-on')
+        self.assertEqual(self.state.get_pr(REPO, 7)['notify'], 'implementation')
+        self.assertTrue(self.state.is_done(key))
+        self.assertEqual(self.state.pending_intents(), {})
+        self.assertIsNotNone(io.pr['auto_merge'])
+
+    def test_pending_intent_with_a_different_queued_head_disables_and_pauses(self):
+        for initial_head, different_head in ((HEAD, 'expectedHeadOid'), ('f' * 40, 'PR head')):
+            with self.subTest(different_head=different_head):
+                io = self.new_flow()
+                io.pr['head']['sha'] = initial_head
+                key = self.start_automerge_before_crash(io)
+                if different_head == 'expectedHeadOid':
+                    io.pr['auto_merge']['expectedHeadOid'] = 'e' * 40
+                else:
+                    io.pr['head']['sha'] = 'e' * 40
+                with mock.patch.object(io, 'enable_automerge', wraps=io.enable_automerge) as enable:
+                    result = self.run_pr(io, notify='implementation')
+                enable.assert_not_called()
+                self.assertEqual((result['result'], result['step']), ('paused', 'merge'), result)
+                self.assertIn('head', result['reason'])
+                self.assertIsNone(io.pr['auto_merge'])
+                self.assertEqual(io.merge_calls(), [])
+                self.assertEqual([status['state'] for _, status in io.statuses], ['success'])
+                self.assertEqual(self.state.get_pr(REPO, 7)['state'], 'paused')
+                self.assertTrue(self.state.is_done(key))
+
+    def test_dry_run_describes_automerge_without_writing_state_or_github(self):
+        io = self.new_flow()
+        before = self.state.read()
+        code, output = self.cli_run(io, '--dry-run', '--json')
+        self.assertEqual(code, 0)
+        result = json.loads(output)
+        self.assertEqual((result['result'], result['route']), ('dry-run', 'automerge'))
+        for step in ('automerge-requested', 'autopilot:authored', 'enablePullRequestAutoMerge', 'expectedHeadOid'):
+            self.assertIn(step, '\n'.join(result['notes']))
+        self.assertEqual(io.writes(), [])
+        self.assertEqual(self.state.read(), before)
+
+    def test_edited_evidence_cannot_claim_admission_passed(self):
+        io = self.new_flow()
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        api = io.api
+
+        def edit_evidence(path, method='GET', body=None):
+            result = api(path, method, body)
+            if method == 'POST' and path.endswith('/comments') and 'autopilot-evidence:v2' in body['body']:
+                for comment in io.comments:
+                    if 'autopilot-evidence:v2' in comment['body']:
+                        comment['updated_at'] = '2026-11-27T01:01:00Z'
+            return result
+
+        io.api = edit_evidence
+        result = self.run_pr(io)
+        self.assertEqual((result['result'], result['step']), ('stopped', 'admission'), result)
+        self.assertEqual(io.merge_calls(), [])
+        self.assertIsNone(io.pr['auto_merge'])
+        self.assertEqual(len(io.graphql_calls), 2)
+        disable = ('POST', 'graphql', io.graphql_calls[-1])
+        self.assertLess(io.calls.index(disable), io.calls.index(('POST', *io.statuses[-1])))
+
+
+class AutoMergeFallbackTest(RunRouteFixture):
+    mismatch = 'Expected head oid does not match the pull request head oid'
+    refused = 'Auto-merge is not allowed'
+
+    def successful_checks(self, io):
+        io.branch_rules[0]['parameters']['required_status_checks'].append({'context': 'ci'})
+        io.check_runs = [{'name': 'ci', 'status': 'completed', 'conclusion': 'success', 'app': {'id': 42}}]
+        io.commit_statuses = [{'context': VERIFIED, 'state': 'success', 'creator': BOT_USER}]
+
+    def assert_paused(self, io, result, reason):
+        self.assertEqual((result['route'], result['result']), ('automerge', 'paused'), result)
+        self.assertIn(reason, result['reason'])
+        self.assertEqual(io.merge_calls(), [])
+        record = self.state.get_pr(REPO, 7)
+        self.assertEqual(record['state'], 'paused')
+        self.assertIn(reason, record['pause']['reason'])
+        self.assertEqual(record['pause']['recovery'], '重新 run 通过')
+        [notification] = [n for n in self.state.pending_notifications() if reason in n['body']]
+        self.assertEqual(notification['target'], 'implementation')
+        self.assertIn(reason, notification['body'])
+
+    def test_head_mismatch_retries_four_times_then_reads_head_and_tries_once_more(self):
+        io = self.new_flow()
+        io.automerge_replies = [self.mismatch] * 5 + [None]
+        sleeps = []
+        result = self.run_pr(io, sleep=sleeps.append)
+        self.assertEqual(result['result'], 'automerge-on', result)
+        self.assertEqual(sleeps, [2] * 4)
+        graphql = ('POST', 'graphql', {'pullRequestId': 'PR_node', 'expectedHeadOid': HEAD, 'mergeMethod': 'squash'})
+        first = io.calls.index(graphql)
+        self.assertEqual(io.calls[first:first + 7],
+                         [graphql] * 5 + [('GET', f'repos/{REPO}/pulls/7', None), graphql])
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_head_mismatch_stops_retrying_as_soon_as_graphql_accepts(self):
+        io = self.new_flow()
+        io.automerge_replies = [self.mismatch, None]
+        sleeps = []
+        self.assertEqual(self.run_pr(io, sleep=sleeps.append)['result'], 'automerge-on')
+        self.assertEqual(sleeps, [2])
+
+    def test_head_still_changed_after_four_retries_pauses_without_merging(self):
+        io = self.new_flow()
+        io.automerge_replies = [self.mismatch] * 5
+        enable = io.enable_automerge
+
+        def change_head(*args):
+            io.pr = dict(io.pr, head=dict(io.pr['head'], sha='e' * 40))
+            return enable(*args)
+
+        sleeps = []
+        with mock.patch.object(io, 'enable_automerge', side_effect=change_head) as graphql:
+            result = self.run_pr(io, notify='implementation', sleep=sleeps.append)
+        self.assertEqual(graphql.call_count, 5)
+        self.assertEqual(sleeps, [2] * 4)
+        self.assert_paused(io, result, 'head 被改了')
+
+    def test_rejection_merges_the_same_head_and_runs_shared_followups(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.refused]
+        io.regression_head[1]['cases'] = [case('R3', 'manual')]
+        self.assertEqual(self.run_pr(io)['step'], 'verification')
+        self.verify.reply(io, 'R3 通过\n意见 R3：按钮间距太小')
+        api = io.api
+
+        def followup_issues(path, method='GET', body=None):
+            if path.startswith(f'repos/{REPO}/issues?labels=autopilot:followup'):
+                io.calls.append((method, path, body))
+                return []
+            if path == f'repos/{REPO}/issues' and method == 'POST' and 'autopilot:followup' in body['labels']:
+                io.calls.append((method, path, body))
+                return {'number': 23}
+            return api(path, method, body)
+
+        io.api = followup_issues
+        result = self.run_pr(io)
+        self.assertEqual((result['route'], result['result'], result['reason']), ('automerge', 'merged', 'm' * 40))
+        [merge] = io.merge_calls()
+        self.assertEqual(merge, ('PUT', f'repos/{REPO}/pulls/7/merge', {'sha': HEAD, 'merge_method': 'squash'}))
+        i = io.calls.index(merge)
+        for endpoint in ('check-runs', 'status'):
+            self.assertIn(('GET', f'repos/{REPO}/commits/{HEAD}/{endpoint}', None), io.calls[:i])
+        self.assertEqual(io.calls[i + 1], ('GET', f'repos/{REPO}/pulls/7', None))
+        self.assertIn(('POST', f'repos/{REPO}/issues/7/labels',
+                       {'labels': ['autopilot:authored', 'autopilot:auto-merged']}), io.calls[i:])
+        self.assertTrue(any('autopilot 已合并' in c['body'] for c in io.comments))
+        self.assertIn('已开后续 issue #23', result['notes'])
+        self.assertEqual(self.state.get_pr(REPO, 7)['state'], 'post-merge-done')
+        self.assertEqual(self.state.pending_intents(), {})
+        self.assertEqual(len(self.state.read()['done']), 1)
+
+    def test_required_checks_must_be_successful_and_present(self):
+        for outcome in ('failure', None):
+            with self.subTest(outcome=outcome):
+                io = self.new_flow()
+                self.successful_checks(io)
+                io.automerge_replies = [self.refused]
+                if outcome is None:
+                    io.check_runs.clear()
+                else:
+                    io.check_runs[0]['conclusion'] = outcome
+                reason = '缺少必需检查 ci' if outcome is None else '必需检查 ci 未成功'
+                self.assert_paused(io, self.run_pr(io, notify='implementation'), reason)
+
+    def test_verified_must_come_from_the_hub_app(self):
+        for via in ('check-run', 'commit status'):
+            with self.subTest(via=via):
+                io = self.new_flow()
+                self.successful_checks(io)
+                io.automerge_replies = [self.refused]
+                io.commit_statuses.clear()
+                if via == 'check-run':
+                    io.check_runs.append({'name': VERIFIED, 'status': 'completed', 'conclusion': 'success',
+                                          'app': {'id': APP_ID + 1}})
+                else:
+                    io.commit_statuses.append({'context': VERIFIED, 'state': 'success',
+                                               'creator': dict(BOT_USER, id=BOT_USER['id'] + 1)})
+                self.assert_paused(io, self.run_pr(io, notify='implementation'), '来源不是 hub App')
+
+    def test_fallback_can_verify_the_hub_app_via_check_runs_and_classic_rules(self):
+        io = self.new_flow()
+        io.branch_rules = []
+        io.legacy_rules = {'strict': True, 'contexts': [VERIFIED, 'ci'],
+                           'checks': [{'context': VERIFIED, 'app_id': APP_ID}]}
+        io.automerge_replies = [self.refused]
+        io.check_runs = [{'name': VERIFIED, 'status': 'completed', 'conclusion': 'success', 'app': {'id': APP_ID}}]
+        io.commit_statuses = [{'context': 'ci', 'state': 'success', 'creator': {'id': 1}}]
+        self.assertEqual(self.run_pr(io)['result'], 'merged')
+        self.assertEqual(len(io.merge_calls()), 1)
+
+    def test_fallback_pauses_when_a_scoped_read_token_cannot_be_minted(self):
+        for permission in ('Administration', 'Checks'):
+            with self.subTest(permission=permission):
+                io = self.new_flow()
+                self.successful_checks(io)
+                io.automerge_replies = [self.refused]
+                local = cli.LocalIO('run-token', None)
+                if permission == 'Administration':
+                    io.legacy_status_checks = local.legacy_status_checks
+                else:
+                    io.commit_check_results = local.commit_check_results
+                projection = {'protection': {'enabled': True, 'required_status_checks': {'contexts': ['classic-ci']}}}
+                with mock.patch.object(local, 'api_optional', return_value=projection), \
+                        mock.patch.object(cli.tokens, 'mint', side_effect=cli.tokens.TokenError('no permission')) as mint:
+                    result = self.run_pr(io, notify='implementation')
+                self.assert_paused(io, result, f'{permission}: read')
+                mint.assert_called_once_with(REPO, {permission.lower(): 'read'})
+
+    def test_pr_behind_main_pauses_and_cli_exits_one(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.refused]
+        io.pr['mergeable_state'] = 'behind'
+        code, output = self.cli_run(io, '--json', '--notify', 'implementation')
+        self.assertEqual(code, 1)
+        self.assert_paused(io, json.loads(output), 'PR 落后主干')
+
+    def test_blocked_mergeability_does_not_hide_a_base_advance(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.refused]
+        io.pr['mergeable_state'] = 'blocked'
+        io.base_is_current = False
+        self.assert_paused(io, self.run_pr(io, notify='implementation'), 'PR 落后主干')
+
+    def test_fallback_rechecks_branch_rules_after_the_last_rejection(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.mismatch] * 5 + [self.refused]
+        enable = io.enable_automerge
+
+        def change_rules(*args):
+            result = enable(*args)
+            if result == self.refused:
+                io.branch_rules = ruleset(APP_ID + 1)
+            return result
+
+        with mock.patch.object(io, 'enable_automerge', side_effect=change_rules):
+            result = self.run_pr(io, notify='implementation', sleep=lambda _: None)
+        self.assert_paused(io, result, f'{VERIFIED} 的来源未限定为 hub App')
+
+    def test_non_head_rejection_cannot_merge_a_pr_with_a_new_head(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.refused]
+        enable = io.enable_automerge
+
+        def change_head(*args):
+            io.pr = dict(io.pr, head=dict(io.pr['head'], sha='e' * 40))
+            return enable(*args)
+
+        with mock.patch.object(io, 'enable_automerge', side_effect=change_head):
+            result = self.run_pr(io, notify='implementation')
+        self.assert_paused(io, result, 'head 被改了')
+
+    def test_fallback_checks_for_a_freeze_during_the_request(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.automerge_replies = [self.refused]
+        enable = io.enable_automerge
+
+        def freeze(*args):
+            self.state.set_frozen(True)
+            return enable(*args)
+
+        with mock.patch.object(io, 'enable_automerge', side_effect=freeze):
+            result = self.run_pr(io, notify='implementation')
+        self.assert_paused(io, result, 'watch 已冻结')
+
+    def test_pause_disables_a_request_that_appears_during_enable(self):
+        io = self.new_flow()
+        self.successful_checks(io)
+        io.pr['mergeable_state'] = 'behind'
+
+        def rejected_after_queueing(*args):
+            io.pr['auto_merge'] = {'merge_method': 'squash', 'enabled_by': BOT_USER}
+            return self.refused
+
+        with mock.patch.object(io, 'enable_automerge', side_effect=rejected_after_queueing):
+            result = self.run_pr(io, notify='implementation')
+        self.assert_paused(io, result, 'PR 落后主干')
+        self.assertIsNone(io.pr['auto_merge'])
+
+
+class ManualRouteTest(RunRouteFixture):
+    def assert_handed_to_user(self, io, *, notify='implementation'):
+        result = self.run_pr(io, notify=notify, author_host='claude-code')
+        self.assertEqual((result['route'], result['result']), ('manual', 'handed-to-user'), result)
+        [(path, status)] = io.statuses
+        self.assertEqual(path, f'repos/{REPO}/statuses/{HEAD}')
+        self.assertEqual((status['context'], status['state']), (VERIFIED, 'success'))
+        self.assertIn(FakeWork(io).patch_id()[:12], status['description'])
+        self.assertIn(FakeWork(io).base_tip[:12], status['description'])
+        comment = next(c for c in io.comments if c['html_url'] == status['target_url'])
+        self.assertIn('autopilot-evidence', comment['body'])
+        self.assertIn('"authorHost": "claude-code"', comment['body'])
+        self.assertEqual(io.graphql_calls, [])
+        self.assertEqual(io.merge_calls(), [])
+        handoff = [c for c in io.comments if '由你合并' in c['body']]
+        self.assertEqual(len(handoff), 1)
+        for reason in result['routeReasons']:
+            self.assertIn(reason, handoff[0]['body'])
+        notification = self.state.pending_notifications()[-1]
+        self.assertEqual(notification['target'], notify)
+        self.assertIn('由你合并', notification['body'])
+        return result
+
+    def test_t4_runs_validation_and_deduplicates_handoff_for_the_same_head(self):
+        io = self.new_flow()
+        io.files.append({'filename': '.github/workflows/ci.yml'})
+        result = self.assert_handed_to_user(io)
+        self.assertIn('T4', '\n'.join(result['routeReasons']))
+        self.assertEqual(io.ran, ['make test'])
+        self.assertEqual(io.verify_calls, ['check', 'record'])
+        self.assertEqual(self.run_pr(io, notify='implementation')['result'], 'handed-to-user')
+        self.assertEqual(len([c for c in io.comments if '由你合并' in c['body']]), 1)
+        self.assertEqual(len(self.state.pending_notifications()), 1)
+
+    def test_manual_rerun_disables_previously_queued_automerge(self):
+        io = self.new_flow()
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        io.branch_rules = ruleset(strict=False)
+        result = self.run_pr(io)
+        self.assertEqual((result['route'], result['result']), ('manual', 'handed-to-user'), result)
+        self.assertIsNone(io.pr['auto_merge'])
+        self.assertEqual(io.merge_calls(), [])
+        disable = ('POST', 'graphql', io.graphql_calls[-1])
+        self.assertIn('disablePullRequestAutoMerge', disable[2]['query'])
+        self.assertLess(io.calls.index(disable), io.calls.index(('POST', *io.statuses[-1])))
+
+    def test_early_stop_disables_previously_queued_automerge(self):
+        io = self.new_flow()
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        io.pr['draft'] = True
+        result = self.run_pr(io)
+        self.assertEqual((result['result'], result['step']), ('stopped', 'pr'), result)
+        self.assertIsNone(io.pr['auto_merge'])
+        self.assertEqual([status['state'] for _, status in io.statuses], ['success'])
+
+    def test_legacy_non_auto_reuses_final_acceptance(self):
+        io = legacy_io(base_takeover={'m': effective('human')})
+        io.config = {}
+        self.assert_handed_to_user(io)
+        self.assertIn('acceptance', io.module_reads)
+        self.assertEqual(io.ran, ['make test'])
+
+    def test_dependabot_only_checks_and_classifies_risk(self):
+        io = self.new_flow()
+        io.pr['user'] = {'login': 'dependabot[bot]', 'type': 'Bot'}
+        io.config = {'mergeMode': 'direct'}
+        with mock.patch.object(flow, 'evaluate', side_effect=AssertionError('module admission')):
+            self.assert_handed_to_user(io)
+        self.assertEqual(io.module_reads, [])
+        self.assertEqual(io.ran, ['make test'])
+        self.assertEqual(io.case_runs, [])
+        self.assertEqual(io.verify_calls, [])
+
+
+class VerificationFailureStatusTest(RunRouteFixture):
+    def test_failure_replaces_success_and_disables_only_queued_automerge(self):
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                io = self.new_flow()
+                if queued:
+                    self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+                    io.verification_files.clear()  # Force verification of this head to run again.
+                case = {'exit': 1, 'timeout': False, 'output': 'regression failed'}
+                baseline = {'exit': 0, 'timeout': False, 'output': 'baseline passed'}
+                with mock.patch.object(FakeWork, 'run_case', side_effect=[case, baseline]):
+                    result = self.run_pr(io)
+                self.assertEqual((result['result'], result['step']), ('stopped', 'verification'))
+                self.assertEqual(io.statuses[-1][0], f'repos/{REPO}/statuses/{HEAD}')
+                self.assertEqual((io.statuses[-1][1]['context'], io.statuses[-1][1]['state']), (VERIFIED, 'failure'))
+                self.assertEqual(io.merge_calls(), [])
+                if queued:
+                    self.assertEqual([s['state'] for _, s in io.statuses], ['success', 'failure'])
+                    enable, call = io.graphql_calls
+                    self.assertEqual(enable['expectedHeadOid'], HEAD)
+                    self.assertIn('disablePullRequestAutoMerge', call['query'])
+                    self.assertEqual(call['variables']['pullRequestId'], 'PR_node')
+                    self.assertIsNone(io.pr['auto_merge'])
+                else:
+                    self.assertEqual(io.graphql_calls, [])
+
+    def test_failed_status_write_still_attempts_to_disable_queued_automerge(self):
+        io = self.new_flow()
+        io.check_exit = 1
+        io.pr['auto_merge'] = {'merge_method': 'squash'}
+        api = io.api
+
+        def reject_status(path, method='GET', body=None):
+            if method == 'POST' and '/statuses/' in path:
+                raise cli.ApiError('status write rejected')
+            return api(path, method, body)
+
+        io.api = reject_status
+        with self.assertRaisesRegex(cli.ApiError, 'status write rejected'):
+            self.run_pr(io)
+        self.assertIsNone(io.pr['auto_merge'])
+        self.assertEqual(len(io.graphql_calls), 1)
+
+    def test_failure_status_and_queue_cleanup_precede_unwritable_repair_state(self):
+        for error in (StateLockedError('locked'), StateCorruptError('corrupt')):
+            with self.subTest(error=error):
+                io = self.new_flow()
+                self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+                io.check_exit = 1
+
+                def fail_recording(*args):
+                    self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+                    self.assertIsNone(io.pr['auto_merge'])
+                    raise error
+
+                with mock.patch.object(self.state, 'record_failure', side_effect=fail_recording), \
+                        contextlib.redirect_stderr(StringIO()) as stderr:
+                    code, _ = self.cli_run(io)
+                self.assertEqual(code, 2)
+                self.assertIn(str(error), stderr.getvalue())
+                self.assertEqual(self.state.get_pr(REPO, 7)['pause']['reason'], 'run-failed')
+
+
+class RunFailureRecordTest(RunRouteFixture):
+    def test_api_error_pauses_and_queues_a_user_notification_before_exit_two(self):
+        io = self.new_flow()
+        error = cli.ApiError('GitHub status write failed')
+        api = io.api
+
+        def reject_status(path, method='GET', body=None):
+            if method == 'POST' and '/statuses/' in path:
+                raise error
+            return api(path, method, body)
+
+        with mock.patch.object(cli, 'LocalIO', return_value=io), \
+                mock.patch.object(cli, 'WatchState', return_value=self.state), \
+                mock.patch.object(cli.tokens, 'mint', return_value='token') as mint, \
+                mock.patch.object(cli.tokens, 'revoke') as revoke, \
+                mock.patch.object(io, 'api', side_effect=reject_status), \
+                contextlib.redirect_stderr(StringIO()) as stderr:
+            exit_code = cli.main(['run', '--repo', REPO, '--pr', '7', '--notify', 'implementation'])
+        self.assertEqual(exit_code, 2)
+        self.assertIn(str(error), stderr.getvalue())
+        mint.assert_called_once_with(REPO, dict(cli.WRITE, statuses='write'))
+        revoke.assert_called_once_with('token')
+        record = self.state.get_pr(REPO, 7)
+        self.assertEqual(record['state'], 'paused')
+        self.assertEqual(record['pause']['reason'], 'run-failed')
+        self.assertIn(str(error), record['pause']['recovery'])
+        [notice] = self.state.pending_notifications()
+        self.assertEqual(notice['target'], 'user')
+        self.assertIn(str(error), notice['body'])
+
+    def test_local_failure_after_enable_disables_queue_before_reporting_run_failed(self):
+        io = self.new_flow()
+
+        def fail_recording(*args):
+            self.assertIsNotNone(io.pr['auto_merge'])
+            raise StateLockedError('could not record successful enable')
+
+        with mock.patch.object(flow, 'record_automerge_on', side_effect=fail_recording), \
+                contextlib.redirect_stderr(StringIO()):
+            code, _ = self.cli_run(io)
+        self.assertEqual(code, 2)
+        self.assertIsNone(io.pr['auto_merge'])
+        self.assertIn('disablePullRequestAutoMerge', io.graphql_calls[-1]['query'])
+        self.assertEqual(self.state.get_pr(REPO, 7)['pause']['reason'], 'run-failed')
+
+
+class RepairLimitTest(RunRouteFixture):
+    def test_two_failed_repairs_pause_and_notify_once(self):
+        io = self.verify.io([case('R9')])
+        heads = ['a' * 40, 'e' * 40, 'c' * 40, 'd' * 40]
+
+        def execute(work, command, sha):
+            return {'exit': int(sha == io.pr['head']['sha']), 'timeout': False, 'output': 'regression'}
+
+        with mock.patch.object(FakeWork, 'run_case', execute):
+            for index, head in enumerate(heads):
+                io.pr['head']['sha'] = head
+                expected = 'stopped' if index < 2 else 'paused'
+                for _ in range(2):
+                    with self.subTest(head=head, result=expected):
+                        result = self.run_pr(io)
+                        self.assertEqual(result['result'], expected, result)
+                        self.assertEqual(self.state.repair_count(REPO, 7, 'case:R9'), min(index, 2))
+            exit_code, stdout = self.cli_run(io, '--json')
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout)['result'], 'paused')
+        self.assertEqual(self.state.read()['repairs'][f'{REPO}#7']['case:R9'], heads[1:3])
+        pause = self.state.get_pr(REPO, 7)['pause']
+        self.assertEqual(pause['reason'], '同一原因修了两次仍失败：case:R9')
+        self.assertEqual(pause['recovery'], '用户决定')
+        [notice] = self.state.pending_notifications()
+        self.assertEqual(notice['target'], 'user')
+        for value in ('case:R9', *heads[1:3], '继续修', '改方案', '交给你手工处理'):
+            self.assertIn(value, notice['body'])
+        self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+        self.assertEqual(io.merge_calls(), [])
+
+    def test_checks_and_review_findings_keep_separate_counts(self):
+        io = legacy_io(check_command='R9', check_exit=1)
+        first = {'id': 'R9', 'severity': 'blocking', 'title': 'Requires a fix'}
+        other = {'file': 'src/a.py', 'title': 'Missing assignment', 'severity': 'blocking', 'line': 7}
+        suggestion = {'id': 'advice', 'severity': 'suggestion'}
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        io.check_exit = 0
+        io.pr['head']['sha'] = 'b' * 40
+        review = dict(report_for(io.pr['head']['sha']), findings=[first, other, suggestion], review_outcome='findings')
+        io.acceptance_record = accepted(review, sha=io.pr['head']['sha'])
+        self.assertEqual(self.run_pr(io)['step'], 'review')
+        self.assertEqual(self.state.repair_count(REPO, 7, 'check:R9'), 0)
+        self.assertEqual(self.state.repair_count(REPO, 7, 'review:R9'), 0)
+        io.pr['head']['sha'] = 'c' * 40
+        review = dict(report_for(io.pr['head']['sha']), findings=[first, suggestion], review_outcome='findings',
+                      recheck={'items': [{'status': 'unresolved', 'finding': dict(other, line=13)}]})
+        io.acceptance_record = accepted(review, sha=io.pr['head']['sha'])
+        self.assertEqual(self.run_pr(io)['step'], 'review')
+        io.check_exit = 1
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        repairs = self.state.read()['repairs'][f'{REPO}#7']
+        self.assertEqual(len(repairs), 3, repairs)
+        self.assertEqual(repairs['check:R9'], ['c' * 40])
+        self.assertEqual(repairs['review:R9'], ['c' * 40])
+        [summary] = [key for key in repairs if key not in ('check:R9', 'review:R9')]
+        self.assertTrue(summary.startswith('review:'))
+        self.assertEqual(repairs[summary], ['c' * 40])
+
+    def test_failed_cases_count_even_if_spec_guard_cannot_record_the_report(self):
+        io = self.verify.io([case('R8'), case('R9')])
+        io.verify_code, io.verify_problem = 3, 'author-unknown'
+
+        def execute(work, command, sha):
+            return {'exit': int(sha == io.pr['head']['sha']), 'timeout': False, 'output': 'regression'}
+
+        with mock.patch.object(FakeWork, 'run_case', execute):
+            for head in (HEAD, 'e' * 40):
+                io.pr['head']['sha'] = head
+                self.assertIn('author-unknown', self.run_pr(io)['reason'])
+        self.assertEqual(self.state.read()['repairs'][f'{REPO}#7'], {'case:R8': [head], 'case:R9': [head]})
+
+    def test_existing_test_pauses_before_checks_and_exits_one(self):
+        io = self.new_flow()
+        io.scope_base, io.changed_existing = 'e' * 40, ['components/widget.spec.js']
+        io.pr['auto_merge'] = {'merge_method': 'squash'}
+        exit_code, stdout = self.cli_run(io, '--json')
+        self.assertEqual(exit_code, 1)
+        result = json.loads(stdout)
+        self.assertEqual(result['result'], 'paused')
+        self.assertEqual(result['repairBaseline'], {'source': 'scope_base', 'sha': io.scope_base})
+        reason = '修复时改了已有测试／回归测试文档：components/widget.spec.js'
+        self.assertEqual(self.state.get_pr(REPO, 7)['pause']['reason'], reason)
+        [notice] = self.state.pending_notifications()
+        self.assertEqual(notice['target'], 'user')
+        self.assertIn(reason, notice['body'])
+        self.assertEqual(io.ran, [])
+        self.assertEqual(io.case_runs, [])
+        self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+        self.assertIsNone(io.pr['auto_merge'])
+
+    def test_existing_regression_document_pauses_before_checks(self):
+        io = self.new_flow()
+        io.changed_existing = ['tasks/m/regression.md']
+        result = self.run_pr(io)
+        self.assertEqual(result['result'], 'paused', result)
+        self.assertEqual(result['reason'], '修复时改了已有测试／回归测试文档：tasks/m/regression.md')
+        self.assertEqual(result['repairBaseline'], {'source': 'merge-base', 'sha': 'b' * 40})
+        self.assertEqual(io.ran, [])
+        self.assertEqual(io.verify_calls, [])
+
+    def test_added_test_can_pass_and_evidence_names_the_fallback_baseline(self):
+        io = self.new_flow()
+        io.files.append({'filename': 'tests/test_added.py', 'status': 'added', 'additions': 1,
+                         'deletions': 0, 'patch': '+assert True'})
+        self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
+        self.assertEqual(self.verify.evidence(io)['repairBaseline'], {'source': 'merge-base', 'sha': 'b' * 40})
+        self.assertEqual(self.state.pending_notifications(), [])
+
+    def test_unconfirmed_scope_base_is_reported_in_run_evidence(self):
+        io = self.new_flow()
+        baseline = {'source': 'merge-base', 'sha': 'b' * 40, 'fallbackReason': 'scope-base-not-ancestor'}
+        with mock.patch.object(FakeWork, 'changed_existing_files', return_value=(baseline, [])):
+            result = self.run_pr(io)
+        self.assertEqual(result['repairBaseline'], baseline)
+        self.assertIn('祖先', '\n'.join(result['notes']))
+        self.assertEqual(self.verify.evidence(io)['repairBaseline'], baseline)
+
+    def test_dry_run_leaves_no_pause_or_notice(self):
+        io = self.new_flow()
+        io.changed_existing = ['tests/test_existing.py']
+        result = self.run_pr(io, dry_run=True)
+        self.assertEqual(result['result'], 'stopped', result)
+        self.assertIn('tests/test_existing.py', result['reason'])
+        self.assertIsNone(self.state.get_pr(REPO, 7))
+        self.assertEqual(self.state.pending_notifications(), [])
+        self.assertEqual(io.writes(), [])
+
+    def test_work_diffs_committed_files_against_scope_base_then_merge_base(self):
+        root = make_repo(self, {'tests/test_old.py': 'old\n', 'tasks/m/regression.md': 'original\n'})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.git_env = root, dict(os.environ)
+        scope_base = work.git('rev-parse', 'HEAD').strip()
+        write_files(root, {'tests/test_existing.py': 'existing\n', 'scope': scope_base})
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'advance main')
+        work.base_tip = work.merge_base = work.git('rev-parse', 'HEAD').strip()
+        commit_on_branch(root, {'tests/test_old.py': 'changed\n', 'tests/test_existing.py': 'changed\n',
+                                'tests/test_added.py': 'new\n', 'tasks/m/regression.md': 'edited\n',
+                                'scope': work.merge_base})
+        work.head = work.git('rev-parse', 'HEAD').strip()
+        git(root, 'checkout', '-q', 'main')
+        with tempfile.TemporaryDirectory() as plugin:
+            write_files(plugin, {'hooks/module_scope.py': (
+                'def scope_base(root, module):\n'
+                '    assert module == "m"\n'
+                '    return (root / "scope").read_text().strip()\n'
+            )})
+            with mock.patch.object(cli, 'find_spec_guard_root', return_value=plugin):
+                self.assertEqual(work.changed_existing_files('m'), ({'sha': scope_base, 'source': 'scope_base'},
+                                 ['tasks/m/regression.md', 'tests/test_old.py']))
+        with mock.patch.object(cli, 'find_spec_guard_root', return_value=None):
+            self.assertEqual(work.changed_existing_files('m'), ({'sha': work.merge_base, 'source': 'merge-base'},
+                             ['scope', 'tasks/m/regression.md', 'tests/test_existing.py', 'tests/test_old.py']))
+
+    def test_main_changes_after_scope_base_are_not_blamed_on_the_pr(self):
+        # Review finding: diffing scope_base..head blamed the PR for test edits that reached main later.
+        root = make_repo(self, {'tests/test_main_only.py': 'old\n', 'tests/test_pr.py': 'old\n'})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.git_env = root, dict(os.environ)
+        scope_base = work.git('rev-parse', 'HEAD').strip()
+        write_files(root, {'tests/test_main_only.py': 'edited on main\n', 'scope': scope_base})
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'someone else edits a test on main')
+        work.base_tip = work.merge_base = work.git('rev-parse', 'HEAD').strip()
+        commit_on_branch(root, {'tests/test_pr.py': 'changed by the PR\n'})
+        work.head = work.git('rev-parse', 'HEAD').strip()
+        git(root, 'checkout', '-q', 'main')
+        with tempfile.TemporaryDirectory() as plugin:
+            write_files(plugin, {'hooks/module_scope.py': (
+                'def scope_base(root, module):\n'
+                '    return (root / "scope").read_text().strip()\n'
+            )})
+            with mock.patch.object(cli, 'find_spec_guard_root', return_value=plugin):
+                baseline, paths = work.changed_existing_files('m')
+        self.assertEqual(baseline, {'sha': scope_base, 'source': 'scope_base'})
+        self.assertEqual(paths, ['tests/test_pr.py'])
+
+    def test_scope_base_from_base_checkout_must_be_an_ancestor_of_the_merge_base(self):
+        root = make_repo(self, {'tests/test_old.py': 'old\n'})
+        work = cli.Work.__new__(cli.Work)
+        work.root, work.git_env = root, dict(os.environ)
+        work.merge_base = work.git('rev-parse', 'HEAD').strip()
+        commit_on_branch(root, {'tests/test_old.py': 'changed\n'})
+        work.head = work.git('rev-parse', 'HEAD').strip()
+        git(root, 'checkout', '-q', 'main')
+        write_files(root, {'other': 'advanced base\n'})
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'advance main')
+        work.base_tip = work.git('rev-parse', 'HEAD').strip()
+        with tempfile.TemporaryDirectory() as plugin:
+            write_files(plugin, {'hooks/module_scope.py': (
+                'import subprocess\n'
+                'def scope_base(root, module):\n'
+                '    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()\n'
+            )})
+            with mock.patch.object(cli, 'find_spec_guard_root', return_value=plugin):
+                baseline, paths = work.changed_existing_files('m')
+        self.assertEqual(baseline, {'source': 'merge-base', 'sha': work.merge_base,
+                                    'fallbackReason': 'scope-base-not-ancestor'})
+        self.assertEqual(paths, ['tests/test_old.py'])
+
+    def test_batch_skips_repair_guard_and_never_updates_watch_state(self):
+        io = self.new_flow()
+        io.changed_existing = ['tests/test_old.py', 'tasks/m/regression.md']
+        before = self.state.read()
+        result = self.run_pr(io, merge_method='merge')
+        self.assertEqual(result['result'], 'merged', result)
+        self.assertEqual(io.merge_calls()[0][2], {'sha': HEAD, 'merge_method': 'merge'})
+        self.assertEqual(self.state.read(), before)
+        self.assertEqual(io.statuses, [])
+
+        io = self.new_flow()
+        io.check_exit = 1
+        for head in (HEAD, 'e' * 40, 'f' * 40):
+            io.pr['head']['sha'] = head
+            result = self.run_pr(io, merge_method='merge')
+            self.assertEqual((result['result'], result['step']), ('stopped', 'check'), result)
+        self.assertEqual(self.state.read(), before)
+        self.assertEqual(io.statuses, [])
+
+
+class DirectModeTest(RunRouteFixture):
+    def test_dry_run_prints_direct_and_makes_no_github_or_state_writes(self):
+        io = self.new_flow()
+        io.local_config = cli.LocalIO.local_config
+        directory = self.state.path.parent
+        (directory / 'config.json').write_text(json.dumps({'mergeMode': 'direct'}), encoding='utf-8')
+        self.state.set_frozen(True)
+        before = self.state.read()
+        with mock.patch.object(cli, 'LocalIO', return_value=io), \
+                mock.patch.object(cli, 'STATE', str(directory)), \
+                mock.patch.object(cli, 'WatchState', return_value=self.state), \
+                mock.patch.object(cli.tokens, 'mint', return_value='token') as mint, \
+                mock.patch.object(cli.tokens, 'revoke'), contextlib.redirect_stdout(StringIO()) as stdout:
+            exit_code = cli.main(['run', '--repo', REPO, '--pr', '7', '--dry-run', '--author-host', 'codex'])
+        self.assertEqual(exit_code, 0)
+        self.assertIn('route=direct', stdout.getvalue())
+        self.assertEqual(io.writes(), [])
+        self.assertEqual(self.state.read(), before)
+        mint.assert_called_once_with(REPO, cli.READ)
+
+    def test_run_exit_codes(self):
+        outcomes = {'merged': 0, 'automerge-on': 0, 'handed-to-user': 0, 'dry-run': 0,
+                    'stopped': 1, 'paused': 1}
+        with mock.patch.object(cli.tokens, 'mint', return_value='token'), \
+                mock.patch.object(cli.tokens, 'revoke'), contextlib.redirect_stdout(StringIO()):
+            for result, expected in outcomes.items():
+                with self.subTest(result=result), mock.patch.object(flow, 'run', return_value={'result': result}):
+                    self.assertEqual(cli.main(['run', '--repo', REPO, '--pr', '7', '--json']), expected)
 
 
 class HappyPathTest(unittest.TestCase):
@@ -645,11 +1646,12 @@ class StopTest(unittest.TestCase):
         self.assertStops(FakeIO(module=None, takeover=False), "takeover")
         self.assertStops(FakeIO(module=None, merge="yes"), "takeover")
 
-    def test_high_risk_stops_before_any_review(self):
+    def test_high_risk_in_direct_mode_stops_at_admission(self):
         io = legacy_io(files=(".github/workflows/ci.yml",))
-        self.assertStops(io, "risk", "T4")
+        # Direct mode now reaches live admission after checking and reusing final acceptance.
+        self.assertStops(io, "admission", "T4")
         self.assertEqual(io.reviews, [])
-        self.assertEqual(io.ran, [])
+        self.assertEqual(io.ran, ["make test"])
 
     def test_no_check_command(self):
         self.assertStops(legacy_io(check_command=None), "check", "找不到检查命令")
@@ -844,44 +1846,54 @@ class AcceptanceTest(unittest.TestCase):
         self.assertIn("/map --json（基础分支）", io.comments[0]["body"])
         self.assertFalse(any("contents/.agent/config.json" in path for _, path, _ in io.calls))
 
-    def test_spec_guard_project_without_any_auto_stops_before_checks(self):
+    def test_spec_guard_project_without_any_auto_checks_then_hands_off(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"m": effective("human")})
+        io.config = {}
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
-        self.assertEqual(io.ran, [])
+        # A project-wide human setting now permits checks before the manual handoff.
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
+        self.assertEqual(io.ran, ["make test"])
 
     def test_module_human_from_base_view(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[],
                     base_takeover={"m": effective("human"), "other": effective()})
+        io.config = {}
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
-        self.assertIn("模块 m", res["reason"])
+        # The module's human setting is now a handoff reason.
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
+        self.assertIn("模块 m", " ".join(res["routeReasons"]))
 
     def test_effective_auto_from_base_view(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"m": effective()})
         self.assertEqual(run(io)["result"], "merged")
 
-    def test_unavailable_base_view_stops_before_checks(self):
+    def test_unavailable_base_view_checks_then_hands_off(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[])
         io.base = None
+        io.config = {}
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
-        self.assertEqual(io.ran, [])
+        # An unavailable base view now permits checks while keeping the route manual.
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
+        self.assertEqual(io.ran, ["make test"])
         self.assertTrue(res["notes"])
 
     def test_head_cannot_widen_base_takeover(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[],
                     base_takeover={"m": effective("human"), "other": effective()})
         io.view["modules"][0]["takeover"] = effective()
+        io.config = {}
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "takeover"))
-        self.assertIn("模块 m", res["reason"])
+        # The base setting still controls the route, so the head's setting only leads to handoff.
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
+        self.assertIn("模块 m", " ".join(res["routeReasons"]))
         self.assertEqual(io.merge_calls(), [])
 
     def test_module_added_in_head_is_human(self):
         io = FakeIO(module="m", acceptance=accepted(), reports=[], base_takeover={"other": effective()})
+        io.config = {}
         res = run(io)
-        self.assertEqual(res["step"], "takeover")
+        # A module missing on the base remains manual after checks and final acceptance.
+        self.assertEqual((res["result"], res["route"]), ("handed-to-user", "manual"))
         self.assertIn("基础分支上还没有模块 m", " ".join(res["notes"]))
 
     def test_several_records_for_head_stop(self):
@@ -908,9 +1920,11 @@ class AcceptanceTest(unittest.TestCase):
         }
         for name, acc in cases.items():
             io = FakeIO(module="m", acceptance=acc, reports=[])
+            # Admission follows acceptance now, so exercise a bad module ID in the file selected for m.
+            io.find_modules = lambda repo, head: ["m"]
             res = run(io)
             self.assertEqual(res["result"], "stopped", name)
-            self.assertIn(res["step"], ("acceptance", "review", "takeover"), name)
+            self.assertIn(res["step"], ("acceptance", "review"), name)
             self.assertEqual(io.merge_calls(), [], name)
 
     def test_human_approved_acceptance_counts(self):
@@ -943,27 +1957,35 @@ class ModuleArtifactsTest(unittest.TestCase):
         io = self.io()
         io.view["modules"][0]["review"]["spec"] = "revised"
         res = run(io)
-        self.assertEqual((res["result"], res["step"]), ("stopped", "admission"))
-        self.assertIn("T4", res["reason"])
+        # R4 preserves the slice 12 approval guard for revised specs as human_only.
+        assert_artifact_blocks_merge(self, io, res, "spec-guard 产物没核对到有效的批准：spec/m.md")
         self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
     def test_codex_approval_not_counted_by_takeover_is_not_verified(self):
         io = self.io()
         io.view["modules"][0]["reviewApprovedBy"]["spec"] = None
-        self.assertEqual(run(io)["step"], "admission")
+        # The slice 12 approval guard keeps an approval without a recognized approver human_only.
+        assert_artifact_blocks_merge(self, io, run(io), "spec-guard 产物没核对到有效的批准：spec/m.md")
+        self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
-    def test_other_modules_artifacts_and_capability_map_stay_T4(self):
-        for f in ("spec/other.md", "spec/CAPABILITY-MAP.md", "tasks/other/plan.md"):
-            io = self.io(files=("spec/m.md", f))
-            res = run(io)
-            self.assertEqual(res["result"], "stopped", f)
-            self.assertIn(res["step"], ("risk", "admission"), f)  # the capability map never gets past the pre-check
-            self.assertEqual(io.merge_calls(), [], f)
+    def test_other_modules_artifacts_and_capability_map_require_human_approval(self):
+        cases = (
+            ("spec/other.md", "admission", "spec-guard 产物没核对到有效的批准：spec/other.md"),
+            ("spec/CAPABILITY-MAP.md", "admission", "能力图改动要用户批"),
+            ("tasks/other/plan.md", "admission", "spec-guard 产物没核对到有效的批准：tasks/other/plan.md"),
+        )
+        for path, step, reason in cases:
+            with self.subTest(path=path):
+                io = self.io(files=("spec/m.md", path))
+                # Direct admission now blocks a capability-map change after verification.
+                assert_artifact_blocks_merge(self, io, run(io), reason, step)
 
     def test_no_map_view_verifies_nothing(self):
         io = self.io()
         io.view = None
-        self.assertEqual(run(io)["step"], "admission")
+        # The slice 12 approval guard leaves artifacts human_only when the map view is unavailable.
+        assert_artifact_blocks_merge(self, io, run(io), "spec-guard 产物没核对到有效的批准：spec/m.md")
+        self.assertEqual(self.evidence(io)["artifacts"]["verified"], [])
 
     def test_verify_artifacts_unit(self):
         view = {"modules": [{"id": "m", "review": {"spec": "approved", "plan": "codex-approved"},
@@ -1150,6 +2172,101 @@ class LocalIOTest(unittest.TestCase):
         cli.STATE = os.path.join(self.tmp.name, "state")
         self.addCleanup(setattr, cli, "STATE", self.old_state)
         self.io = cli.LocalIO("t", "/nonexistent")
+
+    def test_enable_automerge_sends_the_guarded_graphql_mutation(self):
+        response = {"data": {"enablePullRequestAutoMerge": {"pullRequest": {"id": "PR_node"}}}}
+        with mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=json.dumps(response), stderr="")) as request:
+            self.assertIsNone(self.io.enable_automerge("PR_node", HEAD, "squash"))
+        args, kwargs = request.call_args
+        self.assertEqual(args[0], ["gh", "api", "graphql", "--method", "POST", "--input", "-"])
+        payload = json.loads(kwargs["input"])
+        self.assertIn("enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,"
+                      "expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod})", payload["query"])
+        self.assertEqual(payload["variables"], dict(pullRequestId="PR_node", expectedHeadOid=HEAD, mergeMethod="SQUASH"))
+
+    def test_enable_automerge_preserves_a_graphql_rejection_but_raises_on_transport_errors(self):
+        message = "Expected head oid does not match"
+        response = {"data": {"enablePullRequestAutoMerge": None}, "errors": [{"message": message}]}
+        with mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=json.dumps(response), stderr=f"gh: {message}")):
+            self.assertEqual(self.io.enable_automerge("PR_node", HEAD, "merge"), message)
+        with mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout="", stderr="gh: network failure")):
+            with self.assertRaisesRegex(cli.ApiError, "network failure"):
+                self.io.enable_automerge("PR_node", HEAD, "merge")
+
+    def test_fallback_reads_all_pages_of_check_runs_and_statuses_with_scoped_tokens(self):
+        runs = [{"name": "a"}, {"name": "b"}]
+        statuses = [{"context": "c"}, {"context": VERIFIED}]
+        responses = [
+            "\n".join(json.dumps({"check_runs": [run]}) for run in runs),
+            "\n".join(json.dumps({"statuses": [status]}) for status in statuses),
+        ]
+        with mock.patch.object(cli.tokens, "mint", return_value="checks-reader") as mint, \
+                mock.patch.object(cli.tokens, "revoke") as revoke, \
+                mock.patch.object(cli.subprocess, "run", side_effect=[
+                    mock.Mock(returncode=0, stdout=response, stderr="") for response in responses]) as request:
+            self.assertEqual(self.io.commit_check_results(REPO, HEAD), (runs, statuses))
+        mint.assert_called_once_with(REPO, {"checks": "read"})
+        revoke.assert_called_once_with("checks-reader")
+        for call, endpoint, token in zip(request.call_args_list, ("check-runs", "status"), ("checks-reader", "t")):
+            self.assertEqual(call.args[0], ["gh", "api", f"repos/{REPO}/commits/{HEAD}/{endpoint}",
+                                            "--method", "GET", "--paginate"])
+            self.assertEqual(call.kwargs["env"]["GH_TOKEN"], token)
+
+    def test_combined_commit_statuses_get_creators_from_their_exact_status_ids(self):
+        latest = {"id": 20, "context": VERIFIED, "state": "success"}
+        foreign = {"id": 2}
+        history = [dict(latest, creator=foreign), dict(latest, id=19, creator=BOT_USER)]
+        path = f"repos/{REPO}/commits/{HEAD}"
+        with mock.patch.object(cli.tokens, "mint", return_value="checks-reader"), \
+                mock.patch.object(cli.tokens, "revoke"), \
+                mock.patch.object(cli.LocalIO, "api", side_effect=[
+                    {"check_runs": []}, {"statuses": [latest]}, history]) as get:
+            result = self.io.commit_check_results(REPO, HEAD)
+        self.assertEqual(result, ([], [dict(latest, creator=foreign)]))
+        self.assertEqual(get.call_args_list, [mock.call(path + "/check-runs"), mock.call(path + "/status"),
+                                             mock.call(path + "/statuses")])
+
+    def test_compare_checks_ancestry_using_the_live_base_branch(self):
+        for status, expected in (("ahead", True), ("identical", True), ("behind", False), ("diverged", False)):
+            with self.subTest(status=status), mock.patch.object(self.io, "api", return_value={"status": status}) as get:
+                self.assertEqual(self.io.base_is_ancestor(REPO, "release/main", HEAD), expected)
+                get.assert_called_once_with(f"repos/{REPO}/compare/release%2Fmain...{HEAD}?per_page=1", paginate=False)
+
+    def test_classic_status_checks_use_a_separate_read_only_token_when_relevant(self):
+        branch_path = f"repos/{REPO}/branches/main"
+        for contexts, need_source in ((["ci"], True), (["ci", VERIFIED], False), (["ci", VERIFIED], True)):
+            with self.subTest(contexts=contexts, need_source=need_source):
+                projection = {"protection": {"enabled": True, "required_status_checks": {"contexts": contexts}}}
+                checks = {"strict": True, "checks": [{"context": VERIFIED, "app_id": APP_ID}]}
+                with mock.patch.object(cli.LocalIO, "api_optional", side_effect=[projection, checks]) as get, \
+                        mock.patch.object(cli.tokens, "mint", return_value="classic-reader") as mint, \
+                        mock.patch.object(cli.tokens, "revoke") as revoke:
+                    result = self.io.legacy_status_checks(REPO, "main", need_source=need_source, need_sync=False)
+                if VERIFIED in contexts and need_source:
+                    self.assertEqual(result, checks)
+                    self.assertEqual(get.call_args_list, [mock.call(branch_path), mock.call(
+                        branch_path + "/protection/required_status_checks")])
+                    mint.assert_called_once_with(REPO, {"administration": "read"})
+                    revoke.assert_called_once_with("classic-reader")
+                else:
+                    self.assertEqual(result, {"contexts": contexts})
+                    get.assert_called_once_with(branch_path)
+                    mint.assert_not_called()
+                    revoke.assert_not_called()
+
+    def test_classic_status_checks_without_administration_read_fail_closed(self):
+        # The App may lack Administration: read; the run must not fail, and the source stays unconfirmed.
+        projection = {"protection": {"enabled": True, "required_status_checks": {"contexts": ["ci", VERIFIED]}}}
+        with mock.patch.object(cli.LocalIO, "api_optional", return_value=projection), \
+                mock.patch.object(cli.tokens, "mint", side_effect=cli.tokens.TokenError("no permission")) as mint, \
+                mock.patch.object(cli.tokens, "revoke") as revoke:
+            with self.assertRaisesRegex(flow.ChecksUnconfirmed, "Administration: read"):
+                self.io.legacy_status_checks(REPO, "main", need_source=True, need_sync=False)
+        mint.assert_called_once_with(REPO, {"administration": "read"})
+        revoke.assert_not_called()
 
     def test_evidence_file_path_and_content(self):
         data = flow.check_evidence(REPO, HEAD, "make test", flow.check_result(0, "ok\n"), T0)
