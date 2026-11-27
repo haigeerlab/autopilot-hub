@@ -18,7 +18,7 @@
   - 验证：R9
   - 文件：`orchestrator/flow.py`、`orchestrator/state.py`、`tests/test_orchestrator.py`
 - [x] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过（2026-11-27 按回归文档命令逐条执行全部 OK；回归文档命令加 PYTHONPATH=tests 前缀，见其变更记录）
-- [ ] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」
+- [x] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」（2026-11-27 hub#96 用户「合并」，已合 2806aa4）
 - [ ] Task 6：ai-operate 交 delegate
   - 验证：R7
   - 文件：`verify/core.py`、`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_verify.py`、`tests/test_orchestrator.py`
