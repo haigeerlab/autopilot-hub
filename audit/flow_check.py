@@ -37,7 +37,12 @@ def check_flow(view, records):
             approval = m.get("designApproval")
             status = approval.get("status") if isinstance(approval, dict) else None
             by = approval.get("approvedBy") if isinstance(approval, dict) else None
-            if status != "approved" or by != "user":
+            takeover = m.get("takeover")
+            # spec-guard sg-review-rules: with takeover.design = reviewer, the reviewer may approve an
+            # important module's design too; otherwise only the user's approval counts.
+            allowed = ("user", "reviewer") if isinstance(takeover, dict) and takeover.get("design") == "reviewer" \
+                else ("user",)
+            if status != "approved" or by not in allowed:
                 problems.append(problem("important-design-not-user", "严重",
                                         "模块 %s 是重要需求，已开工，但技术方案不是你批的（%s／%s）" % (mid, status, by)))
         if m.get("status") == "done":
