@@ -106,7 +106,7 @@ class WatchState:
         finally:
             Path(temporary.name).unlink(missing_ok=True)
 
-    def _now(self):
+    def now(self):
         now = self._clock()
         if now.utcoffset() is None:
             raise ValueError("The watch clock must return a timezone-aware datetime")
@@ -114,7 +114,7 @@ class WatchState:
 
     def write_heartbeat(self):
         with self._locked_snapshot() as data:
-            data["heartbeat"] = self._now().isoformat()
+            data["heartbeat"] = self.now().isoformat()
             self._write(data)
 
     def heartbeat_is_fresh(self, minutes):
@@ -127,7 +127,7 @@ class WatchState:
                 raise ValueError("missing timezone")
         except ValueError as exc:
             raise StateCorruptError(f"Invalid heartbeat in {self.path}: {exc}") from exc
-        return timedelta(0) <= self._now() - at <= timedelta(minutes=minutes)
+        return timedelta(0) <= self.now() - at <= timedelta(minutes=minutes)
 
     def is_frozen(self):
         return self.read()["frozen"]
@@ -149,10 +149,10 @@ class WatchState:
         """Update a PR record while retaining fields omitted by the caller."""
         self._set_fields("prs", f"{repo}#{number}", fields)
 
-    def pause_pr(self, repo, number, reason, recovery):
+    def pause_pr(self, repo, number, reason, recovery, **fields):
         self.set_pr(repo, number, state="paused", pause={
-            "reason": reason, "at": self._now().isoformat(), "recovery": recovery,
-        })
+            "reason": reason, "at": self.now().isoformat(), "recovery": recovery,
+        }, **fields)
 
     def get_run(self, repo, run_id, attempt):
         return self.read()["runs"].get(f"{repo}:{run_id}:{attempt}")
@@ -165,14 +165,18 @@ class WatchState:
         return self.read()["repos"].get(repo, {}).get("cursor")
 
     def set_cursor(self, repo, run_id):
-        self._set_fields("repos", repo, {"cursor": run_id})
+        self.set_repo(repo, cursor=run_id)
+
+    def set_repo(self, repo, **fields):
+        """Update repository watch fields without changing the narrowing hold."""
+        self._set_fields("repos", repo, fields)
 
     def get_narrowed(self, repo):
         return self.read()["repos"].get(repo, {}).get("narrowed")
 
     def narrow_repo(self, repo, reason, source_run):
         self._set_fields("repos", repo, {"narrowed": {
-            "reason": reason, "at": self._now().isoformat(), "sourceRun": source_run,
+            "reason": reason, "at": self.now().isoformat(), "sourceRun": source_run,
         }})
 
     def resume(self, repo):
@@ -239,17 +243,28 @@ class WatchState:
     def is_done(self, key):
         return key in self.read()["done"]
 
-    def enqueue_notification(self, target, body, key):
+    def enqueue_notification(self, target, body, key, *, repo=None, number=None):
         """Queue a notice once per key, including across successful delivery."""
         with self._locked_snapshot() as data:
             if key in data["done"] or any(item["key"] == key for item in data["outbox"]):
                 return False
-            data["outbox"].append({"target": target, "body": body, "key": key})
+            item = {"target": target, "body": body, "key": key}
+            if repo is not None:
+                item.update(repo=repo, number=number)
+            data["outbox"].append(item)
             self._write(data)
             return True
 
     def pending_notifications(self):
         return self.read()["outbox"]
+
+    def pause_notification(self, key, reason, recovery):
+        with self._locked_snapshot() as data:
+            for item in data["outbox"]:
+                if item["key"] == key:
+                    item["pause"] = dict(reason=reason, recovery=recovery, at=self.now().isoformat())
+                    self._write(data)
+                    break
 
     def dequeue_notification(self, key):
         """After delivery succeeds, remove the notice and record completion together."""

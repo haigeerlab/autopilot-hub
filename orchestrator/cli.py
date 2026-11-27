@@ -2,6 +2,8 @@
 
     python3 -B orchestrator/cli.py run --repo haigeerlab/autopilot-sandbox --pr 1 [--dry-run] [--json]
         [--notify SESSION] [--author-host claude-code|codex]
+    python3 -B orchestrator/cli.py authorize --repo owner/name --quote "..." --session "..." [--replace]
+    python3 -B orchestrator/cli.py authorize --repo owner/name --revoke
     python3 -B orchestrator/cli.py followups --repo haigeerlab/autopilot-sandbox --pr 1 [--json]
     python3 -B orchestrator/cli.py batch --repo haigeerlab/autopilot-sandbox [--dry-run]
     python3 -B orchestrator/cli.py release --repo haigeerlab/autopilot-sandbox --version 1.0.0 [--dry-run]
@@ -14,14 +16,20 @@ import argparse
 import base64
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 
 if __package__ in (None, ""):
@@ -31,7 +39,7 @@ from admission import decide as d
 from checkup import workflow
 from checkup import yamlsub
 from degrade.run import ApiError, NotFound, parse_pages
-from orchestrator import batch, flow, token as tokens
+from orchestrator import batch, flow, token as tokens, watch
 from orchestrator.state import StateCorruptError, StateLockedError, WatchState
 from pipeline import engine, model as pipeline_model
 from risk.tiers import REPO_CONFIGS
@@ -41,11 +49,20 @@ STATE = os.path.expanduser("~/.autopilot")
 DELEGATE_CACHE = os.path.expanduser("~/.claude/plugins/cache/delegate-marketplace/delegate")
 SPEC_GUARD_CACHE = os.path.expanduser("~/.claude/plugins/cache/spec-guard-marketplace/spec-guard")
 SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL", "TERM")
+DELEGATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "CODEX_HOME",
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "no_proxy", "all_proxy")
 CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
+WATCH_LOCK_WAIT = 30
+AUTHORIZATION_MAX_BYTES = 64 * 1024
+AUTHORIZATION_RECORD_MAX_BYTES = 16 * 1024
+DELEGATE_AI_MINIMUM = (0, 13, 2)
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write"}
 RUN_WRITE = dict(WRITE, statuses="write")
+WATCH = dict(WRITE, contents="read", statuses="read", actions="write")
+WATCH_NARROW = {"contents": "write", "pull_requests": "write"}
 READ = {"contents": "read", "pull_requests": "read", "issues": "read"}
 
 
@@ -63,6 +80,69 @@ def _newest(cache, minimum, rel):
 
 def find_delegate():
     return os.environ.get("AUTOPILOT_DELEGATE") or _newest(DELEGATE_CACHE, (0, 10, 0), "scripts/delegate-exec.sh")
+
+
+def authorization_path(repo):
+    if (not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}", repo)
+            or repo.split("/")[1] in (".", "..")):
+        raise ValueError("授权仓库须使用 GitHub 的 owner/name")
+    return Path(STATE) / "authorizations" / (repo.replace("/", "__") + ".md")
+
+
+@contextlib.contextmanager
+def authorization_lock(path, mode):
+    # Lock the directory so replacement and revocation share the same lock as readers.
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, mode)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _authorization_sha256(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= AUTHORIZATION_MAX_BYTES:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            contents = handle.read(AUTHORIZATION_MAX_BYTES + 1)
+        if len(contents) <= AUTHORIZATION_MAX_BYTES and contents.decode("utf-8").strip():
+            return hashlib.sha256(contents).hexdigest()
+        return None
+    finally:
+        os.close(fd)
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _read_delegate_result(output, clone):
+    # On success delegate emits the result path immediately before its final run line on stdout.
+    announcement = re.search(r"^delegate: result=([^\n]+)\ndelegate: run_id=(\S+) status=\S+ "
+                             r"resumable=(?:true|false)\s*\Z", output, re.M)
+    if announcement is None:
+        return None, "delegate 没有在 stdout 报告本次运行的结果文件路径"
+    path, run_id = announcement.groups()
+    try:
+        fd = os.open(Path(clone, path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "无法读取 delegate 结果文件（不是普通文件）"
+            result = json.load(handle, parse_constant=_reject_json_constant)
+    except OSError:
+        return None, "无法读取 delegate 结果文件"
+    except (ValueError, RecursionError):
+        return None, "delegate 结果文件 JSON 无法解析"
+    if not isinstance(result, dict):
+        return None, "delegate 结果文件 JSON 缺少结果对象"
+    if result.get("runId") != run_id:
+        return None, "delegate 结果文件运行编号与本次运行不一致"
+    if result.get("status") != "done":
+        return None, "delegate 结果文件状态不是 done"
+    return result, None
 
 
 def find_project_config():
@@ -111,11 +191,37 @@ def _clean_env():
     return {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")}
 
 
+def _stop_delegate_group(process):
+    for sig, wait_seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            process.poll()
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                # The group has not been confirmed gone. Keep waiting within the signal deadline.
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    return False
+
+
 class Work:
     """A throwaway clone with the base branch tip and the PR head fetched."""
 
     def __init__(self, root, repo, pr, token, delegate):
         self.root, self.pr, self.delegate = root, pr, delegate
+        self.repo = repo
         self.head, self.base_ref = pr["head"]["sha"], pr["base"]["ref"]
         self.git_env = _git_env(token)
         self.git("init", "-q")
@@ -203,6 +309,87 @@ class Work:
             return {"exit": None, "timeout": True, "output": output + "\n执行超时"}
         except OSError:
             return {"exit": None, "timeout": False, "output": "验证命令无法启动"}
+
+    def run_delegate(self, backend, sha, task):
+        """Run delegate against a fresh local copy of the pinned PR commit."""
+        script = self.delegate or find_delegate()
+        if not script or not os.path.isfile(script):
+            return None, "找不到 delegate-exec.sh"
+        try:
+            script = Path(script).resolve()
+            manifest = script.parent.parent / ".claude-plugin" / "plugin.json"
+            version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+            if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version):
+                return None, "无法确认 delegate 版本"
+            version_parts = tuple(map(int, version.split(".")))
+            version_tuple = (version_parts + (0,))[:3]
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            return None, "无法确认 delegate 版本"
+        if version_tuple < DELEGATE_AI_MINIMUM:
+            return None, f"delegate 版本低于 0.13.2（{version}）"
+
+        missing = "没有记录打开自动路的授权，或授权文件不可用"
+        try:
+            path = authorization_path(self.repo)
+            with authorization_lock(path, fcntl.LOCK_SH):
+                digest = _authorization_sha256(path)
+                if digest is None:
+                    return None, missing
+                expected_path = os.path.realpath(path)
+                run, reason = self._run_delegate_in_clone(script, backend, sha, task, path)
+                if reason is not None:
+                    return run, reason
+                reason = flow.delegate_authorization_problem(
+                    run["authorization"], digest, expected_path=expected_path)
+                if reason is None:
+                    run["hubAuthorizationSha256"] = digest
+                return run, reason
+        except (OSError, ValueError):
+            return None, missing
+
+    def _run_delegate_in_clone(self, script, backend, sha, task, authorization):
+        git_env = {k: os.environ[k] for k in SAFE_ENV if k in os.environ}
+        delegate_env = {k: v for k, v in os.environ.items() if k in DELEGATE_ENV or k.startswith("LC_")}
+        group_stopped = True
+        try:
+            tmp = tempfile.mkdtemp(prefix="autopilot-ai-case-")
+            try:
+                clone = os.path.realpath(os.path.join(tmp, "repo"))
+                for args in (("clone", "-q", "--no-hardlinks", "--no-checkout", "--", self.root, clone),
+                             ("-C", clone, "checkout", "-q", "--detach", sha),
+                             ("-C", clone, "remote", "remove", "origin")):
+                    subprocess.run(["git", *args], env=git_env, check=True, capture_output=True,
+                                   stdin=subprocess.DEVNULL, timeout=120)
+                command = ["bash", str(script), "run", "--backend", backend, "--write",
+                           "--authorized-by", str(authorization), "--", task]
+                process = subprocess.Popen(command, cwd=clone, env=delegate_env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8",
+                                           errors="replace", stdin=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    with process.stdout:
+                        output, _ = process.communicate(timeout=CHECK_TIMEOUT)
+                finally:
+                    group_stopped = _stop_delegate_group(process)
+                if not group_stopped:
+                    return None, "无法确认 delegate 进程组已退出，已保留临时克隆"
+                run = dict(stdout=output)
+                if process.returncode:
+                    return run, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
+                result, reason = _read_delegate_result(output, clone)
+                if reason is None:
+                    run["authorization"] = result.get("authorization")
+                return run, reason
+            finally:
+                if group_stopped:
+                    shutil.rmtree(tmp)
+        except subprocess.CalledProcessError:
+            return None, "准备用例的独立克隆失败"
+        except subprocess.TimeoutExpired:
+            if not group_stopped:
+                return None, "执行 delegate 超时，无法确认进程组已退出，已保留临时克隆"
+            return None, "准备克隆或执行 delegate 超时"
+        except (OSError, ValueError):
+            return None, "无法准备克隆或启动 delegate"
 
     def run_release(self, command, version, repo, issue):
         """Run at the pinned release commit with combined output and no GitHub tokens."""
@@ -332,8 +519,9 @@ class Work:
 
 
 class LocalIO:
-    def __init__(self, token, delegate):
+    def __init__(self, token, delegate, *, automerge_target=None):
         self.token, self.delegate = token, delegate
+        self.automerge_target = automerge_target
 
     def api(self, path, method="GET", body=None, *, graphql_rejection=False, paginate=True):
         args = ["gh", "api", path, "--method", method]
@@ -364,6 +552,18 @@ class LocalIO:
 
     def enable_automerge(self, pr_id, head, method):
         """Return the GraphQL rejection message, or None after confirmed success."""
+        if self.automerge_target is None:
+            return self._enable_automerge(pr_id, head, method)
+        state, repo, number = self.automerge_target
+        # Check the hold and send the mutation before watch can start draining the queue.
+        with state.lock(wait_seconds=flow.RUN_LOCK_WAIT):
+            flow.require_automerge_available(state, repo)
+            record = state.get_pr(repo, number) or {}
+            if record.get("state") != "automerge-requested" or record.get("validatedHeadOid") != head:
+                raise flow.Stop("merge", "自动合并意图已变化，请重新验证 PR")
+            return self._enable_automerge(pr_id, head, method)
+
+    def _enable_automerge(self, pr_id, head, method):
         query = ("mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!,$mergeMethod:PullRequestMergeMethod!)"
                  "{enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,"
                  "expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod}){pullRequest{id}}}")
@@ -615,6 +815,15 @@ class LocalIO:
         return prefix + ".verification.json", prefix + ".logs", prefix + ".cases.json"
 
     @staticmethod
+    @contextlib.contextmanager
+    def verification_case_lock(path):
+        lock_path = Path(path).with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @staticmethod
     def write_verification_file(path, content):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -738,16 +947,73 @@ class LocalIO:
             issue = dict(issue, updated_at=edited_at or issue.get("created_at"))
         return issue
 
-    def open_narrow_pr(self, repo, base_ref, module, issue_number, reason):
+    def open_narrow_pr(self, repo, base_ref, module, issue_number, reason, *, watch_state=None):
         """Slice 11: in a throwaway clone of the base branch run spec-guard's `narrow`, commit as the bot, push
         `autopilot/narrow-<issue>` and open a PR. Returns its URL, or None when already the strictest.
         Raises flow.Stop when spec-guard 0.91+ is not installed or a step fails."""
+        bot = self.bot_identity()
+        branch = "autopilot/narrow-%d" % issue_number
+        target = "模块 %s" % module if module else "整个项目"
+        head = None
+        if watch_state is not None:
+            existing, head = self.watch_narrow_progress(repo, base_ref, issue_number, branch, bot, watch_state)
+            if existing:
+                return existing
+        if head is None:
+            head = self.push_narrow_branch(repo, base_ref, module, issue_number, reason, bot, branch, watch_state)
+            if head is None:
+                return None
+        key = f"{repo}:{issue_number}:{head}:watch-narrow-pr"
+        if watch_state is not None:
+            self.narrow_intent(watch_state, key, repo, issue_number, "watch-narrow-pr")
+        created = self.api("repos/%s/pulls" % repo, "POST", {
+            "title": "autopilot 收窄接管档位：%s（降级 #%d）" % (target, issue_number), "head": branch, "base": base_ref,
+            "body": ("%s。\n\n按 spec-guard 的收窄规则降一格（合并 → 技术方案 → 不接管），由 `project_config.py narrow --source "
+                     "autopilot` 生成。改的是 `.agent/config.json`，属于 T4，请你审后合并；在那之前降级 issue #%d 已阻止自动合并。"
+                     % (reason, issue_number))})
+        url = (created or {}).get("html_url")
+        if watch_state is not None:
+            if not url:
+                raise ApiError("GitHub 未确认收窄 PR 已创建")
+            watch_state.mark_done(key)
+        return url
+
+    def watch_narrow_progress(self, repo, base_ref, issue_number, branch, bot, state):
+        qualified = quote(repo.split("/")[0] + ":" + branch, safe="")
+        rows = self.api(f"repos/{repo}/pulls?state=all&head={qualified}&per_page=100")
+        if not isinstance(rows, list):
+            raise ApiError("GitHub 返回的收窄 PR 列表不完整")
+        for pr in rows:
+            head = pr.get("head") or {}
+            if (head.get("ref") == branch and (head.get("repo") or {}).get("full_name") == repo
+                    and (pr.get("base") or {}).get("ref") == base_ref and flow.bot_issue(pr, bot)):
+                if not pr.get("html_url"):
+                    raise ApiError("GitHub 未返回收窄 PR 地址")
+                for key, intent in state.pending_intents().items():
+                    if (intent.get("repo"), intent.get("issue"), intent.get("action")) == (
+                            repo, issue_number, "watch-narrow-pr"):
+                        state.mark_done(key)
+                return pr["html_url"], None
+        ref = self.api_optional(f"repos/{repo}/git/ref/heads/{branch}")
+        if ref is None:
+            return None, None
+        head = (ref.get("object") or {}).get("sha")
+        key = f"{repo}:{issue_number}:{head}:watch-narrow-push"
+        if not head or (key not in state.pending_intents() and not state.is_done(key)):
+            raise flow.Stop("narrow", "远端收窄分支与本机推送意图不匹配")
+        state.mark_done(key)
+        return None, head
+
+    @staticmethod
+    def narrow_intent(state, key, repo, issue, action):
+        if state.intend(key, dict(action=action, repo=repo, issue=issue)):
+            LocalIO.ledger(dict(event="watch-intent", key=key, action=action, repo=repo, issue=issue,
+                                at=state.now().isoformat()))
+
+    def push_narrow_branch(self, repo, base_ref, module, issue_number, reason, bot, branch, state):
         script = find_project_config()
         if not script or not os.path.exists(script):
             raise flow.Stop("narrow", "找不到 spec-guard 0.91 以上的 project_config.py，没法收窄")
-        bot = self.bot_identity()
-        branch = "autopilot/narrow-%d" % issue_number
-        pr = {"head": {"sha": None}, "base": {"ref": base_ref}}
         with tempfile.TemporaryDirectory(prefix="autopilot-narrow-") as tmp:
             work = Work.__new__(Work)
             work.root = tmp
@@ -773,13 +1039,18 @@ class LocalIO:
             target = "模块 %s" % module if module else "整个项目"
             work.git("add", "-A")
             work.git("commit", "-q", "-m", "chore: 收窄%s的接管档位（降级 #%d）\n\n%s" % (target, issue_number, reason))
-            work.git("push", "-q", "--force", url, "HEAD:refs/heads/%s" % branch)
-        created = self.api("repos/%s/pulls" % repo, "POST", {
-            "title": "autopilot 收窄接管档位：%s（降级 #%d）" % (target, issue_number), "head": branch, "base": base_ref,
-            "body": ("%s。\n\n按 spec-guard 的收窄规则降一格（合并 → 技术方案 → 不接管），由 `project_config.py narrow --source "
-                     "autopilot` 生成。改的是 `.agent/config.json`，属于 T4，请你审后合并；在那之前降级 issue #%d 已阻止自动合并。"
-                     % (reason, issue_number))})
-        return (created or {}).get("html_url")
+            refspec = "HEAD:refs/heads/%s" % branch
+            if state is None:
+                work.git("push", "-q", "--force", url, refspec)
+                return branch
+            head = work.git("rev-parse", "HEAD").strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", head):
+                raise flow.Stop("narrow", "无法确认收窄提交的 SHA")
+            key = f"{repo}:{issue_number}:{head}:watch-narrow-push"
+            self.narrow_intent(state, key, repo, issue_number, "watch-narrow-push")
+            work.git("push", "-q", url, refspec)
+            state.mark_done(key)
+            return head
 
     @staticmethod
     def write_check_evidence(repo, data):
@@ -958,9 +1229,45 @@ def release(args):
     return result["code"]
 
 
-def followups(args):
-    """Recover post-merge notes only from trusted evidence and its exact local report."""
+def recover_followups(io, repo, number, pr, *, head, issue_api=None):
+    """Read the trusted evidence and its exact local report, then recover the follow-up issues."""
     from admission.gate import current_evidence
+
+    bot = io.bot_identity()
+    if not bot:
+        raise flow.Stop('followups', 'hub 没配机器人身份，不能补开后续 issue')
+    if not pr.get('merged'):
+        raise flow.Stop('followups', 'PR 还没有合并，不能开后续 issue')
+    comments = io.api(f'repos/{repo}/issues/{number}/comments?per_page=100') or []
+    evidence = [p for p in current_evidence(
+        [flow.rest_comment(c) for c in sorted(comments, key=lambda c: c.get('id', 0))], bot, head)
+                if p.get('_v') == 2]
+    if not evidence:
+        raise flow.Stop('followups', '没有绑定合并前 head 的机器人 v2 证据')
+    latest = evidence[-1]
+    module, patch_id = latest.get('module'), latest.get('patch_id')
+    verification = latest.get('verification')
+    if not isinstance(module, str) or not module.strip() or not isinstance(patch_id, str) \
+            or not re.fullmatch(r'[0-9a-fA-F]{40}', patch_id) or not isinstance(verification, dict):
+        raise flow.Stop('followups', 'v2 证据缺少有效的模块、补丁指纹或报告摘要')
+    try:
+        raw = io.read_bytes(io.verification_paths(repo, patch_id)[0])
+    except FileNotFoundError:
+        raise flow.Stop('followups', '本机验证报告不存在，不能补开后续 issue') from None
+    if hashlib.sha256(raw).hexdigest() != verification.get('report_sha256'):
+        raise flow.Stop('followups', '本机验证报告 sha256 与 v2 证据不符，不能补开后续 issue')
+    try:
+        report = json.loads(raw)
+    except ValueError:
+        raise flow.Stop('followups', '本机验证报告不是有效 JSON') from None
+    if not isinstance(report, dict) or not isinstance(report.get('notes'), list) or any(
+            not isinstance(note, dict) or not isinstance(note.get('title'), str) for note in report['notes']):
+        raise flow.Stop('followups', '本机验证报告的意见格式不对')
+    issues = io if issue_api is None else SimpleNamespace(api=issue_api)
+    return flow.open_followups(issues, repo, number, module, patch_id, report['notes'], bot)
+
+
+def followups(args):
     try:
         token = tokens.mint(args.repo, WRITE)
     except tokens.TokenError as error:
@@ -968,38 +1275,8 @@ def followups(args):
         return 2
     try:
         io = LocalIO(token, None)
-        bot = io.bot_identity()
-        if not bot:
-            raise flow.Stop('followups', 'hub 没配机器人身份，不能补开后续 issue')
         pr = io.api(f'repos/{args.repo}/pulls/{args.pr}')
-        if not pr.get('merged'):
-            raise flow.Stop('followups', 'PR 还没有合并，不能开后续 issue')
-        comments = io.api(f'repos/{args.repo}/issues/{args.pr}/comments?per_page=100') or []
-        evidence = [p for p in current_evidence(
-            [flow.rest_comment(c) for c in sorted(comments, key=lambda c: c.get('id', 0))], bot, pr['head']['sha'])
-                    if p.get('_v') == 2]
-        if not evidence:
-            raise flow.Stop('followups', '没有绑定合并前 head 的机器人 v2 证据')
-        latest = evidence[-1]
-        module, patch_id = latest.get('module'), latest.get('patch_id')
-        verification = latest.get('verification')
-        if not isinstance(module, str) or not module.strip() or not isinstance(patch_id, str) \
-                or not re.fullmatch(r'[0-9a-fA-F]{40}', patch_id) or not isinstance(verification, dict):
-            raise flow.Stop('followups', 'v2 证据缺少有效的模块、补丁指纹或报告摘要')
-        try:
-            raw = io.read_bytes(io.verification_paths(args.repo, patch_id)[0])
-        except FileNotFoundError:
-            raise flow.Stop('followups', '本机验证报告不存在，不能补开后续 issue') from None
-        if hashlib.sha256(raw).hexdigest() != verification.get('report_sha256'):
-            raise flow.Stop('followups', '本机验证报告 sha256 与 v2 证据不符，不能补开后续 issue')
-        try:
-            report = json.loads(raw)
-        except ValueError:
-            raise flow.Stop('followups', '本机验证报告不是有效 JSON') from None
-        if not isinstance(report, dict) or not isinstance(report.get('notes'), list) or any(
-                not isinstance(note, dict) or not isinstance(note.get('title'), str) for note in report['notes']):
-            raise flow.Stop('followups', '本机验证报告的意见格式不对')
-        result = flow.open_followups(io, args.repo, args.pr, module, patch_id, report['notes'], bot)
+        result = recover_followups(io, args.repo, args.pr, pr, head=(pr.get('head') or {}).get('sha'))
     except flow.Stop as error:
         print('autopilot: ' + error.reason, file=sys.stderr)
         return 1
@@ -1018,6 +1295,164 @@ def followups(args):
     return 1 if result['failed'] else 0
 
 
+class WatchNarrowIO:
+    """Narrow issues with the watch token; request contents write only for the patch branch."""
+
+    def __init__(self, io, write_io_for, state):
+        self.api = io.api
+        self.write_io_for = write_io_for
+        self.state = state
+
+    def open_narrow_pr(self, repo, base, module, issue, reason):
+        return self.write_io_for(repo, narrow=True).open_narrow_pr(
+            repo, base, module, issue, reason, watch_state=self.state)
+
+
+def watch_round(state):
+    connections = {}
+
+    def io_for(repo, *, narrow=False):
+        key = repo, narrow
+        if key not in connections:
+            try:
+                credential = tokens.mint(repo, WATCH_NARROW if narrow else WATCH)
+            except (ValueError, TypeError, KeyError) as error:
+                raise tokens.TokenError("换取机器人令牌时返回了无效数据") from error
+            connections[key] = LocalIO(credential, None)
+        return connections[key]
+
+    def narrow(io, repo, base, number, state):
+        bot = io.bot_identity()
+        if not bot:
+            raise flow.Stop("narrow", "缺少机器人身份，无法核对收窄证据")
+        issue = io.api(f"repos/{repo}/issues/{number}")
+        project = flow.base_file(io, repo, flow.SG_CAPABILITY_MAP, quote(base, safe="")) is not None
+        flow.narrow_pending(WatchNarrowIO(io, io_for, state), repo, base, [issue], project, bot, [], False)
+
+    watcher = watch.Watch(state, LocalIO.local_config(), io_for, followups=recover_followups,
+                          narrow=narrow, ledger=LocalIO.ledger, ledger_events=LocalIO.ledger_events)
+    try:
+        watcher.round()
+    finally:
+        for (repo, _), io in connections.items():
+            try:
+                tokens.revoke(io.token)
+            except watch.WATCH_ERRORS as error:
+                reason, recovery = watcher.error(repo, "撤销机器人令牌", error, io=io)
+                state.set_repo(repo, pause=watcher.paused(reason, recovery))
+    return 1 if watcher.failed else 0
+
+
+def watch_command(args):
+    state = WatchState(STATE)
+    controls = [flag for flag, enabled in (("--freeze", args.freeze), ("--unfreeze", args.unfreeze),
+                                           ("--resume", args.resume)) if enabled]
+    try:
+        while True:
+            try:
+                with state.lock(wait_seconds=WATCH_LOCK_WAIT if controls else 0):
+                    if args.freeze or args.unfreeze:
+                        state.set_frozen(args.freeze)
+                    if args.resume:
+                        repo, number = args.resume.groups()
+                        watch.resume(state, repo, int(number) if number is not None else None)
+                    if (args.unfreeze or args.resume) and not (args.once or args.freeze):
+                        return 0
+                    status = watch_round(state)
+            except StateLockedError:
+                if controls:
+                    print(f"autopilot: watch 等待状态锁超时，{'、'.join(controls)} 未生效，请重试", file=sys.stderr)
+                    return 1
+                if args.once:
+                    return 0
+            else:
+                if args.once or args.freeze:
+                    return status
+            time.sleep(300)
+    except KeyboardInterrupt:
+        if controls:
+            print(f"autopilot: watch {'、'.join(controls)} 已中断，请核对状态后重试", file=sys.stderr)
+            return 130
+        return 0
+    except (OSError, StateCorruptError) as error:
+        print(f"autopilot: watch 无法更新本机状态：{error}", file=sys.stderr)
+        return 2
+
+
+def report_failure_command(args):
+    if args.pr < 0 or not re.fullmatch(r"[\w.-]+", args.stage) or not args.detail.strip():
+        print("autopilot: --pr 需为非负整数，--stage 需为步骤名，--detail 不能为空", file=sys.stderr)
+        return 2
+    state = WatchState(STATE)
+    try:
+        with state.lock(wait_seconds=WATCH_LOCK_WAIT):
+            watch.report_failure(state, args.repo, args.pr, args.stage, args.detail, LocalIO.ledger)
+    except StateLockedError:
+        print("autopilot: report-failure 等待状态锁超时，失败未记录，请重试", file=sys.stderr)
+        return 1
+    except (OSError, StateCorruptError) as error:
+        print(f"autopilot: 无法记录暂停：{error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def clear_direct_merge_pause(state, repo, number):
+    try:
+        with state.lock(wait_seconds=flow.RUN_LOCK_WAIT):
+            record = state.get_pr(repo, number)
+            if record and record.get("state") == "paused":
+                state.set_pr(repo, number, state="post-merge-done", pause=None, resumeState=None)
+    except (OSError, StateCorruptError, StateLockedError) as error:
+        print(f"autopilot: PR 已合并，更新本机暂停记录失败：{error}", file=sys.stderr)
+
+
+def authorize_command(args):
+    try:
+        path = authorization_path(args.repo)
+        if args.revoke:
+            if args.quote is not None or args.session is not None:
+                raise ValueError("--revoke 不能与 --quote 或 --session 同用")
+            if path.parent.exists():
+                with authorization_lock(path, fcntl.LOCK_EX | fcntl.LOCK_NB):
+                    path.unlink(missing_ok=True)
+        else:
+            if not (args.quote and args.quote.strip() and args.session and args.session.strip()):
+                raise ValueError("记录授权须提供非空的 --quote 和 --session")
+            timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            content = (f"# 打开自动路的授权\n\n仓库：{args.repo}\n时间：{timestamp}\n记录会话：{args.session}\n"
+                       "范围：只用于该仓库合并前验证里执行方式为 ai-operate 的用例，"
+                       "每条用例一个一次性克隆、只跑一轮。\n\n"
+                       f"用户原话：\n{args.quote}\n").encode("utf-8")
+            if len(content) > AUTHORIZATION_RECORD_MAX_BYTES:
+                raise ValueError("授权记录超过 16 KiB")
+            Path(STATE).mkdir(mode=0o700, exist_ok=True)
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            with authorization_lock(path, fcntl.LOCK_EX | fcntl.LOCK_NB):
+                fd, temporary = tempfile.mkstemp(prefix=".authorize-", dir=path.parent)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        os.fchmod(handle.fileno(), 0o600)
+                        handle.write(content)
+                    if args.replace:
+                        os.replace(temporary, path)
+                    else:
+                        os.link(temporary, path)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+    except FileExistsError:
+        print("autopilot: 授权文件已存在，使用 --replace 才能覆盖", file=sys.stderr)
+        return 2
+    except BlockingIOError:
+        print("autopilot: 正在使用授权，请等 delegate 执行结束后重试", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"autopilot: 无法更新授权：{error}", file=sys.stderr)
+        return 2
+    action = "已收回授权" if args.revoke else "已记录授权"
+    print(f"autopilot: {args.repo} {action}")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="autopilot local orchestrator (slice 10)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1027,11 +1462,30 @@ def main(argv=None):
     r.add_argument("--dry-run", action="store_true", help="read-only token; check and review, post nothing, never merge")
     r.add_argument("--json", action="store_true")
     r.add_argument("--notify", metavar="SESSION", help="queue handoff notices for this session")
-    r.add_argument("--author-host", choices=("claude-code", "codex"), help="record the author's host in evidence")
+    r.add_argument("--author-host", choices=("claude-code", "codex"),
+                   help="record the author's host and select the other host for AI regression cases")
+    auth = sub.add_parser("authorize", help="记录或收回仓库的 AI 回归用例执行授权")
+    auth.add_argument("--repo", required=True, help="owner/name")
+    auth.add_argument("--quote", help="用户打开自动路时的原话")
+    auth.add_argument("--session", help="记录授权的会话名称")
+    auth_action = auth.add_mutually_exclusive_group()
+    auth_action.add_argument("--replace", action="store_true", help="替换已有授权")
+    auth_action.add_argument("--revoke", action="store_true", help="收回授权")
     follow = sub.add_parser('followups', help='在 PR 合并后补开验证意见的后续 issue')
     follow.add_argument('--repo', required=True, help='owner/name')
     follow.add_argument('--pr', required=True, type=int)
     follow.add_argument('--json', action='store_true')
+    w = sub.add_parser("watch", help="巡检自动合并与 CI，送出待发通知")
+    w.add_argument("--once", action="store_true", help="只执行一轮")
+    controls = w.add_mutually_exclusive_group()
+    controls.add_argument("--freeze", action="store_true", help="冻结并关闭已排队的自动合并")
+    controls.add_argument("--unfreeze", action="store_true", help="解除全局冻结")
+    w.add_argument("--resume", metavar="REPO[#PR]", help="解除仓库收紧或 PR 暂停")
+    failure = sub.add_parser("report-failure", help="登记 watch 无法观察到的失败并排队通知用户")
+    failure.add_argument("--repo", required=True, help="owner/name")
+    failure.add_argument("--pr", required=True, type=int, help="PR 编号，尚无编号时填 0")
+    failure.add_argument("--stage", required=True)
+    failure.add_argument("--detail", required=True)
     bat = sub.add_parser("batch", help="推进一个 module-crew 合并第一段模块")
     bat.add_argument("--repo", required=True, help="owner/name")
     bat.add_argument("--dry-run", action="store_true", help="只读 first-stage 与 GitHub，不推分支、不开 PR、不验收、不合并")
@@ -1046,13 +1500,24 @@ def main(argv=None):
     rel.add_argument("--confirm", help="人工确认原话，原样记录")
     rel.add_argument("--dry-run", action="store_true", help="只读预演，不开 issue、不执行命令")
     a = p.parse_args(argv)
+    if a.cmd == "watch":
+        if a.resume is not None:
+            a.resume = watch.PR_TARGET.fullmatch(a.resume)
+            if a.resume is None:
+                print("autopilot: --resume 要写成 owner/name 或 owner/name#PR", file=sys.stderr)
+                return 2
+        return watch_command(a)
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", a.repo):
         print("autopilot: --repo 要写成 owner/name", file=sys.stderr)
         return 2
     if a.cmd == "batch":
         return batch_command(a)
+    if a.cmd == "authorize":
+        return authorize_command(a)
     if a.cmd == "release":
         return release(a)
+    if a.cmd == "report-failure":
+        return report_failure_command(a)
     if a.cmd == 'followups':
         return followups(a)
     if a.cmd == "stats":
@@ -1083,10 +1548,12 @@ def main(argv=None):
         return 2
     state = WatchState(STATE)
     try:
-        result = flow.run(LocalIO(token, None), a.repo, a.pr, dry_run=a.dry_run,
+        io = LocalIO(token, None, automerge_target=(state, a.repo, a.pr))
+        result = flow.run(io, a.repo, a.pr, dry_run=a.dry_run,
                           state=state, notify=a.notify, author_host=a.author_host)
-    except (ApiError, OSError, StateCorruptError, StateLockedError) as error:
-        summary = " ".join(str(error).replace(token, "[redacted]").split())[:350]
+    except (ApiError, OSError, StateCorruptError, StateLockedError, subprocess.TimeoutExpired) as error:
+        summary = ("本机命令超时" if isinstance(error, subprocess.TimeoutExpired)
+                   else watch.clean_detail(str(error).replace(token, "[redacted]"))[:350])
         source, recovery_check = (("GitHub 接口", "GitHub 接口和 App 权限") if isinstance(error, ApiError)
                                   else ("本机运行", "本机运行环境和 watch 状态"))
         print(f"autopilot: {source}失败：{summary}", file=sys.stderr)
@@ -1103,6 +1570,8 @@ def main(argv=None):
         return 2
     finally:
         tokens.revoke(token)
+    if not a.dry_run and result["result"] == "merged" and result.get("route") == "direct":
+        clear_direct_merge_pause(state, a.repo, a.pr)
     if a.json:
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:

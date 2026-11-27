@@ -23,7 +23,7 @@ class VerifyTest(unittest.TestCase):
         groups = select_cases(base, head)
         self.assertEqual([c['id'] for c in groups['auto']], ['R1'])
         self.assertEqual([c['id'] for c in groups['confirm']], ['R2'])
-        self.assertEqual([c['id'] for c in groups['manual']], ['R3', 'R4'])
+        self.assertEqual([c['id'] for c in groups['manual']], ['R3'])
         self.assertEqual(len(select_cases(None, head)['confirm']), 2)
 
     def test_replies(self):
@@ -64,6 +64,28 @@ class VerifyTest(unittest.TestCase):
             self.assertEqual(report['verdict'], verdict)
             self.assertEqual(set(report), {'schema', 'module', 'usage', 'regression', 'base', 'head', 'patchId', 'executor', 'verdict', 'cases', 'notes'})
         self.assertNotEqual(new_executor()['sessionId'], new_executor()['sessionId'])
+
+
+class AiOperateTest(unittest.TestCase):
+    def test_ai_and_manual_are_separate_even_for_changed_cases(self):
+        base = {'cases': [case('R1', 'ai-operate')]}
+        ai = [case('R1', 'ai-operate', sha='changed'), case('R2', 'ai-operate')]
+        manual = case('R3', 'manual')
+        self.assertEqual(select_cases(base, {'cases': [manual, *ai]}),
+                         {'auto': [], 'confirm': [], 'manual': [manual], 'ai': ai})
+
+    def test_delegate_result_and_evidence_are_in_report(self):
+        entry = case(method='ai-operate')
+        doc = dict(document='tasks/m/regression.md', sha256='d'*64, cases=[entry])
+        evidence = dict(type='log', path='R1-delegate.log', sha256='a'*64, source=None)
+        for outcome, category in [('pass', None), ('fail', 'check-failure')]:
+            with self.subTest(outcome=outcome):
+                execution = dict(executor='delegate:codex', result=outcome, evidence=[evidence], exit=0)
+                result = case_result(entry, execution)
+                report = build_report('m', doc, 'base', 'head', 'patch', new_executor(), [result], [])
+                self.assertEqual(report['verdict'], outcome)
+                self.assertEqual(report['cases'], [dict(id='R1', method='ai-operate', result=outcome,
+                    failCategory=category, baselineCommit=None, evidence=[evidence], executor='delegate:codex', exit=0)])
 
 
 PLUGIN = Path.home()/'.claude/plugins/cache/spec-guard-marketplace/spec-guard/0.96.0'

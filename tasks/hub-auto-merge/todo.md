@@ -18,22 +18,22 @@
   - 验证：R9
   - 文件：`orchestrator/flow.py`、`orchestrator/state.py`、`tests/test_orchestrator.py`
 - [x] Checkpoint 1（report）：R1～R4、R6、R9、R16 通过（2026-11-27 按回归文档命令逐条执行全部 OK；回归文档命令加 PYTHONPATH=tests 前缀，见其变更记录）
-- [ ] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」
-- [ ] Task 6：ai-operate 交 delegate
+- [x] Checkpoint 2（gate）：推送并开实现 PR 一（Task 1～5），用户说「合并」（2026-11-27 hub#96 用户「合并」，已合 2806aa4）
+- [x] Task 6：ai-operate 交 delegate
   - 验证：R7
   - 文件：`verify/core.py`、`orchestrator/flow.py`、`orchestrator/cli.py`、`tests/test_verify.py`、`tests/test_orchestrator.py`
-- [ ] Task 7：`orchestrator/classify.py`
+- [x] Task 7：`orchestrator/classify.py`
   - 验证：R8（`tests.test_classify`）
   - 文件：`orchestrator/classify.py`、`tests/test_classify.py`
-- [ ] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
+- [x] Task 8：`orchestrator/watch.py` 与 `watch`、`report-failure` 子命令
   - 验证：R5、R8、R10、R11、R12、R13
   - 文件：`orchestrator/watch.py`、`orchestrator/cli.py`、`tests/test_watch.py`
-- [ ] Task 9：degrade 的 `skip_main_red`
+- [x] Task 9：degrade 的 `skip_main_red`
   - 验证：R18
   - 文件：`.github/workflows/degrade.yml`、`degrade/run.py`、`tests/test_degrade.py`
-- [ ] Task 10：launchd 模板、README、CHANGELOG
+- [x] Task 10：launchd 模板、README、CHANGELOG
   - 验证：R16、R17
   - 文件：`examples/launchd/com.haigeerlab.autopilot-watch.plist`、`README.md`、`README.en.md`、`CHANGELOG.md`
-- [ ] Checkpoint 3（report）：R5、R7、R8、R10～R13、R18 通过
+- [x] Checkpoint 3（report）：R5、R7、R8、R10～R13、R18 通过（2026-11-27 按回归文档命令逐条执行全部 OK，全量两遍通过）
 - [ ] Checkpoint 4（gate）：推送并开实现 PR 二（Task 6～10），用户说「合并」
 - [ ] Checkpoint 5（gate）：最终验收：沙盒 R14、R15 等用户原话

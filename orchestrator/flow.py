@@ -523,15 +523,20 @@ def verification_listing(module, groups, payload):
         lines.append("要你测的人工用例（含 ai-operate）：")
     for case in groups['manual']:
         lines.extend([f"{case['id']}：{case['title']}", f"步骤：{case['steps']}", f"预期：{case['expected']}"])
+        reason = payload.get('aiUnavailable', {}).get(case['id'])
+        if reason:
+            lines.append(f"AI 执行不可用：{reason}")
     lines.extend(["", "请逐行回复，例如：确认执行 R5 R6；R2 通过；R3 不通过：说明；意见 R2：文字。",
                   "只认仓库所有者在最新清单之后、没有编辑过的评论。", block('autopilot-verify', payload)])
     return '\n'.join(lines)
 
 
-def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
+def verification_issue(io, repo, pr, module, groups, patch_id, document_sha, ai_unavailable):
     bot = io.bot_identity()
     payload = dict(pr=pr['number'], patchId=patch_id, regressionSha256=document_sha,
                    confirm=[c['id'] for c in groups['confirm']], manual=[c['id'] for c in groups['manual']])
+    if ai_unavailable:
+        payload['aiUnavailable'] = ai_unavailable
     def listings(source, issue_body=False):
         # REST updated_at of an issue moves on every comment, so the issue body is identified by its bot
         # author and app only; listing comments must also be unedited.
@@ -562,7 +567,13 @@ def verification_issue(io, repo, pr, module, groups, patch_id, document_sha):
         found = listings(comment)
         if found:
             latest, after_id = found[-1], comment['id']
-    if latest != payload:
+    def same_cases(group):
+        previous = latest.get(group)
+        return (isinstance(previous, list) and all(isinstance(cid, str) for cid in previous)
+                and set(previous) == set(payload[group]))
+    if (latest.get('patchId') != patch_id or latest.get('regressionSha256') != document_sha
+            or not same_cases('confirm') or not same_cases('manual')
+            or latest.get('aiUnavailable', {}) != ai_unavailable):
         added = io.api(f"repos/{repo}/issues/{issue['number']}/comments", 'POST', {'body': body})
         after_id = added['id']
     return issue, comments, after_id
@@ -578,7 +589,68 @@ def case_failures(results):
             for case in results if case['result'] == 'fail'}
 
 
-def verify_module(io, repo, pr, work, module, notes, dry_run):
+def delegate_authorization_problem(authorization, hub_digest, *, expected_path=None):
+    if not isinstance(authorization, dict):
+        return 'delegate 结果文件缺少有效的 authorization 对象'
+    for field in ('source', 'path', 'sha256', 'bytes'):
+        if field not in authorization:
+            return f'delegate 结果文件缺少 authorization.{field}'
+    if authorization['source'] != 'file':
+        return 'delegate 结果文件的 authorization.source 不是 file'
+    path = authorization['path']
+    if not isinstance(path, str) or not path or (expected_path is not None and path != expected_path):
+        return 'delegate 记录的授权文件路径不一致'
+    if not isinstance(hub_digest, str) or not re.fullmatch(r'[0-9a-f]{64}', hub_digest):
+        return 'hub 授权文件的 SHA-256 缺失或无效'
+    if authorization['sha256'] != hub_digest:
+        return 'delegate 记录的授权文件 SHA-256 不一致'
+    size = authorization['bytes']
+    if type(size) is not int or size <= 0:
+        return 'delegate 结果文件的 authorization.bytes 无效'
+    return None
+
+
+def has_delegate_authorization(result):
+    if not isinstance(result, dict) or not result.get('executor'):
+        return False
+    return delegate_authorization_problem(result.get('authorization'), result.get('hubAuthorizationSha256')) is None
+
+
+def run_ai_case(work, case, head, author_host):
+    if author_host == 'codex':
+        return None, '非作者后端 claude-code 不支持 delegate run'
+    if author_host != 'claude-code':
+        return None, '未传 --author-host，无法选择非作者后端'
+    backend = 'codex'
+    cid = case['id']
+    task = (f"用例 {cid}：{case['title']}\n步骤：{case['steps']}\n预期：{case['expected']}\n"
+            f"证据要求：{case['evidence']}\n"
+            f'执行该用例，并把最后一行写成独立 JSON，不加代码围栏：'
+            f'{{"case":"{cid}","result":"pass 或 fail","evidence":"实际观察和证据"}}。'
+            'result 必须是 pass 或 fail，evidence 写下克隆删除后仍可核对的证据。')
+    run, reason = work.run_delegate(backend, head, task)
+    output = run['stdout'] if run is not None else ''
+    answer, separator, footer = output.rpartition('\n---\n模型：')
+    if not separator or '\n过程日志（未进入本会话上下文）：' not in footer:
+        answer, footer = output, ''
+    if (answer.lstrip().startswith('NEED_USER:')
+            or re.search(r'^delegate: run_id=\S+ status=needs-input(?: |$)', footer, re.M)):
+        return None, 'delegate 要人回答，交你执行用例'
+    if reason:
+        return None, reason
+    try:
+        data = json.loads(answer.strip().rpartition('\n')[2])
+    except ValueError:
+        return None, 'delegate 结尾 JSON 无法解析'
+    if not isinstance(data, dict) or data.get('result') not in ('pass', 'fail') or not data.get('evidence'):
+        return None, 'delegate 结尾 JSON 缺少有效结果或证据'
+    if data.get('case') != cid:
+        return None, 'delegate 返回的用例编号不匹配'
+    return dict(executor=f'delegate:{backend}', result=data['result'], evidence=data['evidence'], exit=0,
+                authorization=run['authorization'], hubAuthorizationSha256=run['hubAuthorizationSha256']), None
+
+
+def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=None):
     from verify.core import select_cases, parse_replies, case_result, build_report, new_executor
     head = pr['head']['sha']
     base_code, base_doc = work.regression(module, ref=work.base_tip)
@@ -596,6 +668,7 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
     if dry_run:
         notes.append('合并前验证分组：' + json.dumps({k: [c['id'] for c in v] for k, v in groups.items()}, ensure_ascii=False))
         return dict(result='dry-run', step='verification', reason='预演：已读取回归文档并分组', notes=notes, head_sha=head)
+    ai_approved = not groups['ai'] or bool(verify_artifacts(work.module_view(), module, [doc['document']], flow_v2=True))
     patch_id = work.patch_id()
     report_path, logs, cache_path = io.verification_paths(repo, patch_id)
     def read_json(path):
@@ -606,27 +679,61 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
     def write_json(path, value):
         io.write_verification_file(path, json.dumps(value, ensure_ascii=False, indent=2) + '\n')
     def evidence(path, text, kind='log', source=None):
-        raw = text.encode('utf-8')
+        raw = text.encode('utf-8', errors='backslashreplace')
         io.write_verification_file(path, raw)
         return dict(type=kind, path=os.path.relpath(path, os.path.dirname(report_path)),
                     sha256=hashlib.sha256(raw).hexdigest(), source=source)
     report = read_json(report_path)
     reused = False
-    if isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']:
+    if (ai_approved and isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']
+            and not any(c.get('method') == 'ai-operate' and not has_delegate_authorization(c)
+                        for c in report.get('cases', []))):
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
         digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
-        # A failed verdict is never reused: the next run re-executes (failures may be flaky).
+        # Rebuild failed reports so flaky command cases can be re-executed.
         reused = (state.get('current') is True and state.get('reportSha256') == digest
                   and report.get('verdict') != 'fail')
     if not reused:
+        ai_results, ai_unavailable = {}, {}
+        for case in groups['ai']:
+            cid = case['id']
+            if not ai_approved:
+                groups['manual'].append(case)
+                ai_unavailable[cid] = '未确认模块已批准，不能委托执行回归用例'
+                continue
+            key = hashlib.sha256(json.dumps([patch_id, cid, case['sha256']]).encode('utf-8')).hexdigest()
+            outcome_path = f'{report_path}.{key}.ai.json'
+            with io.verification_case_lock(outcome_path):
+                outcome = read_json(outcome_path)
+                result = outcome.get('result') if isinstance(outcome, dict) else None
+                reason = None
+                if not has_delegate_authorization(result) or result.get('result') != 'pass':
+                    execution, reason = run_ai_case(work, case, head, author_host)
+                    result = None
+                    if execution is not None:
+                        text = execution['evidence']
+                        if not isinstance(text, str):
+                            text = json.dumps(text, ensure_ascii=False, indent=2)
+                        execution['evidence'] = [evidence(os.path.join(logs, f'{cid}-delegate-{key}.log'), text)]
+                        result = case_result(case, execution)
+                        result['authorization'] = execution['authorization']
+                        result['hubAuthorizationSha256'] = execution['hubAuthorizationSha256']
+                        if result['result'] == 'pass':
+                            write_json(outcome_path, dict(result=result, reason=None))
+            if reason is not None:
+                groups['manual'].append(case)
+                ai_unavailable[cid] = reason
+            else:
+                ai_results[cid] = result
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:
             owner = pr['base']['repo']['owner']
             if owner.get('type') == 'Organization':  # checked before any tracking-issue write
                 raise Stop('verification', '仓库属于组织，跟踪 issue 只认仓库所有者本人的答复，组织仓库还不支持，交你处理')
-            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'])
+            issue, comments, after_id = verification_issue(io, repo, pr, module, groups, patch_id, doc['sha256'],
+                                                           ai_unavailable)
             owner_id = owner.get('id')
             if owner_id is None:
                 owner_id = (io.api(f'repos/{repo}').get('owner') or {}).get('id')
@@ -635,6 +742,9 @@ def verify_module(io, repo, pr, work, module, notes, dry_run):
         results, pending_confirm, pending_manual = [], [], []
         for case in doc['cases']:
             cid = case['id']
+            if cid in ai_results:
+                results.append(ai_results[cid])
+                continue
             if case in groups['manual']:
                 reply = replies['results'].get(cid)
                 if reply is None:
@@ -1234,7 +1344,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                         raise Stop("takeover", detail)
                     manual_reasons.append(f"{detail}（{reason}）" if reason else detail)
                 if flow_v2:
-                    verification = verify_module(io, repo, pr, work, module, notes, dry_run)
+                    verification = verify_module(io, repo, pr, work, module, notes, dry_run, author_host=author_host)
                 else:
                     acceptance, report = accepted_review(io, repo, module, head)
                     fp, rounds = gate_review(report), 1

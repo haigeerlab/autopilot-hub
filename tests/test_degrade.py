@@ -3,10 +3,15 @@
 Run: python3 -B -m unittest discover -s tests -v
 Stdlib only; the GitHub API is replaced by a fake.
 """
+from contextlib import redirect_stdout
+import io
 import json
 import os
+from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -232,6 +237,70 @@ class CloseCheckTest(unittest.TestCase):
         api = FakeApi()
         r.run("issues", closed_event("helper", labels=("bug",)), api)
         self.assertEqual(api.writes(), [])
+
+
+class SkipMainRedTest(unittest.TestCase):
+    """R18: opting in hands main CI failures to watch and keeps the other triggers."""
+
+    def run_event(self, skip_main_red, event_name, event, api):
+        log = io.StringIO()
+        with TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "event.json"
+            summary_path = Path(tmp) / "summary.md"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            with patch.dict(os.environ, {"SKIP_MAIN_RED": skip_main_red}), patch.object(r, "gh_api", api):
+                with redirect_stdout(log):
+                    self.assertEqual(r.main(["--event-name", event_name, "--event-path", str(event_path),
+                                             "--out-md", str(summary_path)]), 0)
+            return log.getvalue(), summary_path.read_text(encoding="utf-8")
+
+    def test_main_ci_failure_is_skipped_only_when_enabled(self):
+        for skip_main_red in ("false", "true"):
+            with self.subTest(skip_main_red=skip_main_red):
+                api = FakeApi(pulls_of(MERGE, [AUTHORED]))
+                log, summary = self.run_event(skip_main_red, "workflow_run", workflow_run_event(), api)
+                if skip_main_red == "true":
+                    self.assertEqual(api.calls, [])
+                    self.assertIn("skip_main_red=true", log)
+                    self.assertIn("watch", log)
+                    self.assertIn("skip_main_red=true", summary)
+                else:
+                    self.assertEqual(len(api.created()), 1)
+                    _, payload = created_payload(api)
+                    self.assertEqual((payload["reason"], payload["level"], payload["ref"]),
+                                     ("main-red", "L2", MERGE))
+
+    def test_revert_regression_and_freeze_open_degrade_in_both_modes(self):
+        cases = (
+            ("push", push_event(revert_message()), pulls_of(REVERTED, [AUTHORED]), "revert", "L2"),
+            ("issues", label_event("autopilot:regression"), {}, "regression", "L2"),
+            ("issues", label_event("autopilot:freeze"), {}, "freeze", "L0"),
+        )
+        for skip_main_red in ("false", "true"):
+            for event_name, event, responses, reason, level in cases:
+                with self.subTest(skip_main_red=skip_main_red, reason=reason):
+                    api = FakeApi(responses)
+                    self.run_event(skip_main_red, event_name, event, api)
+                    self.assertEqual(len(api.created()), 1)
+                    _, payload = created_payload(api)
+                    self.assertEqual((payload["reason"], payload["level"]), (reason, level))
+                    if reason == "revert":
+                        self.assertEqual(payload["ref"], REVERT_COMMIT)
+                        self.assertTrue(any(method == "POST" and "correction:revert" in body.get("labels", [])
+                                            for method, _, body in api.writes()))
+                    else:
+                        self.assertEqual(payload["ref"], event["issue"]["html_url"])
+
+    def test_non_admin_close_is_reopened_with_comment_in_both_modes(self):
+        for skip_main_red in ("false", "true"):
+            with self.subTest(skip_main_red=skip_main_red):
+                api = FakeApi(permission_of("helper", "write"))
+                self.run_event(skip_main_red, "issues", closed_event("helper"), api)
+                issue_path = f"repos/{REPO}/issues/42"
+                reopen, comment = api.writes()
+                self.assertEqual(reopen, ("PATCH", issue_path, {"state": "open"}))
+                self.assertEqual(comment[:2], ("POST", f"{issue_path}/comments"))
+                self.assertIn("管理员", comment[2]["body"])
 
 
 class RevertLabelTest(unittest.TestCase):

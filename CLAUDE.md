@@ -95,7 +95,7 @@ Claude Code 进入本仓库时读这份文件。
 - 提供给 spec-guard：风险路径清单文件；本机检查证据（`~/.autopilot/evidence/…`，格式版本见接口清单）。
 - 使用 spec-guard 的：模块进度视图（map_view）、回归测试文档视图（regressionView）、合并前验证报告的校验与记录、接管收窄入口（narrow）、最终验收记录与 reviewMark（batch 补验收时）、范围检查（scopeCheck，只用来写清停下的原因）。
 - 使用 module-crew 的：合并第一段出口 firstStage（`module-crew merge first-stage --json`）。
-- 使用 delegate 的：老流程模块的最终验收审查报告（由 spec-guard 记录）。
+- 使用 delegate 的：老流程模块的最终验收审查报告（由 spec-guard 记录）。hub-auto-merge 实现后，还使用执行通道 run（`--write --authorized-by`，授权文件由 hub 记录用户打开该仓库自动路时的原话），只用于合并前验证里执行方式为 ai-operate 的用例：每条用例一个一次性克隆、只跑一轮；delegate 不可用、要人回答或结果解析不到时，该用例转人工。
 <!-- shared:end -->
 
 ## 只给 Claude Code
