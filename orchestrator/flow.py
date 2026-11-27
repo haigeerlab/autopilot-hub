@@ -567,7 +567,13 @@ def verification_issue(io, repo, pr, module, groups, patch_id, document_sha, ai_
         found = listings(comment)
         if found:
             latest, after_id = found[-1], comment['id']
-    if latest != payload:
+    def same_cases(group):
+        previous = latest.get(group)
+        return (isinstance(previous, list) and all(isinstance(cid, str) for cid in previous)
+                and set(previous) == set(payload[group]))
+    if (latest.get('patchId') != patch_id or latest.get('regressionSha256') != document_sha
+            or not same_cases('confirm') or not same_cases('manual')
+            or latest.get('aiUnavailable', {}) != ai_unavailable):
         added = io.api(f"repos/{repo}/issues/{issue['number']}/comments", 'POST', {'body': body})
         after_id = added['id']
     return issue, comments, after_id
@@ -643,7 +649,9 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                     sha256=hashlib.sha256(raw).hexdigest(), source=source)
     report = read_json(report_path)
     reused = False
-    if isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']:
+    if (isinstance(report, dict) and report.get('regression', {}).get('sha256') == doc['sha256']
+            and not any(c.get('method') == 'ai-operate' and not c.get('executor')
+                        for c in report.get('cases', []))):
         with io.verification_worktree(repo, head, pr['base']['ref']) as root:
             state = verification_state(io.verification_view(root), module)
         digest = hashlib.sha256(io.read_bytes(report_path)).hexdigest()
@@ -658,7 +666,9 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
             outcome_path = f'{report_path}.{key}.ai.json'
             with io.verification_case_lock(outcome_path):
                 outcome = read_json(outcome_path)
-                if outcome is None:
+                result = outcome.get('result') if isinstance(outcome, dict) else None
+                reason = None
+                if not isinstance(result, dict) or result.get('result') != 'pass':
                     execution, reason = run_ai_case(work, case, head, author_host)
                     result = None
                     if execution is not None:
@@ -667,13 +677,13 @@ def verify_module(io, repo, pr, work, module, notes, dry_run, *, author_host=Non
                             text = json.dumps(text, ensure_ascii=False, indent=2)
                         execution['evidence'] = [evidence(os.path.join(logs, f'{cid}-delegate-{key}.log'), text)]
                         result = case_result(case, execution)
-                    outcome = dict(result=result, reason=reason)
-                    write_json(outcome_path, outcome)
-            if outcome['reason'] is not None:
+                        if result['result'] == 'pass':
+                            write_json(outcome_path, dict(result=result, reason=None))
+            if reason is not None:
                 groups['manual'].append(case)
-                ai_unavailable[cid] = outcome['reason']
+                ai_unavailable[cid] = reason
             else:
-                ai_results[cid] = outcome['result']
+                ai_results[cid] = result
         replies = dict(results={}, confirmed=set(), notes=[])
         issue = None
         if groups['confirm'] or groups['manual']:

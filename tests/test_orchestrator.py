@@ -5,6 +5,7 @@ Run: python3 -B -m unittest discover -s tests -v
 import base64
 import contextlib
 from datetime import datetime, timedelta, timezone
+import hashlib
 from io import StringIO
 import json
 import os
@@ -761,27 +762,95 @@ sys.exit(response['exit'])
             self.assertFalse(Path(call['cwd']).exists(), call)
         self.assertEqual(Path(self.work.root, 'fixture.txt').read_text(), 'base')
 
-    def test_delegate_outcomes_reused_until_case_hash_or_patch_changes(self):
+    def test_delegate_pass_reused_until_case_hash_or_patch_changes(self):
         self.responses(R1=('later output\n{"case":"R1","result":"pass","evidence":"pass"}', 0),
                        R2=('later output\n{"case":"R2","result":"fail","evidence":"fail"}', 0))
         io = self.io('R1', 'R2')
         self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
         self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
-        self.assertEqual(self.delegate.call_count, 2)
+        self.assertEqual(self.delegate.call_count, 3)
         self.assertEqual([entry['result'] for entry in self.verify.report(io)['cases']], ['pass', 'fail'])
 
         doc = io.regression_head[1]
         doc['cases'][0]['sha256'] = 'f' * 64
         doc['sha256'] = 'e' * 64
         self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
-        self.assertEqual(self.delegate.call_count, 3)
-        self.assertTrue(self.delegate.call_args.args[2].startswith('用例 R1'))
+        self.assertEqual(self.delegate.call_count, 5)
+        self.assertTrue(self.delegate.call_args_list[-2].args[2].startswith('用例 R1'))
+        self.assertTrue(self.delegate.call_args.args[2].startswith('用例 R2'))
 
         with mock.patch.object(FakeWork, 'patch_id', return_value='a' * 40):
             self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
-        self.assertEqual(self.delegate.call_count, 5)
+        self.assertEqual(self.delegate.call_count, 7)
 
-    def test_manual_fallback_keeps_existing_reply_when_delegate_failure_changes(self):
+    def test_failed_delegate_reruns_and_can_pass_on_the_same_patch(self):
+        self.responses(R1=('{"case":"R1","result":"fail","evidence":"first attempt"}', 0))
+        io = self.io('R1')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.assertEqual(self.verify.report(io)['verdict'], 'fail')
+        self.assertFalse(any(path.endswith('.ai.json') for path in io.verification_files))
+
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"second attempt"}', 0))
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.verify.report(io)['verdict'], 'pass')
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(sum(path.endswith('.ai.json') for path in io.verification_files), 1)
+
+    def test_legacy_nonpassing_delegate_cache_entries_are_ignored(self):
+        self.responses(R1=('{"case":"R1","result":"pass","evidence":"R1 passed"}', 0),
+                       R2=('{"case":"R2","result":"pass","evidence":"R2 passed"}', 0))
+        io = self.io('R1', 'R2')
+        cases = io.regression_head[1]['cases']
+        outcomes = [
+            dict(result=dict(id='R1', method='ai-operate', result='fail', failCategory='check-failure',
+                             baselineCommit=None, evidence=[], executor='delegate:codex', exit=0), reason=None),
+            dict(result=None, reason='找不到 delegate-exec.sh'),
+        ]
+        patch_id = FakeWork(io).patch_id()
+        report_path, _, _ = io.verification_paths(REPO, patch_id)
+        for entry, outcome in zip(cases, outcomes):
+            key = hashlib.sha256(json.dumps([patch_id, entry['id'], entry['sha256']]).encode('utf-8')).hexdigest()
+            io.write_verification_file(f'{report_path}.{key}.ai.json', json.dumps(outcome))
+
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.verify.report(io)['verdict'], 'pass')
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(io.verify_issues, [])
+
+    def test_unavailable_delegate_retries_and_recovers_on_the_same_patch(self):
+        cases = [
+            ('no author', (), '未传 --author-host'),
+            ('codex author', ('--author-host', 'codex'), 'claude-code'),
+            ('missing', ('--author-host', 'claude-code'), '找不到 delegate'),
+            ('old version', ('--author-host', 'claude-code'), '版本低于 0.13'),
+            ('timeout', ('--author-host', 'claude-code'), '超时'),
+            ('nonzero exit', ('--author-host', 'claude-code'), '退出码 127'),
+            ('invalid output', ('--author-host', 'claude-code'), '结尾 JSON'),
+        ]
+        for fault, args, reason in cases:
+            with self.subTest(fault=fault):
+                self.find_delegate.return_value = None if fault == 'missing' else str(self.script)
+                self.set_version('0.12.6' if fault == 'old version' else '0.14.0')
+                self.responses(R1=('not JSON', 127 if fault == 'nonzero exit' else 0))
+                io = self.io('R1')
+                timeout = (mock.patch.object(self.work, 'run_delegate', return_value=(None, '执行 delegate 超时'))
+                           if fault == 'timeout' else contextlib.nullcontext())
+                with timeout:
+                    code, out = self.cli_run(io, *args, '--json')
+                self.assertEqual(code, 1, out)
+                self.assertIn(reason, io.verify_issues[0]['body'])
+                self.assertFalse(any(path.endswith('.ai.json') for path in io.verification_files))
+
+                self.find_delegate.return_value = str(self.script)
+                self.set_version('0.14.0')
+                self.responses(R1=('{"case":"R1","result":"pass","evidence":"delegate recovered"}', 0))
+                code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+                self.assertEqual(code, 0, out)
+                self.assertEqual(self.verify.report(io)['cases'][0]['executor'], 'delegate:codex')
+
+    def test_manual_fallback_keeps_existing_reply_when_delegate_failure_is_unchanged(self):
         self.responses(R1=('not JSON', 0))
         io = self.io('R1')
         code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
@@ -789,12 +858,57 @@ sys.exit(response['exit'])
         self.assertIn('结尾 JSON', io.verify_issues[0]['body'])
         self.verify.reply(io, 'R1 通过')
 
-        self.find_delegate.return_value = None  # A different failure must not replace the listing.
         code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.delegate.call_count, 1)
+        self.assertEqual(self.delegate.call_count, 2)
         self.assertEqual(len(io.verify_comments), 1)
         self.assertEqual(self.verify.report(io)['cases'][0]['evidence'][0]['type'], 'user-quote')
+
+    def test_manual_fallback_reposts_when_the_reason_changes(self):
+        self.responses(R1=('not JSON', 0))
+        io = self.io('R1')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.verify.reply(io, 'R1 通过')
+
+        self.find_delegate.return_value = None
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 1, out)
+        self.assertIn('要你测 R1', out)
+        self.assertEqual(len(io.verify_comments), 2)
+        self.assertIn('找不到 delegate', io.verify_comments[-1]['body'])
+
+    def test_fallback_listing_ignores_case_order_and_unrelated_metadata(self):
+        self.responses(R1=('not JSON', 0), R2=('not JSON', 0))
+        io = self.io('R1', 'R2')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        issue = io.verify_issues[0]
+        raw = flow_block(issue['body'], 'autopilot-verify')
+        listing = json.loads(raw)
+        listing['manual'].reverse()
+        listing['generatedAt'] = T0
+        issue['body'] = issue['body'].replace(raw, json.dumps(listing))
+        self.verify.reply(io, 'R1 通过\nR2 通过')
+
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(io.verify_comments), 1)
+        self.assertEqual(self.delegate.call_count, 4)
+
+    def test_manual_pass_report_does_not_skip_delegate_on_the_next_run(self):
+        self.find_delegate.return_value = None
+        io = self.io('R1')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 1)
+        self.verify.reply(io, 'R1 通过')
+        self.assertEqual(self.cli_run(io, '--author-host', 'claude-code', '--json')[0], 0)
+        self.assertEqual(self.verify.report(io)['cases'][0]['evidence'][0]['type'], 'user-quote')
+
+        io.merged = False
+        self.find_delegate.return_value = str(self.script)
+        self.responses(R1=('{"case":"R1","result":"fail","evidence":"delegate reproduced the failure"}', 0))
+        code, out = self.cli_run(io, '--author-host', 'claude-code', '--json')
+        self.assertEqual(code, 1, out)
+        result = self.verify.report(io)['cases'][0]
+        self.assertEqual((result['executor'], result['result']), ('delegate:codex', 'fail'))
 
     def test_delegate_only_receives_allowlisted_environment(self):
         self.responses(R1=('delegate output', 0))
@@ -813,17 +927,44 @@ sys.exit(response['exit'])
         delegate = next(call for call in popen.call_args_list if call.args[0][0] == 'bash')
         self.assertEqual(delegate.kwargs['env'], allowed)
 
+    def test_delegate_receives_proxy_environment(self):
+        self.responses(R1=('delegate output', 0))
+        proxies = {key: f'proxy-fixture-{key}' for key in (
+            'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+            'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+        )}
+        with mock.patch.dict(os.environ, proxies), mock.patch.object(subprocess, 'Popen', wraps=subprocess.Popen) as popen:
+            output, error = self.work.run_delegate('codex', self.head, '用例 R1')
+
+        self.assertIsNone(error)
+        self.assertEqual(output.strip(), 'delegate output')
+        delegate = next(call for call in popen.call_args_list if call.args[0][0] == 'bash')
+        self.assertEqual({key: delegate.kwargs['env'].get(key) for key in proxies}, proxies)
+
     def test_delegate_timeout_terminates_group_before_removing_clone(self):
         self.assert_delegate_group_stopped(subprocess.TimeoutExpired('delegate', 1))
+
+    def test_delegate_exit_terminates_remaining_group_before_removing_clone(self):
+        self.assert_delegate_group_stopped()
+
+    def test_delegate_group_exit_probe_retries_when_temporarily_denied(self):
+        process = mock.Mock(pid=12345)
+        with mock.patch.object(os, 'killpg', side_effect=[None, PermissionError, ProcessLookupError]) as killpg, \
+                mock.patch.object(cli.time, 'sleep'):
+            self.assertTrue(cli._stop_delegate_group(process))
+        self.assertEqual(killpg.call_args_list, [
+            mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, 0), mock.call(process.pid, 0),
+        ])
 
     def test_interrupted_delegate_stops_group_before_removing_clone(self):
         self.assert_delegate_group_stopped(KeyboardInterrupt())
 
-    def assert_delegate_group_stopped(self, interruption):
+    def assert_delegate_group_stopped(self, interruption=None):
         real_popen = subprocess.Popen
-        process = mock.MagicMock(pid=12345)
+        process = mock.MagicMock(pid=12345, returncode=0)
         process.__enter__.return_value = process
         process.communicate.side_effect = interruption
+        process.communicate.return_value = ('delegate output', None)
         started = []
         signals = []
 
@@ -846,10 +987,13 @@ sys.exit(response['exit'])
             if isinstance(interruption, KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     self.work.run_delegate('codex', self.head, '用例 R1')
-            else:
+            elif interruption is not None:
                 output, error = self.work.run_delegate('codex', self.head, '用例 R1')
                 self.assertIsNone(output)
                 self.assertIn('超时', error)
+            else:
+                output, error = self.work.run_delegate('codex', self.head, '用例 R1')
+                self.assertEqual((output, error), ('delegate output', None))
 
         self.assertIs(started[0].get('start_new_session'), True)
         self.assertEqual([sig for sig in signals if sig], [signal.SIGTERM, signal.SIGKILL])

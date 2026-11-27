@@ -605,18 +605,27 @@ class Watch:
 
     def inspect_main(self, io, repo):
         cursor = self.state.get_cursor(repo)
-        for key, intent in self.state.pending_intents().items():
-            if intent.get("action") == "watch-main-red" and intent.get("repo") == repo:
-                try:
-                    self.finish_main_red(io, key, intent)
-                except WATCH_ERRORS as exc:
-                    self.pause_run_error(io, repo, intent["run_id"], intent["attempt"], intent["fields"], exc)
-                    return cursor
-        self.reconcile_reruns(io, repo, "push")
+        if cursor is not None:
+            for key, intent in self.state.pending_intents().items():
+                if intent.get("action") == "watch-main-red" and intent.get("repo") == repo:
+                    try:
+                        self.finish_main_red(io, key, intent)
+                    except WATCH_ERRORS as exc:
+                        self.pause_run_error(io, repo, intent["run_id"], intent["attempt"], intent["fields"], exc)
+                        return cursor
+            self.reconcile_reruns(io, repo, "push")
         base = (io.api(f"repos/{repo}") or {}).get("default_branch")
         if not base:
             raise degrade.ApiError("GitHub 未返回默认分支")
-        runs = list(self.action_runs(io, repo, cursor=cursor, event="push", branch=base))
+        main_runs = self.action_runs(io, repo, cursor=cursor, event="push", branch=base)
+        if cursor is None:
+            latest = next(main_runs, None)
+            # An empty history still establishes a starting point for the next push.
+            cursor = latest["id"] if latest else 0
+            self.event(f"{repo}:main-cursor:{cursor}", "watch-main-cursor", repo=repo, cursor=cursor,
+                       detail="首次巡检，从此处开始")
+            return cursor
+        runs = list(main_runs)
         records = self.state.read()["runs"]
         known = {}
         for key, record in records.items():
@@ -636,7 +645,7 @@ class Watch:
             run_id = run["id"]
             if self.inspect_ci_run(io, repo, run, base=base) == "retry":
                 break
-            cursor = run_id if cursor is None else max(cursor, run_id)
+            cursor = max(cursor, run_id)
         return cursor
 
     def deliver(self, item):

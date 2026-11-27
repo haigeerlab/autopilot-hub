@@ -398,8 +398,48 @@ class PrCiFailureTest(WatchTestCase):
 
 
 class MainRedTest(WatchTestCase):
+    def test_first_main_watch_sets_cursor_without_processing_history(self):
+        self.config["repos"][REPO]["watchMainRed"] = True
+        self.github.add_pr(7)
+        self.github.runs = {
+            18: ci(18, "push"),
+            19: ci(19, "push", conclusion="startup_failure"),
+            20: ci(20, "push"),
+            21: ci(21, "push") | {"head_branch": "other"},
+            22: ci(22),
+        }
+        self.github.jobs[20] = jobs("setup")
+
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.state.get_cursor(REPO), 20)
+        self.assertEqual(self.state.read()["runs"], {})
+        self.assertIsNone(self.state.get_narrowed(REPO))
+        self.assertEqual(self.github.effects, [])
+        self.assertFalse(any(path.startswith(f"repos/{REPO}/actions/runs/") for _, path in self.github.requests))
+        events = [event for event in LOCAL_IO.ledger_events() if event.get("repo") == REPO]
+        self.assertEqual(len(events), 1)
+        self.assertIn("首次巡检，从此处开始", events[0]["detail"])
+
+        self.github.runs[23] = ci(23, "push")
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.state.get_cursor(REPO), 23)
+        self.assertEqual(set(self.state.read()["runs"]), {f"{REPO}:23:1"})
+        self.assertIsNotNone(self.state.get_narrowed(REPO))
+        self.assertEqual(len(self.effects("issue")), 1)
+
+    def test_first_main_watch_with_no_runs_processes_the_next_push(self):
+        self.config["repos"][REPO]["watchMainRed"] = True
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.state.get_cursor(REPO), 0)
+
+        self.github.runs[20] = ci(20, "push")
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.state.get_cursor(REPO), 20)
+        self.assertIsNotNone(self.state.get_narrowed(REPO))
+
     def test_narrows_in_order_and_only_repository_resume_releases_hold(self):
         self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 19)
         self.github.add_pr(7)
         self.github.add_pr(8)
         self.github.runs[20] = ci(20, "push")
@@ -437,6 +477,7 @@ class MainRedTest(WatchTestCase):
 
     def test_narrowing_and_queue_close_survive_evidence_api_failure(self):
         self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 19)
         self.github.add_pr(7)
         self.github.runs[20] = ci(20, "push")
 
@@ -450,7 +491,7 @@ class MainRedTest(WatchTestCase):
         self.assertTrue(self.state.get_narrowed(REPO))
         self.assertEqual(self.effects("close"), [("close", 7, True)])
         self.assert_paused(self.state.get_run(REPO, 20, 1))
-        self.assertIsNone(self.state.get_cursor(REPO))
+        self.assertEqual(self.state.get_cursor(REPO), 19)
         self.github.fail = None
         self.once()
         self.assertEqual(self.state.get_cursor(REPO), 20)
@@ -458,6 +499,7 @@ class MainRedTest(WatchTestCase):
 
     def test_main_config_pause_notifies_without_closing_the_repo_queue(self):
         self.config["repos"][REPO].update(watchMainRed=True, notify="repo-owner")
+        self.state.set_cursor(REPO, 19)
         self.github.add_pr(7)
         self.github.runs[20] = ci(20, "push", conclusion="startup_failure")
 
@@ -517,6 +559,7 @@ class TimeoutAndFailureTest(WatchTestCase):
 
     def test_main_running_ci_timeout_pauses_attempt_without_narrowing(self):
         self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 9)
         self.github.runs[10] = ci(10, "push", conclusion=None, started=OLD)
 
         self.once()
@@ -670,6 +713,23 @@ class FreezeTest(WatchTestCase):
         self.assertEqual(self.state.read()["heartbeat"], None)
         self.mint.assert_not_called()
 
+    def test_daemon_skips_locked_round_and_retries_after_poll_interval(self):
+        with ExitStack() as other:
+            other.enter_context(WatchState(self.directory).lock())
+
+            def sleep(seconds):
+                self.assertEqual(seconds, 300)
+                if self.state.read()["heartbeat"] is not None:
+                    raise KeyboardInterrupt
+                self.mint.assert_not_called()
+                other.close()
+
+            with mock.patch.object(cli.time, "sleep", side_effect=sleep) as wait:
+                self.assertEqual(self.command("watch"), 0)
+
+        self.assertEqual(wait.call_args_list, [mock.call(300), mock.call(300)])
+        self.assertTrue(self.state.heartbeat_is_fresh(15))
+
     def test_unfreeze_and_repository_resume_can_be_requested_together(self):
         self.state.set_frozen(True)
         self.state.narrow_repo(REPO, "main-red", "20:1")
@@ -758,6 +818,7 @@ class ResumeTest(WatchTestCase):
 
     def test_crash_after_issue_creation_resumes_narrowing_with_same_issue(self):
         self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 19)
         self.github.add_pr(7)
         self.github.runs[20] = ci(20, "push")
 
@@ -768,7 +829,7 @@ class ResumeTest(WatchTestCase):
         self.github.after_write = crash
         with self.assertRaises(SimulatedCrash):
             self.once()
-        self.assertIsNone(self.state.get_cursor(REPO))
+        self.assertEqual(self.state.get_cursor(REPO), 19)
         self.assertTrue(self.state.get_narrowed(REPO))
         self.github.after_write = None
         self.once()
@@ -857,6 +918,7 @@ class ResumeTest(WatchTestCase):
 
     def test_in_progress_run_revisited_after_cursor_passes_it(self):
         self.config["repos"][REPO]["watchMainRed"] = True
+        self.state.set_cursor(REPO, 19)
         self.github.runs = {20: ci(20, "push", conclusion=None), 21: ci(21, "push", conclusion="success")}
         self.once()
         self.assertEqual(self.state.get_cursor(REPO), 21)

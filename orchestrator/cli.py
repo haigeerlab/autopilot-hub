@@ -46,7 +46,9 @@ STATE = os.path.expanduser("~/.autopilot")
 DELEGATE_CACHE = os.path.expanduser("~/.claude/plugins/cache/delegate-marketplace/delegate")
 SPEC_GUARD_CACHE = os.path.expanduser("~/.claude/plugins/cache/spec-guard-marketplace/spec-guard")
 SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL", "TERM")
-DELEGATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "CODEX_HOME")
+DELEGATE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "CODEX_HOME",
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "no_proxy", "all_proxy")
 CHECK_TIMEOUT = 15 * 60
 REVIEW_TIMEOUT = 30 * 60
 RELEASE_TIMEOUT = 30 * 60
@@ -136,6 +138,9 @@ def _stop_delegate_group(process):
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
                 return True
+            except PermissionError:
+                # The group has not been confirmed gone. Keep waiting within the signal deadline.
+                pass
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
@@ -256,9 +261,10 @@ class Work:
         delegate_env = {k: v for k, v in os.environ.items() if k in DELEGATE_ENV or k.startswith("LC_")}
         # Delegate 0.13 only accepts --repo for review. Its run uses cwd and prints a footer after the answer.
         legacy_run = major_minor == (0, 13)
+        process = None
+        group_stopped = True
         try:
             tmp = tempfile.mkdtemp(prefix="autopilot-ai-case-")
-            retain_clone = False
             try:
                 clone = os.path.realpath(os.path.join(tmp, "repo"))
                 for args in (("clone", "-q", "--no-hardlinks", "--no-checkout", "--", self.root, clone),
@@ -274,24 +280,24 @@ class Work:
                                            errors="replace", stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
                     output, _ = process.communicate(timeout=CHECK_TIMEOUT)
-                except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError) as error:
-                    retain_clone = True
-                    retain_clone = not _stop_delegate_group(process)
-                    if retain_clone and isinstance(error, subprocess.TimeoutExpired):
-                        return None, "执行 delegate 超时，无法确认进程组已退出，已保留临时克隆"
-                    raise
                 finally:
                     process.stdout.close()
             finally:
-                if not retain_clone:
+                if process is not None:
+                    group_stopped = _stop_delegate_group(process)
+                if group_stopped:
                     shutil.rmtree(tmp)
         except subprocess.CalledProcessError:
             return None, "准备用例的独立克隆失败"
         except subprocess.TimeoutExpired:
+            if not group_stopped:
+                return None, "执行 delegate 超时，无法确认进程组已退出，已保留临时克隆"
             return None, "准备克隆或执行 delegate 超时"
         except (OSError, ValueError):
             return None, "无法准备克隆或启动 delegate"
 
+        if not group_stopped:
+            return None, "无法确认 delegate 进程组已退出，已保留临时克隆"
         if process.returncode:
             return None, f"delegate 后端 {backend} 执行失败（退出码 {process.returncode}）"
         if legacy_run:
@@ -1258,23 +1264,26 @@ def watch_command(args):
                                            ("--resume", args.resume)) if enabled]
     try:
         while True:
-            with state.lock(wait_seconds=WATCH_LOCK_WAIT if controls else 0):
-                if args.freeze or args.unfreeze:
-                    state.set_frozen(args.freeze)
-                if args.resume:
-                    repo, number = args.resume.groups()
-                    watch.resume(state, repo, int(number) if number is not None else None)
-                if (args.unfreeze or args.resume) and not (args.once or args.freeze):
+            try:
+                with state.lock(wait_seconds=WATCH_LOCK_WAIT if controls else 0):
+                    if args.freeze or args.unfreeze:
+                        state.set_frozen(args.freeze)
+                    if args.resume:
+                        repo, number = args.resume.groups()
+                        watch.resume(state, repo, int(number) if number is not None else None)
+                    if (args.unfreeze or args.resume) and not (args.once or args.freeze):
+                        return 0
+                    status = watch_round(state)
+            except StateLockedError:
+                if controls:
+                    print(f"autopilot: watch 等待状态锁超时，{'、'.join(controls)} 未生效，请重试", file=sys.stderr)
+                    return 1
+                if args.once:
                     return 0
-                status = watch_round(state)
-            if args.once or args.freeze:
-                return status
+            else:
+                if args.once or args.freeze:
+                    return status
             time.sleep(300)
-    except StateLockedError:
-        if controls:
-            print(f"autopilot: watch 等待状态锁超时，{'、'.join(controls)} 未生效，请重试", file=sys.stderr)
-            return 1
-        return 0
     except KeyboardInterrupt:
         if controls:
             print(f"autopilot: watch {'、'.join(controls)} 已中断，请核对状态后重试", file=sys.stderr)
