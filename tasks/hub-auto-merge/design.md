@@ -103,7 +103,7 @@
 - 新子命令 `cli.py watch [--once] [--freeze|--unfreeze] [--resume <repo>[#pr]]`；launchd 每 5 分钟跑一次 `--once`。另有 `cli.py report-failure --repo --pr --stage <open-pr|...> --detail` 供会话上报 hub 看不到的失败（例如开 PR 失败），落成暂停记录并通知用户。
 - `orchestrator/state.py`：`~/.autopilot/watch-state.json`，`fcntl.flock` 独占锁（拿不到直接退出）；原子写。结构：
   - `heartbeat`、`frozen`；
-  - `prs["owner/repo#n"]`：`state`（automerge-requested／automerge-on／merged／post-merge-done／paused／handed-to-user）、`validatedHeadOid`、`validatedBaseOid`、`since`、`notify`、`pause`（原因、时间、恢复条件）；
+  - `prs["owner/repo#n"]`：`state`（automerge-requested／automerge-on／merged／post-merge-done／paused／handed-to-user）、`validatedHeadOid`、`validatedBaseOid`、`since`、`notify`、`pause`（原因、时间、恢复条件）、`resumeState`（关闭待重试时保留原巡检状态）；
   - `runs["owner/repo:<run_id>:<attempt>"]`：`event`（pull_request／push）、`headSha`、`state`（pending／green／red-classified／rerun／paused）、`classification`、`reruns`、关联 PR；
   - `repos["owner/repo"]`：`narrowed`（原因、时间、来源运行）、`watchMainRed`（从 config 读）、`cursor`（已处理到的最新运行 id）；
   - `repairs["owner/repo#n"][<原因键>]`：已计数的修复尝试（提交号列表）；
@@ -113,17 +113,18 @@
 - 每轮：
   1. **冻结**：`frozen` 时只做关闭类动作：列出各仓库 `autoMergeRequest` 非空的 PR，逐个 `disablePullRequestAutoMerge`，写事件。`run` 在冻结时路线固定 `manual`（第 2 节）。
   2. **PR**：对每个 `automerge-requested`／`automerge-on` 的 PR：
-     - head ≠ `validatedHeadOid`，或该 head 上 `autopilot/verified` 不是 success → 关自动合并、暂停（恢复条件：重新 `run` 通过）、通知会话；
+     - head ≠ `validatedHeadOid`，或该 head 上 `autopilot/verified` 不是 success → 关闭自动合并后暂停，通知用户和已配置的会话。head 变化时，通知写明已验证的提交、新 head、已关闭自动合并，以及重新 `run` 通过的恢复条件；
      - 已合并 → 打 `autopilot:auto-merged`、开跟进 issue（复用 `followups` 的路径：读 `validatedHeadOid` 的 v2 证据和本机报告，`cli.py:835-851`）、写事件、`post-merge-done`；
-     - 打开超过 60 分钟未合并 → 关自动合并、暂停、通知用户；
-     - PR 上的 CI 运行（按 `run_id:attempt` 增量）失败 → 分类（第 6 节）；单次运行超过 60 分钟 → 暂停、通知。
+     - 打开超过 60 分钟未合并 → 关闭自动合并后暂停，通知用户和已配置的会话；
+     - PR 上的 CI 运行（按 `run_id:attempt` 增量）失败 → 分类（第 6 节）；单次运行超过 60 分钟 → 关闭自动合并后暂停，通知用户和已配置的会话；
+     - 关闭失败 → 记录错误和暂停原因，保留关闭意图及原巡检状态（`resumeState`）。下一轮按该意图重试，确认队列已关闭后才按原原因暂停并通知。
   3. **主干**：只对 `watchMainRed=true` 的仓库（见第 8 节）。从 `cursor` 起逐条处理主干 push 运行（不只看最新一条）：
      - 绿 → 记 `green` 和关联 PR、`validatedHeadOid`、证据评论地址（交模块 3）；
      - 红 → 分类；`test`：按顺序 ①写 `repos.narrowed`（`run` 从此路线固定 `manual`）②关掉该仓库所有排队的自动合并 ③开降级 issue（复用 `degrade/run.py` 的开 issue 与去重函数，reason `main-red`）④调 `narrow_pending` 开 spec-guard 收窄 PR ⑤通知用户。收窄 PR 要用户合并才在 spec-guard 生效，但 ①已让 hub 立即停止打开自动合并；
      - 单次运行超过 60 分钟 → 暂停、通知。
   4. **发通知**：用户走 macOS 通知（`osascript display notification`）加 PR／issue 评论；会话走 `~/.agent-relay/bin/agent-relay send --from autopilot-watch --to <notify>`；成功才出队，失败留到下一轮。
   5. 写 `heartbeat` 和各仓库 `cursor`。
-- 解除：PR 级暂停在重新 `run` 通过或 `--resume <repo>#<pr>` 后解除；仓库级 `narrowed` 只由 `--resume <repo>` 解除（用户说恢复后由会话执行）。
+- 解除：PR 级暂停在重新 `run` 通过或 `--resume <repo>#<pr>` 后解除。关闭待重试时，`--resume <repo>#<pr>` 恢复原巡检状态，待关闭意图继续执行。仓库级 `narrowed` 只由 `--resume <repo>` 解除（用户说恢复后由会话执行）。
 - 「将要做什么」：每串动作开始前写一条事件到 `ledger.jsonl`，有 `notify` 时进 `outbox`。
 
 ### 6. CI 失败分类（`classify.py`，U4、4.3）
@@ -155,6 +156,7 @@
 
 - `run`：contents、pull_requests、issues 写，statuses 写（新增）。
 - `watch`：contents 读，pull_requests、issues 写，statuses 读，actions 写（重跑）。
+- `watch` 关闭自动合并：调用 `disablePullRequestAutoMerge` 时按仓库另申请短期令牌，权限为 contents 写、pull_requests 写。只用于该次 mutation，调用结束即撤销。冻结、收紧和 PR 巡检关队列共用这条路径。
 - `batch`、`followups`：不变（`cli.py:754`、:822 现有 WRITE）。
 - 路线判定的「部署前提」里，App 权限不足会在调用时报错，按暂停处理；B 批清单写明需要的 App 权限。
 
@@ -237,3 +239,4 @@
 - 2026-11-27（delegate 0.13.2 发版后）：按用户原话「走 1，转 delegate 改」及 delegate#78/#80，第 4 节补上授权记录子命令、带授权的一轮执行和授权来源留存，按 delegate-owner #23472 的建议以结果文件的 authorization 字段为准。
 - 2026-11-27（检查点 5 沙盒准备时）：B 批加必需检查后，非模块 PR 无人写 `autopilot/verified`。按用户原话「按 A 改 hub」，第 2 节补上未归属模块路线，照 Dependabot 跑检查和风险分级。按用户后续确认，风险项未通过时也与模块 PR 一样记下风险原因，检查通过后写 `success` 并交人合并。
 - 2026-11-27（检查点 5 R14 时）：原第 7 节漏了总体技术方案 4.7 的「修复后」限定，导致首次运行时修改已有测试也会暂停。按用户原话「按 A 收窄」，只检查已有失败记录后的新 head。
+- 2026-11-27（检查点 5 R15 ① 时）：按用户原话「按 A 修」，第 9 节补充关闭自动合并专用的短期写令牌，第 5 节补充关闭失败后的重试、恢复巡检状态及 head 变化通知。

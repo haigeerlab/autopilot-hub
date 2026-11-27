@@ -35,6 +35,10 @@ def pause_intent(repo, number, record, reason, recovery, *, user=False, notify=N
                 since=record.get("since"), reason=reason, recovery=recovery, user=user, notify=notify)
 
 
+def pr_phase(record):
+    return record.get("resumeState") if record.get("state") == "paused" else record.get("state")
+
+
 def report_failure(state, repo, number, stage, detail, ledger):
     detail = clean_detail(detail)
     target = f"{repo}#{number}" if number else repo
@@ -49,11 +53,13 @@ def report_failure(state, repo, number, stage, detail, ledger):
     if state.intend(key, dict(action="report-failure", repo=repo, pr=number)):
         ledger(dict(event="watch-intent", action="report-failure", repo=repo, pr=number, key=key,
                     at=state.now().isoformat()))
+    resume_state = record.get("resumeState") if record.get("state") == "paused" else None
     if record.get("state") in ACTIVE_PRS:
         state.intend(key + ":close", pause_intent(repo, number, record, stage, recovery))
+        resume_state = record["state"]
     state.enqueue_notification("user", f"{target} 已暂停。{stage} 失败：{detail}。{recovery}。",
                                key + ":user", repo=repo, number=number or None)
-    state.pause_pr(repo, number, stage, recovery, detail=detail)
+    state.pause_pr(repo, number, stage, recovery, detail=detail, resumeState=resume_state)
     state.mark_done(key)
 
 
@@ -63,7 +69,7 @@ def resume(state, repo, number):
         return
     pr = state.get_pr(repo, number)
     if pr and pr.get("state") == "paused":
-        # A resume does not restore a GitHub auto-merge request. Run must validate it again.
+        # Restore local inspection only. Opening a new GitHub queue requires run to validate it again.
         state.set_pr(repo, number, state=pr.get("resumeState") or "handed-to-user", pause=None,
                      resumeState=None, resumeCount=pr.get("resumeCount", 0) + 1)
 
@@ -100,11 +106,12 @@ def timestamp(stamp):
 class Watch:
     """One round under the caller's WatchState lock; remote I/O is injected by the CLI."""
 
-    def __init__(self, state, config, io_for, *, followups, narrow, ledger, ledger_events):
+    def __init__(self, state, config, io_for, *, followups, disable_automerge, narrow, ledger, ledger_events):
         self.state = state
         self.config = config
         self.io_for = io_for
         self.followups = followups
+        self.disable_automerge = disable_automerge
         self.narrow = narrow
         self.ledger = ledger
         self.logged = {row.get("key") for row in ledger_events() if isinstance(row, dict)}
@@ -164,9 +171,14 @@ class Watch:
         pr = self.state.get_pr(repo, number) or {}
         if (pr.get("validatedHeadOid"), pr.get("since")) == (intent["head"], intent["since"]):
             self.event(key, "watch-intent", **intent)
-            flow.disable_queued_automerge(io, repo, number)  # Checks the live queue before writing.
+            try:
+                self.disable_automerge(io, repo, number)
+            except WATCH_ERRORS as exc:
+                reason, recovery = self.error(repo, "关闭自动合并", exc, io=io, number=number)
+                self.state.pause_pr(repo, number, reason, recovery, resumeState=pr_phase(pr))
+                return  # Keep the original intent for the next round.
             if pr.get("state") not in ("handed-to-user", "merged", "post-merge-done"):
-                body = f"{repo}#{number} 已暂停。{intent['reason']}。恢复条件：{intent['recovery']}。"
+                body = f"{repo}#{number} 已关闭自动合并并暂停。{intent['reason']}。恢复条件：{intent['recovery']}。"
                 if intent["user"]:
                     self.notice(key, repo, number, "user", body)
                 self.notice(key, repo, number, intent["notify"], body)
@@ -176,14 +188,17 @@ class Watch:
 
     def pause_pr_error(self, io, repo, number, reason, recovery):
         record = self.state.get_pr(repo, number) or {}
-        merged = record.get("state") == "merged" or record.get("resumeState") == "merged"
+        phase = pr_phase(record)
         close = None
         pending = any((intent.get("action"), intent.get("repo"), intent.get("pr")) == (
             "watch-pause-pr", repo, number) for intent in self.state.pending_intents().values())
-        if not pending and not merged and record.get("validatedHeadOid"):
+        if not pending and phase != "merged" and record.get("validatedHeadOid"):
             key = f"{repo}:{number}:{record['validatedHeadOid']}:{record.get('since')}:watch-error"
             close = self.prepare_pr_pause(repo, number, record, key, reason, recovery)
-        self.state.pause_pr(repo, number, reason, recovery, resumeState="merged" if merged else None)
+        resume_state = phase if phase == "merged" else None
+        if (close or pending) and phase in ACTIVE_PRS:
+            resume_state = phase
+        self.state.pause_pr(repo, number, reason, recovery, resumeState=resume_state)
         if close and io is not None:
             try:
                 self.finish_pr_pause(io, *close)
@@ -222,7 +237,7 @@ class Watch:
                 key = self.next_key(prefix)
 
             def close():
-                flow.disable_queued_automerge(io, repo, number)
+                self.disable_automerge(io, repo, number)
                 record = self.state.get_pr(repo, number) or {}
                 if record.get("state") in ACTIVE_PRS:
                     self.state.pause_pr(repo, number, reason, RECOVERY, resumeState=None)
@@ -259,8 +274,11 @@ class Watch:
             live_head = (pr.get("head") or {}).get("sha")
             status = self.verified(io, repo, head) if head and live_head == head else {}
             if live_head != head or status.get("state") != "success":
-                reason = "PR 的 head 已变化" if live_head != head else f"{flow.VERIFIED} 未通过"
-                self.pr_pause(io, repo, number, record, key + ":invalid", reason, RECOVERY, session=True)
+                if live_head != head:
+                    reason = f"PR 的 head 已变化，已验证提交 `{head or '未知'}`，新 head `{live_head or '未知'}`"
+                else:
+                    reason = f"{flow.VERIFIED} 未通过"
+                self.pr_pause(io, repo, number, record, key + ":invalid", reason, RECOVERY, user=True, session=True)
                 return
             if pr.get("merged"):
                 self.state.set_pr(repo, number, state="merged", mergeCommitOid=pr.get("merge_commit_sha"),
@@ -270,7 +288,7 @@ class Watch:
                 since = record.get("since") or (queue or {}).get("enabled_at")
                 if since and self.state.now() - timestamp(since) > TIMEOUT:
                     self.pr_pause(io, repo, number, record, key + ":queue-timeout", "自动合并已等待超过 60 分钟",
-                                  RECOVERY, user=True)
+                                  RECOVERY, user=True, session=True)
                     return
                 if queue is None:
                     if record["state"] == "automerge-requested":
@@ -449,7 +467,7 @@ class Watch:
             if base:
                 self.link_main_pr(io, repo, run["head_sha"], base, fields)
             return self.pause_ci(io, repo, fields["pr"], pr, key, fields, "CI 运行超过 60 分钟", RECOVERY if pr else
-                                 "检查运行后重新触发主干 CI")
+                                 "检查运行后重新触发主干 CI", notify=notify if pr else None)
         if not complete:
             return "pending"
         if conclusion == "success":

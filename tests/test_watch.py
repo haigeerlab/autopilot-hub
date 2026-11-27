@@ -30,6 +30,9 @@ OLD = "2026-01-01T10:55:00Z"
 BOT = {"login": "autopilot[bot]", "id": 123, "app_slug": "autopilot"}
 BOT_USER = {"login": BOT["login"], "id": BOT["id"], "type": "Bot"}
 LOCAL_IO = cli.LocalIO
+WATCH_PERMISSIONS = {"contents": "read", "pull_requests": "write", "issues": "write",
+                     "statuses": "read", "actions": "write"}
+DISABLE_PERMISSIONS = {"contents": "write", "pull_requests": "write"}
 
 
 def ci(run_id, event="pull_request", *, head=None, attempt=1, conclusion="failure", started=RECENT):
@@ -48,6 +51,11 @@ def jobs(failed_step):
         {"number": 1, "name": "Setup", "conclusion": "failure" if failed_step == "setup" else "success"},
         {"number": 2, "name": "Run tests", "conclusion": "skipped" if failed_step == "setup" else "failure"},
     ]}]
+
+
+def reject_disable(method, path):
+    if (method, path) == ("POST", "graphql"):
+        raise ApiError("Resource not accessible by integration")
 
 
 class SimulatedCrash(BaseException):
@@ -242,10 +250,27 @@ class WatchTestCase(unittest.TestCase):
         stack.enter_context(mock.patch.object(cli, "STATE", self.temp))
         stack.enter_context(mock.patch.object(cli, "WatchState", side_effect=lambda *_: self.state))
         self.mint = stack.enter_context(mock.patch.object(cli.tokens, "mint", return_value="watch-token"))
-        stack.enter_context(mock.patch.object(cli.tokens, "revoke"))
+        self.revoke = stack.enter_context(mock.patch.object(cli.tokens, "revoke"))
         stack.enter_context(mock.patch.object(cli.LocalIO, "local_config", side_effect=lambda: self.config))
-        stack.enter_context(mock.patch.object(cli, "LocalIO", wraps=cli.LocalIO, return_value=self.github))
+        self.local_io = stack.enter_context(mock.patch.object(cli, "LocalIO", wraps=cli.LocalIO, return_value=self.github))
         stack.enter_context(mock.patch.object(subprocess, "run", side_effect=self.fake_process))
+
+    def trace_disable_credentials(self):
+        trace = mock.Mock()
+        write_io = mock.Mock(token="disable-token")
+        write_io.api.side_effect = self.github.api
+        self.mint.side_effect = lambda repo, permissions: (
+            write_io.token if permissions == DISABLE_PERMISSIONS else self.github.token)
+        self.local_io.side_effect = lambda token, _: write_io if token == write_io.token else self.github
+        trace.attach_mock(self.mint, "mint")
+        trace.attach_mock(write_io.api, "write_api")
+        trace.attach_mock(self.revoke, "revoke")
+        return trace
+
+    @staticmethod
+    def disable_credential_calls():
+        return [mock.call.mint(REPO, DISABLE_PERMISSIONS), mock.call.write_api("graphql", "POST", mock.ANY),
+                mock.call.revoke("disable-token")]
 
     def fake_process(self, args, **kwargs):
         if args[0] == "osascript":
@@ -293,15 +318,69 @@ class HeadChangedTest(WatchTestCase):
         self.tracked_pr()
         self.github.prs[7]["head"]["sha"] = MAIN
         self.fail_relay = True
+        trace = self.trace_disable_credentials()
 
         self.once()
 
         self.assertIsNone(self.github.prs[7]["auto_merge"])
         self.assertEqual(self.effects("close"), [("close", 7, False)])
+        self.assertEqual(trace.mock_calls, [mock.call.mint(REPO, WATCH_PERMISSIONS),
+                                           *self.disable_credential_calls(), mock.call.revoke("watch-token")])
         record = self.state.get_pr(REPO, 7)
         self.assert_paused(record)
         self.assertIn("run", record["pause"]["recovery"])
-        self.assertEqual([item["target"] for item in self.state.pending_notifications()], ["author"])
+        notices = self.state.pending_notifications()
+        self.assertEqual([item["target"] for item in notices], ["author"])
+        self.assertEqual(len(self.effects("desktop")), 1)
+        for body in (notices[0]["body"], self.github.comments[7][0]["body"]):
+            for detail in (HEAD, MAIN, "已关闭自动合并", "重新运行 autopilot run"):
+                self.assertIn(detail, body)
+
+    def test_disable_error_keeps_head_change_pending_and_retries_next_round(self):
+        self.tracked_pr()
+        self.github.prs[7]["head"]["sha"] = MAIN
+        self.github.fail = reject_disable
+        trace = self.trace_disable_credentials()
+
+        self.assertEqual(self.once(), 1)
+
+        record = self.state.get_pr(REPO, 7)
+        self.assert_paused(record)
+        self.assertEqual(record["resumeState"], "automerge-on")
+        self.assertIn("Resource not accessible by integration", record["pause"]["reason"])
+        self.assertTrue(any(event["event"] == "watch-error" for event in LOCAL_IO.ledger_events()))
+        self.assertTrue(self.github.prs[7]["auto_merge"])
+        self.assertFalse(self.effects("relay"))
+        self.assertIn("Resource not accessible by integration", self.github.comments[7][0]["body"])
+        self.assertEqual(trace.mock_calls, [mock.call.mint(REPO, WATCH_PERMISSIONS),
+                                           *self.disable_credential_calls(), mock.call.revoke("watch-token")])
+
+        self.github.fail = None
+        self.assertEqual(self.once(), 0)
+        self.assertEqual(self.once(), 0)
+
+        record = self.state.get_pr(REPO, 7)
+        self.assert_paused(record)
+        self.assertIsNone(record["resumeState"])
+        self.assertIn("head 已变化", record["pause"]["reason"])
+        self.assertIsNone(self.github.prs[7]["auto_merge"])
+        self.assertEqual(self.effects("close"), [("close", 7, False)])
+        self.assertEqual(len(self.effects("relay")), 1)
+        self.assertEqual(self.effects("relay")[0][1], "author")
+        self.assertIn(MAIN, self.effects("relay")[0][2])
+        self.assertEqual(len(self.effects("desktop")), 2)
+        self.assertEqual(self.state.pending_intents(), {})
+
+    def test_already_disabled_queue_does_not_need_a_write_token(self):
+        self.tracked_pr()
+        self.github.add_pr(7, head=MAIN, queued=False)
+        trace = self.trace_disable_credentials()
+
+        self.assertEqual(self.once(), 0)
+
+        self.assertEqual(trace.mock_calls, [mock.call.mint(REPO, WATCH_PERMISSIONS), mock.call.revoke("watch-token")])
+        self.assert_paused(self.state.get_pr(REPO, 7))
+        self.assertFalse(self.effects("close"))
 
     def test_verified_must_be_success_on_the_validated_head(self):
         self.tracked_pr()
@@ -312,6 +391,7 @@ class HeadChangedTest(WatchTestCase):
         self.assert_paused(self.state.get_pr(REPO, 7))
         self.assertIsNone(self.github.prs[7]["auto_merge"])
         self.assertEqual(len(self.effects("relay")), 1)
+        self.assertEqual(len(self.effects("desktop")), 1)
 
     def test_verified_requires_hub_creator_on_the_latest_status(self):
         trusted = {"context": flow.VERIFIED, "state": "success", "creator": BOT_USER}
@@ -540,12 +620,16 @@ class TimeoutAndFailureTest(WatchTestCase):
 
     def test_automerge_over_one_hour_is_closed_and_paused(self):
         self.tracked_pr(since=OLD)
+        trace = self.trace_disable_credentials()
 
         self.once()
 
         self.assert_paused(self.state.get_pr(REPO, 7))
         self.assertEqual(len(self.effects("close")), 1)
         self.assertEqual(len(self.effects("desktop")), 1)
+        self.assertEqual(len(self.effects("relay")), 1)
+        self.assertEqual(trace.mock_calls, [mock.call.mint(REPO, WATCH_PERMISSIONS),
+                                           *self.disable_credential_calls(), mock.call.revoke("watch-token")])
 
     def test_pr_running_ci_timeout_pauses_pr_and_attempt(self):
         self.tracked_pr()
@@ -556,6 +640,8 @@ class TimeoutAndFailureTest(WatchTestCase):
         self.assert_paused(self.state.get_run(REPO, 10, 1))
         self.assert_paused(self.state.get_pr(REPO, 7))
         self.assertEqual(len(self.effects("desktop")), 1)
+        self.assertIsNone(self.github.prs[7]["auto_merge"])
+        self.assertEqual(len(self.effects("relay")), 1)
 
     def test_main_running_ci_timeout_pauses_attempt_without_narrowing(self):
         self.config["repos"][REPO]["watchMainRed"] = True
@@ -692,6 +778,7 @@ class FreezeTest(WatchTestCase):
         self.config["repos"][REPO]["watchMainRed"] = True
         self.github.runs[20] = ci(20, "push")
         self.state.enqueue_notification("author", "pending notice", "notice-key")
+        trace = self.trace_disable_credentials()
 
         self.command("watch", "--freeze")
         self.once()
@@ -699,6 +786,10 @@ class FreezeTest(WatchTestCase):
 
         self.assertTrue(self.state.is_frozen())
         self.assertEqual(self.github.effects, [("close", 7, False), ("close", 8, False)])
+        read = mock.call.mint(REPO, WATCH_PERMISSIONS)
+        revoke = mock.call.revoke("watch-token")
+        self.assertEqual(trace.mock_calls, [read, *self.disable_credential_calls(),
+                                           *self.disable_credential_calls(), revoke, read, revoke, read, revoke])
         self.assertIsNone(self.state.get_cursor(REPO))
         self.assertEqual(len(self.state.pending_notifications()), 1)
         self.assertTrue(self.state.heartbeat_is_fresh(15))
@@ -870,6 +961,25 @@ class ResumeTest(WatchTestCase):
         self.command("watch", "--resume", f"{REPO}#7")
 
         self.assertIsNone(self.state.get_pr(REPO, 7)["pause"])
+        self.assertIsNone(self.github.prs[7]["auto_merge"])
+
+    def test_resume_pr_restores_pending_inspection_state_after_disable_error(self):
+        self.tracked_pr(state="automerge-requested", since=OLD)
+        self.github.fail = reject_disable
+        self.assertEqual(self.once(), 1)
+        self.assert_paused(self.state.get_pr(REPO, 7))
+
+        self.assertEqual(self.command("watch", "--resume", f"{REPO}#7"), 0)
+
+        record = self.state.get_pr(REPO, 7)
+        self.assertEqual(record["state"], "automerge-requested")
+        self.assertIsNone(record["pause"])
+        self.assertIsNone(record["resumeState"])
+        self.assertTrue(self.github.prs[7]["auto_merge"])
+
+        self.github.fail = None
+        self.assertEqual(self.once(), 0)
+        self.assert_paused(self.state.get_pr(REPO, 7))
         self.assertIsNone(self.github.prs[7]["auto_merge"])
 
     def test_successful_direct_run_clears_an_earlier_pause(self):

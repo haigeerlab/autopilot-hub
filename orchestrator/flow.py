@@ -927,7 +927,7 @@ def verification_status(io, repo, head, state, description, evidence_url=None):
     io.api(f"repos/{repo}/statuses/{head}", "POST", payload)
 
 
-def disable_queued_automerge(io, repo, number):
+def disable_queued_automerge(io, repo, number, *, mutation_api=None):
     # REST exposes the current GraphQL autoMergeRequest as auto_merge and the PR ID as node_id.
     pr = io.api(f"repos/{repo}/pulls/{number}")
     if pr.get("auto_merge") is None:
@@ -937,7 +937,9 @@ def disable_queued_automerge(io, repo, number):
         raise ApiError("PR 已排队自动合并，但读不到节点 ID")
     query = ("mutation($pullRequestId:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId})"
              "{pullRequest{id}}}")
-    result = io.api("graphql", "POST", {"query": query, "variables": {"pullRequestId": pr_id}})
+    # Watch can request write permission here without using it for the REST read above.
+    api = io.api if mutation_api is None else mutation_api
+    result = api("graphql", "POST", {"query": query, "variables": {"pullRequestId": pr_id}})
     try:
         if not result.get("errors") and result["data"]["disablePullRequestAutoMerge"]["pullRequest"]["id"] == pr_id:
             return

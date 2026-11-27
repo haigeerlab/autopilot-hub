@@ -19,6 +19,7 @@ autopilot-hub 替各插件仓库做两件事：
 - **hub-auto-merge** 由 `run` 在合并前验证的提交上写 `autopilot/verified`。通过写 `success` 并链接证据，失败写 `failure` 并关闭已排队的自动合并。合并档位为 `auto`、风险和准入通过、满足部署条件的新流程模块走 `automerge`，先打 `autopilot:authored`，再对验证过的提交打开 GitHub 自动合并。T4、老流程、Dependabot 和缺少自动路条件的 PR 验证通过后走 `manual`，由人合并。`mergeMode=direct` 时走原有直接合并路线。[规格](spec/hub-auto-merge.md)
 - **未归属模块的 PR** 由普通 `run` 执行仓库检查和风险分级。仓库检查通过就写 `autopilot/verified`；风险分级不过（T3、T4、`human_only`）也照样写，原因记进路线原因。这类 PR 固定走 `manual`，由你合并。
 - **巡检与暂停**由本机 `watch` 负责。PR 提交变化、验证状态失效或等待超时时，关闭排队中的自动合并并暂停，合并后补 `autopilot:auto-merged` 标签与跟进 issue。环境问题最多重跑两次，CI 配置错误暂停交人处理，PR 测试失败由负责会话分析。已移交巡检的仓库主干因测试失败变红时，watch 先在本机收紧仓库，再关闭该仓库排队中的自动合并、开降级 issue、尝试开收窄 PR，最后通知用户。收窄 PR 由人合并。主干 CI 通过时，watch 在 `~/.autopilot/watch-state.json` 的 `runs` 里记录目标提交和可核对的关联 PR 与验证证据，供发布模块读取。
+  常规巡检令牌的 Contents 权限为只读。关闭自动合并时按仓库另申请具有 Contents 和 Pull requests 写权限的短期令牌，使用后立即撤销。关闭失败会在下一轮重试。
 - **AI 操作用例**使用 delegate 0.13.2 或以上版本。Claude Code 作者对应 Codex 后端，已批模块的每条 `ai-operate` 用例在独立的一次性克隆里执行一轮，验证报告保留结果、证据、delegate 结果文件中的 `authorization` 和 hub 算出的完整授权文件 SHA-256。先用 `python3 -B orchestrator/cli.py authorize --repo owner/name --quote "用户原话" --session "记录会话"` 记录你打开该仓库自动路时的原话。收回授权用 `python3 -B orchestrator/cli.py authorize --repo owner/name --revoke`。缺少可用授权、授权来源不匹配、作者是 Codex、未提供作者宿主、delegate 不可用、要人回答或结果无法解析时，用例转人工。
 - **切片 1**（已退役，见切片 7）：原先准入脚本读取 repo-readiness 的接入结论、算信任上限；该部分已删除。规格留作历史：[docs/spec/slice-1.md](docs/spec/slice-1.md)。
 - **切片 2**：出事时自动开 `autopilot:degrade` issue（撤回 autopilot 的 PR、它合并后主干变红、手动打 `autopilot:regression` 或 `autopilot:freeze`），只要有一个未关闭的降级 issue，准入就报“不会自动合并”；关闭 issue 即解除。规格见 [docs/spec/slice-2.md](docs/spec/slice-2.md)。
@@ -71,7 +72,7 @@ launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/com.haigeerlab.autopilot-
 - `python3 -B orchestrator/cli.py watch --freeze` 写入全局冻结并执行一轮关闭操作。冻结期间，默认自动路的 `run` 交人合并，watch 只处理关闭已排队的自动合并。
 - `python3 -B orchestrator/cli.py watch --unfreeze` 解除全局冻结。
 - `python3 -B orchestrator/cli.py watch --resume owner/name` 在用户确认恢复后解除该仓库在 hub 的本机收紧。
-- `python3 -B orchestrator/cli.py watch --resume 'owner/name#123'` 解除该 PR 的暂停。重新验证通过也可解除 PR 暂停。再次打开自动合并须重新运行 `run`。
+- `python3 -B orchestrator/cli.py watch --resume 'owner/name#123'` 解除该 PR 的暂停。关闭自动合并待重试时，此命令恢复原巡检状态。重新验证通过也可解除 PR 暂停。再次打开自动合并须重新运行 `run`。
 
 开完 PR 后可运行 `python3 -B orchestrator/cli.py run --repo owner/name --pr 123 --notify "session-name" --author-host claude-code`。`--notify` 指定接收交接通知的会话，`--author-host` 填实际作者宿主 `claude-code` 或 `codex`。watch 看不到的失败可用 `python3 -B orchestrator/cli.py report-failure --repo owner/name --pr 0 --stage open-pr --detail "开 PR 失败的原因"` 记入暂停并排队通知用户。尚无 PR 编号时填 `0`。
 
