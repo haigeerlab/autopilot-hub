@@ -2255,6 +2255,12 @@ class RepairLimitTest(RunRouteFixture):
 
     def test_existing_test_pauses_before_checks_and_exits_one(self):
         io = self.new_flow()
+        io.check_exit = 1
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        io.ran.clear()
+        io.check_exit = 0
+        head = 'c' * 40
+        io.pr['head']['sha'] = head
         io.scope_base, io.changed_existing = 'e' * 40, ['components/widget.spec.js']
         io.pr['auto_merge'] = {'merge_method': 'squash'}
         exit_code, stdout = self.cli_run(io, '--json')
@@ -2269,11 +2275,14 @@ class RepairLimitTest(RunRouteFixture):
         self.assertIn(reason, notice['body'])
         self.assertEqual(io.ran, [])
         self.assertEqual(io.case_runs, [])
-        self.assertEqual(io.statuses[-1][1]['state'], 'failure')
+        status_path, status = io.statuses[-1]
+        self.assertEqual((status_path, status['state']), (f'repos/{REPO}/statuses/{head}', 'failure'))
         self.assertIsNone(io.pr['auto_merge'])
 
     def test_existing_regression_document_pauses_before_checks(self):
         io = self.new_flow()
+        self.state.record_failure(REPO, 7, 'case:R9', HEAD)
+        io.pr['head']['sha'] = 'c' * 40
         io.changed_existing = ['tasks/m/regression.md']
         result = self.run_pr(io)
         self.assertEqual(result['result'], 'paused', result)
@@ -2282,16 +2291,59 @@ class RepairLimitTest(RunRouteFixture):
         self.assertEqual(io.ran, [])
         self.assertEqual(io.verify_calls, [])
 
-    def test_added_test_can_pass_and_evidence_names_the_fallback_baseline(self):
+    def test_first_run_with_existing_test_additions_follows_normal_route(self):
+        path = 'tests/test_calc.py'
+        io = FakeIO(module='m', files=(path,))
+        io.files[0].update(additions=3, patch=(
+            '@@ -1,0 +2,3 @@\n+class TestCalc(unittest.TestCase):\n'
+            '+    def test_add(self):\n+        self.assertEqual(1 + 1, 2)\n'
+        ))
+        io.changed_existing = [path]
+        with mock.patch.object(FakeWork, 'changed_existing_files', autospec=True,
+                               side_effect=FakeWork.changed_existing_files) as compare:
+            result = self.run_pr(io)
+        self.assertEqual((result['result'], result.get('route')), ('handed-to-user', 'manual'), result)
+        compare.assert_not_called()
+        self.assertEqual(io.ran, ['make test'])
+        self.assertEqual([(status['context'], status['state']) for _, status in io.statuses], [(VERIFIED, 'success')])
+
+    def test_new_head_without_prior_failure_can_edit_existing_tests(self):
+        io = FakeIO(module='m')
+        self.assertEqual(self.run_pr(io)['result'], 'handed-to-user')
+        head = 'c' * 40
+        io.pr['head']['sha'] = head
+        path = 'tests/test_calc.py'
+        io.files.append({'filename': path, 'status': 'modified', 'additions': 1, 'deletions': 0, 'patch': '+assert True'})
+        io.changed_existing = [path]
+        result = self.run_pr(io)
+        self.assertEqual((result['result'], result.get('route')), ('handed-to-user', 'manual'), result)
+        self.assertEqual(io.ran, ['make test', 'make test'])
+        status_path, status = io.statuses[-1]
+        self.assertEqual((status_path, status['state']), (f'repos/{REPO}/statuses/{head}', 'success'))
+
+    def test_rerun_of_same_failed_head_does_not_trigger_repair_guard(self):
+        io = FakeIO(module='m', check_exit=1)
+        self.assertEqual(self.run_pr(io)['step'], 'check')
+        io.changed_existing = ['tests/test_calc.py']
+        result = self.run_pr(io)
+        self.assertEqual((result['result'], result['step']), ('stopped', 'check'), result)
+        self.assertEqual(io.ran, ['make test', 'make test'])
+
+    def test_repair_adding_test_can_pass_and_evidence_names_the_fallback_baseline(self):
         io = self.new_flow()
-        io.files.append({'filename': 'tests/test_added.py', 'status': 'added', 'additions': 1,
-                         'deletions': 0, 'patch': '+assert True'})
+        self.state.record_failure(REPO, 7, 'review:missing-test', HEAD)
+        io.pr['head']['sha'] = 'c' * 40
+        io.acceptance_record = accepted(sha=io.pr['head']['sha'])
+        io.files[:] = [{'filename': 'tests/test_added.py', 'status': 'added', 'additions': 1,
+                        'deletions': 0, 'patch': '+assert True'}]
         self.assertEqual(self.run_pr(io)['result'], 'automerge-on')
         self.assertEqual(self.verify.evidence(io)['repairBaseline'], {'source': 'merge-base', 'sha': 'b' * 40})
         self.assertEqual(self.state.pending_notifications(), [])
 
     def test_unconfirmed_scope_base_is_reported_in_run_evidence(self):
         io = self.new_flow()
+        self.state.record_failure(REPO, 7, 'check:make test', HEAD)
+        io.pr['head']['sha'] = 'c' * 40
         baseline = {'source': 'merge-base', 'sha': 'b' * 40, 'fallbackReason': 'scope-base-not-ancestor'}
         with mock.patch.object(FakeWork, 'changed_existing_files', return_value=(baseline, [])):
             result = self.run_pr(io)
@@ -2301,11 +2353,14 @@ class RepairLimitTest(RunRouteFixture):
 
     def test_dry_run_leaves_no_pause_or_notice(self):
         io = self.new_flow()
+        self.state.record_failure(REPO, 7, 'check:make test', HEAD)
+        io.pr['head']['sha'] = 'c' * 40
         io.changed_existing = ['tests/test_existing.py']
+        before = self.state.read()
         result = self.run_pr(io, dry_run=True)
         self.assertEqual(result['result'], 'stopped', result)
         self.assertIn('tests/test_existing.py', result['reason'])
-        self.assertIsNone(self.state.get_pr(REPO, 7))
+        self.assertEqual(self.state.read(), before)
         self.assertEqual(self.state.pending_notifications(), [])
         self.assertEqual(io.writes(), [])
 

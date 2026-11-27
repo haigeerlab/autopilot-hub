@@ -199,6 +199,16 @@ class WatchState:
     def repair_count(self, repo, number, reason_key):
         return len(self.read()["repairs"].get(f"{repo}#{number}", {}).get(reason_key, []))
 
+    def has_failure_on_other_head(self, repo, number, head):
+        """Return whether this PR has a recorded failure on a different head."""
+        pr_key = f"{repo}#{number}"
+        data = self.read()
+        first_failures = data["prs"].get(pr_key, {}).get("firstFailures", {})
+        if any(commit != head for commit in first_failures.values()):
+            return True
+        repairs = data["repairs"].get(pr_key, {})
+        return any(commit != head for commits in repairs.values() for commit in commits)
+
     def record_failure(self, repo, number, reason_key, commit):
         """Record the first failing head separately and return the counted repair commits."""
         pr_key = f"{repo}#{number}"

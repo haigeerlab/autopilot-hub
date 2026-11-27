@@ -193,6 +193,22 @@ class WatchStateTest(unittest.TestCase):
         self.assertEqual(self.state.repair_count(REPO, PR + 1, "tests"), 0)
         self.assertEqual(self.state.read()["repairs"], {f"{REPO}#{PR}": {"tests": [HEAD, BASE], "lint": [HEAD]}})
 
+    def test_failure_on_other_head_uses_the_prs_persisted_failure_records(self):
+        state = self.open_state()
+        self.assertFalse(state.has_failure_on_other_head(REPO, PR, HEAD))
+        self.assertFalse(self.path.exists())
+        self.state.record_failure(REPO, PR, 'case:R9', HEAD)
+        self.assertFalse(state.has_failure_on_other_head(REPO, PR, HEAD))
+        self.assertTrue(state.has_failure_on_other_head(REPO, PR, BASE))
+        self.assertFalse(state.has_failure_on_other_head(REPO, PR + 1, BASE))
+        self.assertFalse(state.has_failure_on_other_head('owner/other', PR, BASE))
+
+    def test_failure_on_other_head_includes_state_with_only_a_counted_repair(self):
+        self.state.record_repair(REPO, PR, 'check:make test', HEAD)
+        state = self.open_state()
+        self.assertFalse(state.has_failure_on_other_head(REPO, PR, HEAD))
+        self.assertTrue(state.has_failure_on_other_head(REPO, PR, BASE))
+
     def test_pending_intent_survives_a_process_exit_and_is_completed_once(self):
         key = f"{REPO}:{PR}:{HEAD}:enable-automerge"
         detail = {"pr": PR, "head": HEAD}

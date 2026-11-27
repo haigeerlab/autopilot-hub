@@ -1264,7 +1264,7 @@ def run(io, repo, number, *, dry_run=False, merge_method=None, state=None, notif
                 result_info.update(route="direct", routeReasons=["mergeMode=direct"])
 
             checking = True
-            if not batch_merge:
+            if not batch_merge and state.has_failure_on_other_head(repo, number, head):
                 scope_module = module_candidates[0] if len(module_candidates) == 1 else None
                 repair_baseline, existing_paths = work.changed_existing_files(scope_module)
                 result_info["repairBaseline"] = repair_baseline
