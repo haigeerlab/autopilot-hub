@@ -10,6 +10,7 @@ hub 不发版本号：各仓库按 40 位提交 SHA 引用 hub，「需要升钉
 - 合规监测（`audit`）新流程检查：重要需求模块的技术方案，在 spec-guard 的模块接管档位 `takeover.design` 为 `reviewer` 时，审查者批准（`approvedBy` 为 `reviewer`）也算合规；其余情况仍只认你批的，否则照旧报严重 `important-design-not-user`。配合 spec-guard 模块 sg-review-rules（技术方案可由审查者放行）。spec-guard 现有版本对重要需求的有效档位固定为人批，所以在它发版前行为不变。不需要升钉。
 
 ### Fixed
+- `hub run` 的「不许改裁判」只在同一 PR 已记录过失败且当前 head 与失败 head 不同时执行。首次运行或没有失败记录时，给已有测试文件补用例会继续走正常验证。
 - 普通 `hub run` 对非 spec-guard 仓库及 spec-guard 项目里未识别出模块的 PR 跑仓库检查（含合并前追加步骤）和风险分级。风险项未通过时，与模块 PR 一样把风险详情记入路线原因。仓库检查和降级检查通过后写 `autopilot/verified` 的 `success` 并交人合并。**各仓库在 B 批加必需检查前先升钉到含此改动的 hub 提交。**
 - module-crew 合并第一段（`orchestrator/cli.py batch`）：推「合并：自动」模块的合并提交前，先查有没有还没推送的人批合并会被一起带上（本机检出里是它的祖先、远端基础分支还没有），有就停下，不推、不开 PR。module-crew 的合并是叠起来的，以前会把人批模块夹带进自动合并的 PR。按祖先关系判断，不依赖清单顺序。不需要升钉。
 - 本机编排：认机器人开的 issue 时允许 App 字段为空（GitHub 在 App 开的 issue 上不返回 `performed_via_github_app`，发布引擎和合规监测早已这样处理）。之前合并前验证每次续跑都会新开一个跟踪 issue、读不到你在旧 issue 上的回复，跟进 issue 也去不了重。S6 沙盒演练发现。跟踪清单和停下提示不再列空的「确认执行」。不需要升钉。
